@@ -46,7 +46,6 @@ def test_supported_modes_match_discord_py():
         'on_voice_state_update',
         'on_voice_server_update',
         'connect',
-        'checked_add',
         'cleanup',
         'source',
         'guild',
@@ -113,9 +112,10 @@ def test_gateway_opcode_constants():
 
 
 def test_exception_types_line_up_with_discord():
+    # The exceptions this library can raise at the discord.py boundary are discord.py's own.
     assert dev.ClientException is discord.ClientException
     assert dev.FFmpegProcessError is discord.errors.FFmpegProcessError
-    assert dev.OpusNotLoaded is discord.opus.OpusNotLoaded
+    assert dev.ConnectionClosed is discord.errors.ConnectionClosed
 
     # A native FFmpeg failure is catchable as either flavour.
     assert issubclass(dev.FFmpegSourceError, dev.FFmpegError)

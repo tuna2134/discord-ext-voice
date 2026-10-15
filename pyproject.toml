@@ -17,14 +17,16 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-    # `VoiceClient` subclasses `discord.VoiceClient`, which requires PyNaCl and the Python
-    # `davey` bindings at construction time; discord.py's inherited bookkeeping also refers to
-    # them. Our own crypto and DAVE session are native, so neither is actually used by us.
-    "discord.py[voice]>=2.7",
+    # `VoiceClient` subclasses `discord.VoiceClient` for its API and connection flow. The
+    # `voice` extra (PyNaCl + the Python `davey` bindings) is deliberately *not* needed: the
+    # RTP encryption and the DAVE/MLS session are implemented natively in Rust.
+    "discord.py>=2.7",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13"]
+# PyNaCl is used by the test suite only, to prove the native RTP packets are byte-compatible
+# with discord.py's own encryption.
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5"]
 
 [tool.maturin]
 module-name = "discord_ext_voice._native"

@@ -101,28 +101,6 @@ impl DaveState {
         Ok(Some(encrypted.into_owned()))
     }
 
-    /// Decrypt a received Opus frame from `user_id`.
-    ///
-    /// Returns `Ok(None)` when the frame must be passed through unmodified, which is what
-    /// happens for users whose key ratchet has not been established yet.
-    pub fn decrypt_opus(
-        &mut self,
-        user_id: u64,
-        data: &[u8],
-    ) -> Result<Option<Vec<u8>>, crate::errors::DaveFailure> {
-        if !self.can_encrypt() {
-            return Ok(None);
-        }
-        let Some(session) = self.session.as_mut() else {
-            return Ok(None);
-        };
-        match session.decrypt(user_id, davey::MediaType::AUDIO, data) {
-            Ok(frame) => Ok(Some(frame)),
-            Err(_) if session.can_passthrough(user_id) => Ok(None),
-            Err(err) => Err(Self::to_dave_err(err)),
-        }
-    }
-
     /// (Re)create the MLS session for the current protocol version and return the
     /// `dave_mls_key_package` (opcode 26) frame that must be sent to Discord.
     ///

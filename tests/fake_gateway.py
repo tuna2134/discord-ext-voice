@@ -22,8 +22,31 @@ from typing import Any, Optional
 import websockets
 from websockets.asyncio.server import serve
 
+from discord_ext_voice import _native
+
 #: The SSRC the fake gateway hands out.
 SSRC = 0x1234ABCD
+
+#: The identifiers the fake gateway expects in an IDENTIFY payload.
+GUILD_ID = 111
+USER_ID = 222
+CHANNEL_ID = 333
+
+
+async def open_connection(gateway: 'FakeVoiceGateway', *, resume: bool = False):
+    """Create a native ``VoiceConnection``, feed it the gateway credentials and handshake.
+
+    This mirrors what the Python layer does: store the values from ``VOICE_STATE_UPDATE`` and
+    ``VOICE_SERVER_UPDATE``, move the connection flow to ``got_both_voice_updates`` and then
+    let the transport negotiate.
+    """
+    connection = _native.VoiceConnection(GUILD_ID, USER_ID, CHANNEL_ID)
+    connection.set_session_id('session-abc')
+    connection.set_server_info(GUILD_ID, 'voice-token', gateway.endpoint)
+    # ConnectionFlowState.got_both_voice_updates (or got_voice_server_update when resuming).
+    connection.set_phase(3 if resume else 4)
+    await connection.handshake(resume=resume, timeout=10.0)
+    return connection
 
 
 def make_secret_key() -> list[int]:

@@ -11,11 +11,15 @@ voice = await channel.connect(cls=dev.VoiceClient)
 voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished', error))
 ```
 
-`dev.VoiceClient` subclasses `discord.VoiceClient`, `dev.VoiceConnectionState` subclasses
-`discord.voice_state.VoiceConnectionState`, `dev.DiscordVoiceWebSocket` subclasses
-`discord.gateway.DiscordVoiceWebSocket`, and the audio player, audio sources and volume
-transformer are discord.py's own classes re-exported unchanged. Only the parts that must be
-native are overridden — and those parts are the whole voice protocol:
+`dev.VoiceClient` implements `discord.VoiceProtocol` — discord.py's documented extension point
+for alternative voice backends — on top of the native transport. `dev.VoiceConnectionState`
+subclasses `discord.voice_state.VoiceConnectionState` (the connection flow and reconnect
+policy), `dev.DiscordVoiceWebSocket` subclasses `discord.gateway.DiscordVoiceWebSocket` (the
+opcodes and frame builders), and the audio player, audio sources and volume transformer are
+discord.py's own classes re-exported unchanged. What is *not* reused is discord.py's own
+`VoiceClient`, which is built on PyNaCl and the Python `davey` bindings.
+
+Everything that must be native is native — and that is the whole voice protocol:
 
 | Concern | Where it lives |
 | --- | --- |
@@ -27,6 +31,8 @@ native are overridden — and those parts are the whole voice protocol:
 | Opus codec | Rust: `audiopus` (libopus) |
 | Audio decode + resample | Rust: `ac-ffmpeg` + `libswresample` |
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
+| PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
+| Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
 | Connection flow state machine, reconnect policy | `discord.voice_state.VoiceConnectionState` |
 | Audio player thread, `PCMAudio`, `PCMVolumeTransformer` | `discord.player` |
 | Gateway opcodes and outgoing frame builders | `discord.gateway.DiscordVoiceWebSocket` |
@@ -44,8 +50,9 @@ native are overridden — and those parts are the whole voice protocol:
   compete with Python work — the Python player thread just hands Rust 20ms of PCM.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
   commit/welcome processing, epoch transitions and the passthrough windows.
-* **No duplicated Python.** Roughly 860 lines of Python (mostly docstrings) instead of the
-  ~2400 it takes to re-implement discord.py's player, state machine and gateway handling.
+* **A thin Python layer.** About 1000 lines of Python (well over half of it docstrings and
+  type hints) instead of the ~2400 it takes to re-implement discord.py's player, state machine
+  and gateway handling.
 
 ## Requirements
 
@@ -80,9 +87,15 @@ pip install maturin
 maturin develop --release
 ```
 
-`discord.py[voice]` is a runtime dependency: `discord.VoiceClient.__init__` refuses to build
-without PyNaCl and the Python `davey` bindings, even though this library's crypto and MLS
-session are native.
+Only plain `discord.py` is required. `discord.py[voice]` (PyNaCl + the Python `davey`
+bindings) is **not** needed: `VoiceClient` implements `VoiceProtocol` directly, so discord.py's
+capability checks and its PyNaCl/`davey` code paths are never entered.
+
+> **Note:** discord.py logs ``PyNaCl is not installed, voice will NOT be supported`` (and the
+> `davey` equivalent) once at login, because it inspects *its own* backend. Voice through
+> `discord_ext_voice.VoiceClient` works regardless. If you also want discord.py's built-in
+> voice client, install `discord.py[voice]`; to silence the message instead, raise the log
+> level for `discord.client`.
 
 ## Usage
 
@@ -109,9 +122,11 @@ async def on_message(message):
         await message.guild.voice_client.disconnect()
 ```
 
-Because `dev.VoiceClient` *is* a `discord.VoiceClient`, everything works the same way it does
-with discord.py: `is_playing()`, `pause()`, `resume()`, `stop()`, `source`, `move_to()`,
-`latency`, `average_latency`, `voice_privacy_code`, the `after` callback, and so on.
+`dev.VoiceClient` provides the same members discord.py's client does for sending audio:
+`play()`, `is_playing()`, `is_paused()`, `pause()`, `resume()`, `stop()`, `source`, `move_to()`,
+`disconnect()`, `is_connected()`, `wait_until_connected()`, `latency`, `average_latency`,
+`voice_privacy_code`, the `after` callback, and so on. `channel.connect(cls=dev.VoiceClient)`
+accepts it because it implements `discord.VoiceProtocol`.
 
 ### Audio sources
 
@@ -206,14 +221,17 @@ identical to discord.py's while the work is native.
 
 ```bash
 cargo test          # 22 Rust unit tests
-pytest -q           # 128 Python tests
+pytest -q           # 128 Python tests (the interop module skips itself without PyNaCl)
 ```
 
 The Python suite includes:
 
 * a fake voice gateway that speaks the real protocol (HELLO, IDENTIFY, READY, UDP IP
   discovery, SELECT_PROTOCOL, SESSION_DESCRIPTION, heartbeats, DAVE opcodes) and records RTP;
-* PyNaCl interoperability tests for **all four** encryption modes, in both directions;
+* PyNaCl interoperability tests for **all four** encryption modes, in both directions
+  (`pynacl` is a test dependency; the tests skip if it is missing);
+* a test asserting `VoiceClient` still constructs when `discord.voice_client.has_nacl` and
+  `has_dave` are false;
 * DAVE tests asserting a real MLS key package (opcode 26) is produced and that transitions are
   acknowledged;
 * end-to-end `VoiceClient` tests covering playback, pause/resume, `after` callbacks,

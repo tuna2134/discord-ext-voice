@@ -462,7 +462,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
- "tracing",
  "webpki-roots",
  "xsalsa20poly1305",
 ]

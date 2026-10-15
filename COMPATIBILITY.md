@@ -11,34 +11,46 @@ It reflects `discord.py` **2.7.1** (`discord/voice_client.py`, `discord/voice_st
 ## Layering
 
 ```python
-class VoiceClient(discord.voice_client.VoiceClient): ...                     # 3 overrides
+class VoiceClient(discord.voice_client.VoiceProtocol): ...                   # implements the protocol
 class VoiceConnectionState(discord.voice_state.VoiceConnectionState): ...    # 12 overrides
 class DiscordVoiceWebSocket(discord.gateway.DiscordVoiceWebSocket): ...      # read side only
 class FFmpegPCMAudio(_InProcessFirst, discord.player.FFmpegPCMAudio): ...    # read/cleanup
 class FFmpegOpusAudio(_InProcessFirst, discord.player.FFmpegOpusAudio): ...  # read/cleanup/probe
 ```
 
+`discord.VoiceProtocol` is discord.py's documented extension point for third-party backends
+("such as Lavalink or a native library implementation"), which is exactly what this is.
+discord.py's own `VoiceClient` is deliberately **not** inherited: it is built on PyNaCl and the
+Python `davey` bindings, so inheriting it would mean bypassing its constructor and carrying
+code paths that can never run here.
+
 The Rust core is reached through a single object, `discord_ext_voice._native.VoiceConnection`,
 exposed as `voice.native` (`voice._connection.native`).
 
 ## `VoiceClient`
 
-| Member | Source |
+`VoiceClient` lives in `discord_ext_voice/voice_client.py` and is a `VoiceProtocol`
+implementation, so its members are written here rather than inherited:
+
+| Member | Behaviour |
 | --- | --- |
-| `__init__` | **inherited** (requires `discord.py[voice]`, see below) |
-| `connect`, `disconnect`, `move_to`, `is_connected`, `wait_until_connected` | inherited |
-| `guild`, `user`, `session_id`, `token`, `endpoint`, `ssrc`, `mode`, `secret_key`, `ws`, `timeout` | inherited (delegating to the state) |
-| `latency`, `average_latency`, `voice_privacy_code` | inherited (delegating to the native ws/session) |
-| `is_playing`, `is_paused`, `stop`, `pause`, `resume`, `source` | inherited |
-| `checked_add`, `wait_until_connected`, `on_voice_state_update`, `on_voice_server_update`, `cleanup` | inherited |
-| `create_connection_state` | **overridden** → returns the native-backed state |
-| `play` | **overridden** → installs the native Opus encoder, then uses `discord.player.AudioPlayer` |
-| `send_audio_packet` | **overridden** → encodes, DAVE-encrypts, RTP-encrypts and sends in Rust |
+| `__init__(client, channel)`, `create_connection_state()` | build the native-backed `VoiceConnectionState` |
+| `on_voice_state_update`, `on_voice_server_update` | forwarded to the connection state |
+| `connect`, `disconnect`, `move_to`, `is_connected`, `wait_until_connected` | thin delegations to the connection state (which is discord.py's) |
+| `guild`, `user`, `session_id`, `token`, `endpoint`, `ssrc`, `mode`, `secret_key`, `ws`, `timeout` | read from the connection state |
+| `latency`, `average_latency`, `voice_privacy_code` | read from the native transport |
+| `play`, `is_playing`, `is_paused`, `stop`, `pause`, `resume`, `source` | discord.py's semantics; `play` installs the native Opus encoder and then uses `discord.player.AudioPlayer` |
+| `send_audio_packet` | encodes, DAVE-encrypts, RTP-encrypts and sends in Rust |
+| `supported_modes` | read from `discord.VoiceClient.supported_modes` so the two cannot drift |
+| `cleanup` | inherited from `VoiceProtocol` (removes the client from the state cache) |
 | `native` | **added** → the `_native.VoiceConnection` handle |
-| `warn_nacl`, `warn_dave` | set to `False`; both capabilities are native |
 
 `play` keeps discord.py's exact signature, validation and `ClientException`/`TypeError`
 behaviour — only the encoder is swapped, so no `discord.opus.load_opus()` is needed.
+
+Deliberately absent, because the native transport owns them and nothing reads them:
+`checked_add`, `sequence`, `timestamp`, `_incr_nonce`, `server_id`, `socket`, `_get_voice_packet`
+and the `_encrypt_*` helpers (the PyNaCl-based packet builder).
 
 ## `VoiceConnectionState`
 
@@ -123,18 +135,20 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
 
 ## Intentional differences
 
-1. **`discord.py[voice]` is required.** `discord.VoiceClient.__init__` refuses to construct
-   without PyNaCl and the Python `davey` bindings, and discord.py's inherited bookkeeping
-   (`_get_voice_packet`, `_encrypt_*`, the `warn_nacl`/`warn_dave` checks) refers to them.
-   Neither is used by this library — the crypto and the MLS session are native.
+1. **PyNaCl and the Python `davey` bindings are not used.** `VoiceClient` is a
+   `VoiceProtocol` implementation, so discord.py's capability checks, its PyNaCl-based packet
+   builder and its Python `davey` session are never entered. discord.py still logs its own
+   capability warning at login, because it inspects its own backend; see the README.
+   `isinstance(voice, discord.VoiceClient)` is therefore `False` — use
+   `isinstance(voice, discord.VoiceProtocol)` (which is what `channel.connect` checks).
 2. **A missing local file raises `FFmpegSourceError` at construction**, where discord.py only
    surfaces it once the subprocess exits. A `PathLike` is accepted.
 3. **`FFmpegAudio._check_process_returncode` waits for the child** (up to 5s) before reading
    `Popen.poll()`, so an `ffmpeg` failure is always reported. discord.py can miss it if the
    process has not been reaped yet.
-4. **`before_options`/`options` always take the subprocess path.** Supporting `-ss` in process
-   was deliberately dropped: FFmpeg's CLI grammar is not expressible through libav's option
-   table, and partly supporting it was a source of surprises.
+4. **`before_options`/`options` always take the subprocess path.** The in-process decoder
+   accepts no FFmpeg CLI options at all: `-ss`/`-t`/`-f` and friends are CLI grammar that
+   libav's option table cannot express, so they are handed to the binary as-is.
 5. **Reconnect event ordering.** The inherited `_inner_connect` reaches
    `got_both_voice_updates` after a `4015` resume only if the server update arrives before the
    state update, because `voice_state_update` does not transition away from `connected`. This
@@ -147,8 +161,9 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
 ## Additions
 
 * `discord_ext_voice.probe(source)` — codec/rate/channels/duration without decoding.
-* `voice.native` / `state.native` — the `_native.VoiceConnection`, with `is_connected()`,
-  `latency`, `mode`, `secret_key`, `voice_privacy_code`, `decrypt_rtp`, `decrypt_dave`,
-  `encode`, `handle_dave_binary`, `wait_for_phase`, `close_code`, ...
+* `voice.native` / `state.native` — the `_native.VoiceConnection`: `is_connected()`, `phase`,
+  `latency`, `average_latency`, `seq_ack`, `ssrc`, `ip`/`port`/`voice_port`, `mode`,
+  `secret_key`, `dave_protocol_version`, `can_encrypt`, `has_dave_session`,
+  `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `wait_closed`, ...
 * `FFmpegPCMAudio(..., force_cli=True)` and `FFmpegOpusAudio.probe_codec(source)`.
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

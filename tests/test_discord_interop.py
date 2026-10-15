@@ -18,17 +18,55 @@ import discord.voice_client as discord_voice_client  # noqa: E402
 import discord_ext_voice as dev  # noqa: E402
 
 
-def test_voice_client_is_a_discord_voice_client():
+def test_voice_client_implements_voice_protocol():
+    """`VoiceProtocol` is discord.py's extension point for alternative voice backends."""
     assert issubclass(dev.VoiceClient, discord_voice_client.VoiceProtocol)
-    assert issubclass(dev.VoiceClient, discord_voice_client.VoiceClient)
     assert issubclass(dev.VoiceClient, discord.VoiceProtocol)
-    assert issubclass(dev.VoiceClient, discord.VoiceClient)
+    # discord.py's own implementation is deliberately not inherited: it is built on PyNaCl and
+    # the Python `davey` bindings, neither of which this backend uses.
+    assert not issubclass(dev.VoiceClient, discord_voice_client.VoiceClient)
+    assert dev.VoiceProtocol is discord_voice_client.VoiceProtocol
 
 
 def test_the_discord_exception_types_are_reused():
     assert dev.ClientException is discord.errors.ClientException
     assert dev.FFmpegProcessError is discord.errors.FFmpegProcessError
-    assert dev.OpusNotLoaded is discord.opus.OpusNotLoaded
+    assert dev.ConnectionClosed is discord.errors.ConnectionClosed
+
+
+def test_voice_client_does_not_require_pynacl_or_davey(monkeypatch):
+    """Our `VoiceClient` must work when discord.py's own capability checks would fail."""
+    import asyncio
+    import types
+
+    import discord.voice_client as discord_voice_client
+
+    monkeypatch.setattr(discord_voice_client, 'has_nacl', False)
+    monkeypatch.setattr(discord_voice_client, 'has_dave', False)
+
+    with pytest.raises(RuntimeError, match='PyNaCl'):
+        discord_voice_client.VoiceClient(object(), object())
+
+    class _State:
+        loop = None
+        user = types.SimpleNamespace(id=222)
+
+    class _Client:
+        _connection = _State()
+
+    class _Channel:
+        id = 333
+        guild = types.SimpleNamespace(id=111)
+
+    voice = dev.VoiceClient(_Client(), _Channel())
+    try:
+        assert voice._connection.native is not None
+        assert voice.native.is_connected() is False
+        assert voice.encoder is None
+        assert voice.is_playing() is False
+        assert asyncio.iscoroutinefunction(voice.connect)
+    finally:
+        voice._connection._socket_reader.stop()
 
 
 def test_voice_client_constructor_signature_matches_discord():

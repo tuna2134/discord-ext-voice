@@ -38,7 +38,6 @@ from .errors import (
     ConnectionClosed,
     ConnectionClosedError,
     DaveError,
-    DiscordException,
     EncryptionError,
     FFmpegError,
     FFmpegProcessError,
@@ -46,7 +45,6 @@ from .errors import (
     HandshakeError,
     NotConnected,
     OpusError,
-    OpusNotLoaded,
     ProtocolError,
     VoiceError,
 )
@@ -112,11 +110,9 @@ __all__ = (
     'EncryptionError',
     'DaveError',
     'OpusError',
-    'OpusNotLoaded',
     'FFmpegError',
     'FFmpegProcessError',
     'FFmpegSourceError',
-    'DiscordException',
     'ConnectionClosed',
     '__version__',
 )

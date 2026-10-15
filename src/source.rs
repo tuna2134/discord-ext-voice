@@ -19,12 +19,12 @@ use std::path::PathBuf;
 use ac_ffmpeg::codec::Decoder;
 use ac_ffmpeg::codec::audio::AudioDecoder;
 use ac_ffmpeg::codec::audio::frame::AudioFrame;
-use ac_ffmpeg::format::demuxer::{Demuxer, DemuxerWithStreamInfo, InputFormat};
+use ac_ffmpeg::format::demuxer::{Demuxer, DemuxerWithStreamInfo};
 use ac_ffmpeg::format::io::IO;
 use ac_ffmpeg::format::stream::Stream;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyBytes;
 
 use crate::errors::FFmpegError;
 use crate::resample::StereoResampler;
@@ -170,11 +170,7 @@ impl DemuxedInput {
     }
 }
 
-fn demux(
-    source: &Bound<'_, PyAny>,
-    format: Option<&str>,
-    options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<DemuxedInput> {
+fn demux(source: &Bound<'_, PyAny>) -> PyResult<DemuxedInput> {
     let input = open_input(source)?;
     let seekable = input.seekable();
 
@@ -184,21 +180,7 @@ fn demux(
         IO::from_read_stream(input)
     };
 
-    let mut builder = Demuxer::builder();
-    if let Some(format) = format
-        && let Some(input_format) = InputFormat::find_by_name(format)
-    {
-        builder = builder.input_format(Some(input_format));
-    }
-    if let Some(options) = options {
-        for (key, value) in options.iter() {
-            let key: String = key.extract()?;
-            let value: String = value.str()?.to_string_lossy().into_owned();
-            builder = builder.set_option(key.as_str(), value);
-        }
-    }
-
-    let demuxer = builder
+    let demuxer = Demuxer::builder()
         .build(io)
         .map_err(|err| ffmpeg_err(format!("FFmpeg could not open the input: {err}")))?;
     let demuxer = demuxer.find_stream_info(None).map_err(|(_, err)| {
@@ -226,10 +208,6 @@ pub struct DecodeSource {
     decoder: AudioDecoder,
     resampler: Option<StereoResampler>,
     pending: VecDeque<u8>,
-    /// Samples per channel that still need to be discarded (`-ss`).
-    skip_samples: u64,
-    /// Samples per channel left before the source ends (`-t`).
-    remaining_samples: Option<u64>,
     input_done: bool,
     flushed: bool,
     finished: bool,
@@ -242,50 +220,20 @@ pub struct DecodeSource {
 unsafe impl Send for DecodeSource {}
 
 impl DecodeSource {
-    fn open(
-        source: &Bound<'_, PyAny>,
-        format: Option<&str>,
-        options: Option<&Bound<'_, PyDict>>,
-        start_time: Option<f64>,
-        end_time: Option<f64>,
-    ) -> PyResult<Self> {
-        let demuxed = demux(source, format, options)?;
+    fn open(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let demuxed = demux(source)?;
         let stream_index = demuxed.stream_index;
 
         let decoder = AudioDecoder::from_stream(demuxed.stream())
             .and_then(|builder| builder.build())
             .map_err(|err| ffmpeg_err(format!("FFmpeg could not open the audio decoder: {err}")))?;
 
-        let demuxer = demuxed.demuxer.into_demuxer();
-
-        // Offsets are honoured by discarding decoded samples, which keeps the source usable
-        // for non-seekable inputs (pipes, sockets, ...) as well.
-        let skip_samples = start_time.map(|s| (s.max(0.0) * f64::from(TARGET_SAMPLE_RATE)) as u64);
-        let remaining_samples = match (start_time, end_time) {
-            (_, Some(end)) => {
-                let end_samples = (end.max(0.0) * f64::from(TARGET_SAMPLE_RATE)) as u64;
-                let start_samples = start_time
-                    .map(|s| (s.max(0.0) * f64::from(TARGET_SAMPLE_RATE)) as u64)
-                    .unwrap_or(0);
-                Some(end_samples.saturating_sub(start_samples))
-            }
-            _ => None,
-        };
-
-        if let Some(offset) = start_time
-            && offset > 0.0
-        {
-            log_debug!("skipping {offset}s of decoded audio");
-        }
-
         Ok(Self {
-            demuxer,
+            demuxer: demuxed.demuxer.into_demuxer(),
             stream_index,
             decoder,
             resampler: None,
             pending: VecDeque::new(),
-            skip_samples: skip_samples.unwrap_or(0),
-            remaining_samples,
             input_done: false,
             flushed: false,
             finished: false,
@@ -327,36 +275,8 @@ impl DecodeSource {
         if converted.is_empty() {
             return Ok(());
         }
-        self.queue_pcm(&converted);
+        self.pending.extend(converted.iter().copied());
         Ok(())
-    }
-
-    /// Apply the `-ss`/`-t` window to freshly converted stereo PCM.
-    fn queue_pcm(&mut self, data: &[u8]) {
-        let bytes_per_sample = (FRAME_CHANNELS * 2) as u64;
-        let mut data = data;
-
-        if self.skip_samples > 0 {
-            let skip_bytes = (self.skip_samples * bytes_per_sample).min(data.len() as u64) as usize;
-            self.skip_samples -= skip_bytes as u64 / bytes_per_sample;
-            data = &data[skip_bytes..];
-        }
-
-        if data.is_empty() {
-            return;
-        }
-
-        if let Some(remaining) = self.remaining_samples.as_mut() {
-            let allowed_bytes = (*remaining * bytes_per_sample).min(data.len() as u64) as usize;
-            *remaining -= allowed_bytes as u64 / bytes_per_sample;
-            data = &data[..allowed_bytes];
-            if data.is_empty() {
-                self.finished = true;
-                return;
-            }
-        }
-
-        self.pending.extend(data.iter().copied());
     }
 
     /// Advance the pipeline until at least one 20ms frame is buffered or the input ends.
@@ -384,7 +304,7 @@ impl DecodeSource {
                     if let Some(resampler) = self.resampler.as_mut() {
                         let mut converted = Vec::new();
                         resampler.flush(&mut converted).map_err(ffmpeg_err)?;
-                        self.queue_pcm(&converted);
+                        self.pending.extend(converted.iter().copied());
                     }
                     continue;
                 }
@@ -441,12 +361,8 @@ pub struct OpusSource {
 unsafe impl Send for OpusSource {}
 
 impl OpusSource {
-    fn open(
-        source: &Bound<'_, PyAny>,
-        format: Option<&str>,
-        options: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
-        let demuxed = demux(source, format, options)?;
+    fn open(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let demuxed = demux(source)?;
         let stream_index = demuxed.stream_index;
 
         let codec = demuxed
@@ -495,8 +411,8 @@ pub type ProbeResult = Option<(String, u32, usize, Option<f64>)>;
 
 /// Probe a source and report `(codec, sample_rate, channels, duration_seconds)` without
 /// decoding anything.
-pub fn probe_source(source: &Bound<'_, PyAny>, format: Option<&str>) -> PyResult<ProbeResult> {
-    let demuxed = demux(source, format, None)?;
+pub fn probe_source(source: &Bound<'_, PyAny>) -> PyResult<ProbeResult> {
+    let demuxed = demux(source)?;
     let stream = demuxed.stream();
 
     let parameters = stream.codec_parameters();
@@ -530,15 +446,8 @@ pub struct PyDecodeSource {
 #[pymethods]
 impl PyDecodeSource {
     #[new]
-    #[pyo3(signature = (source, *, format=None, start_time=None, end_time=None, options=None))]
-    fn new(
-        source: &Bound<'_, PyAny>,
-        format: Option<String>,
-        start_time: Option<f64>,
-        end_time: Option<f64>,
-        options: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
-        let inner = DecodeSource::open(source, format.as_deref(), options, start_time, end_time)?;
+    fn new(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let inner = DecodeSource::open(source)?;
         Ok(Self {
             inner: Mutex::new(inner),
         })
@@ -578,13 +487,8 @@ pub struct PyOpusSource {
 #[pymethods]
 impl PyOpusSource {
     #[new]
-    #[pyo3(signature = (source, *, format=None, options=None))]
-    fn new(
-        source: &Bound<'_, PyAny>,
-        format: Option<String>,
-        options: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
-        let inner = OpusSource::open(source, format.as_deref(), options)?;
+    fn new(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let inner = OpusSource::open(source)?;
         Ok(Self {
             inner: Mutex::new(inner),
         })
@@ -613,9 +517,8 @@ impl PyOpusSource {
 
 /// Probe a media source without decoding it.
 #[pyfunction]
-#[pyo3(signature = (source, *, format=None))]
-pub fn probe(source: &Bound<'_, PyAny>, format: Option<String>) -> PyResult<ProbeResult> {
-    probe_source(source, format.as_deref())
+pub fn probe(source: &Bound<'_, PyAny>) -> PyResult<ProbeResult> {
+    probe_source(source)
 }
 
 #[cfg(test)]

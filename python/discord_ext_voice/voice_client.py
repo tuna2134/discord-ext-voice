@@ -1,29 +1,31 @@
-"""A drop-in replacement for :class:`discord.voice_client.VoiceClient`.
+"""A `discord.py` voice backend implemented with :class:`discord.VoiceProtocol`.
 
-Use it exactly like the built-in client::
+``VoiceProtocol`` is discord.py's documented extension point for third-party voice backends
+("This class allows you to implement a protocol to allow for an external method of sending
+voice, such as Lavalink or a native library implementation"). This module implements it on top
+of the native transport, so nothing from discord.py's own `VoiceClient` — its PyNaCl-based
+encryption, its Python `davey` session, its capability guards — is inherited or worked around.
+
+The connection flow itself is :class:`discord.voice_state.VoiceConnectionState`, subclassed in
+:mod:`discord_ext_voice.voice_state`; the audio player is :class:`discord.player.AudioPlayer`.
+So the pieces discord.py provides are still reused — just not its *implementation* of this
+class, which is exactly what ``VoiceProtocol`` exists for.
+
+Usage is unchanged::
 
     import discord_ext_voice as dev
 
     voice = await channel.connect(cls=dev.VoiceClient)
     voice.play(dev.FFmpegPCMAudio('song.mp3'))
-
-:class:`VoiceClient` *is* a :class:`discord.voice_client.VoiceClient`, so every property and
-method (``guild``, ``latency``, ``move_to``, ``is_playing``, ``source``, ...) is inherited
-unchanged. Only two things differ, and both exist because the work happens in Rust:
-
-* :meth:`create_connection_state` builds :class:`~discord_ext_voice.VoiceConnectionState`,
-  which drives the native websocket/UDP/DAVE session;
-* :meth:`play` installs the native Opus encoder and :meth:`send_audio_packet` encodes,
-  encrypts (including DAVE) and transmits entirely in Rust.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from discord.player import AudioPlayer, AudioSource
 from discord.voice_client import VoiceClient as _DiscordVoiceClient
-from discord.voice_client import VoiceProtocol  # noqa: F401  (re-exported)
+from discord.voice_client import VoiceProtocol
 
 from . import opus
 from .errors import ClientException, NotConnected
@@ -40,15 +42,34 @@ has_nacl: bool = True
 has_dave: bool = True
 
 
-class VoiceClient(_DiscordVoiceClient):
-    """Represents a Discord voice connection backed by the native transport."""
+class VoiceClient(VoiceProtocol):
+    """Represents a Discord voice connection backed by the native transport.
 
-    #: Both capabilities come from the native core, so discord.py's PyNaCl/davey warnings do
-    #: not apply to this subclass.
-    warn_nacl: bool = False
-    warn_dave: bool = False
+    Parameters
+    ----------
+    client: :class:`discord.Client`
+        The client that started the connection request.
+    channel: :class:`discord.abc.Connectable`
+        The voice channel being connected to.
+    """
 
-    # ------------------------------------------------------------------ construction
+    #: The encryption modes this backend advertises. Read from :class:`discord.VoiceClient` so
+    #: the two can never disagree; the test suite also asserts that the native mode list
+    #: (:data:`discord_ext_voice.SUPPORTED_MODES`) matches it.
+    supported_modes: Tuple[str, ...] = _DiscordVoiceClient.supported_modes
+
+    def __init__(self, client: Any, channel: Any) -> None:
+        super().__init__(client, channel)
+        state = client._connection
+        self.loop = state.loop
+        self._state = state
+        self._player: Optional[AudioPlayer] = None
+        #: The Opus encoder, set by :meth:`play` for PCM sources and handed to the native
+        #: transport for every packet.
+        self.encoder: Any = None
+        self._connection: VoiceConnectionState = self.create_connection_state()
+
+    # ------------------------------------------------------------------ state accessors
 
     def create_connection_state(self) -> VoiceConnectionState:
         """Build the connection state that drives the native transport."""
@@ -58,6 +79,131 @@ class VoiceClient(_DiscordVoiceClient):
     def native(self) -> Any:
         """The underlying :class:`discord_ext_voice._native.VoiceConnection`."""
         return self._connection.native
+
+    @property
+    def guild(self) -> Any:
+        """:class:`discord.Guild`: The guild we're connected to."""
+        return self.channel.guild
+
+    @property
+    def user(self) -> Any:
+        """:class:`discord.ClientUser`: The user connected to voice (i.e. ourselves)."""
+        return self._state.user
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """Optional[:class:`str`]: The voice connection session ID."""
+        return self._connection.session_id
+
+    @property
+    def token(self) -> Optional[str]:
+        """Optional[:class:`str`]: The voice connection token."""
+        return self._connection.token
+
+    @property
+    def endpoint(self) -> Optional[str]:
+        """Optional[:class:`str`]: The endpoint we are connecting to."""
+        return self._connection.endpoint
+
+    @property
+    def ssrc(self) -> int:
+        """:class:`int`: The RTP synchronisation source Discord assigned to us."""
+        return self._connection.ssrc
+
+    @property
+    def mode(self) -> Optional[str]:
+        """Optional[:class:`str`]: The negotiated RTP encryption mode."""
+        return self._connection.mode
+
+    @property
+    def secret_key(self) -> Optional[list[int]]:
+        """Optional[List[:class:`int`]]: The RTP encryption key negotiated with Discord."""
+        return self._connection.secret_key
+
+    @property
+    def ws(self) -> Any:
+        """:class:`discord_ext_voice.DiscordVoiceWebSocket`: The voice websocket facade."""
+        return self._connection.ws
+
+    @property
+    def timeout(self) -> float:
+        """:class:`float`: How long to wait for the connection flow, in seconds."""
+        return self._connection.timeout
+
+    @property
+    def latency(self) -> float:
+        """:class:`float`: Latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds."""
+        return self._connection.native.latency
+
+    @property
+    def average_latency(self) -> float:
+        """:class:`float`: Average of the most recent 20 HEARTBEAT latencies in seconds."""
+        return self._connection.native.average_latency
+
+    @property
+    def voice_privacy_code(self) -> Optional[str]:
+        """Optional[:class:`str`]: The voice privacy code of this E2EE session's group.
+
+        A new privacy code is created each time a new transition is executed. This is ``None``
+        when there is no active DAVE session.
+        """
+        return self._connection.native.voice_privacy_code
+
+    # ------------------------------------------------------------------ connection
+
+    async def on_voice_state_update(self, data: dict, /) -> None:
+        """|coro|
+
+        Called by discord.py for every ``VOICE_STATE_UPDATE`` payload addressed to us.
+        """
+        await self._connection.voice_state_update(data)
+
+    async def on_voice_server_update(self, data: dict, /) -> None:
+        """|coro|
+
+        Called by discord.py for every ``VOICE_SERVER_UPDATE`` payload addressed to us.
+        """
+        await self._connection.voice_server_update(data)
+
+    async def connect(
+        self, *, reconnect: bool, timeout: float, self_deaf: bool = False, self_mute: bool = False
+    ) -> None:
+        """|coro|
+
+        Connects to voice and completes the handshake.
+        """
+        await self._connection.connect(
+            reconnect=reconnect,
+            timeout=timeout,
+            self_deaf=self_deaf,
+            self_mute=self_mute,
+            resume=False,
+        )
+
+    async def disconnect(self, *, force: bool = False) -> None:
+        """|coro|
+
+        Disconnects this voice client from voice.
+        """
+        self.stop()
+        await self._connection.disconnect(force=force, wait=True)
+        self.cleanup()
+
+    async def move_to(self, channel: Optional[Any], *, timeout: Optional[float] = 30.0) -> None:
+        """|coro|
+
+        Moves you to a different voice channel.
+        """
+        await self._connection.move_to(channel, timeout)
+
+    def is_connected(self) -> bool:
+        """Indicates if the voice client is connected to voice."""
+        return self._connection.is_connected()
+
+    def wait_until_connected(self, timeout: Optional[float] = 30.0) -> bool:
+        """Block until the connection is established (or ``timeout`` expires)."""
+        self._connection.wait(timeout)
+        return self._connection.is_connected()
 
     # ------------------------------------------------------------------ audio
 
@@ -75,9 +221,10 @@ class VoiceClient(_DiscordVoiceClient):
     ) -> None:
         """Plays an :class:`AudioSource`.
 
-        Identical to :meth:`discord.VoiceClient.play`, except that the encoder is the native
-        one, so no ``discord.opus.load_opus`` call is required. The finalizer ``after`` is
-        called after the source has been exhausted or an error occurred.
+        The finalizer ``after`` is called after the source has been exhausted or an error
+        occurred. The encoder parameters are only used for PCM based sources; they are passed
+        straight to the native :class:`discord_ext_voice.opus.Encoder`, which validates them
+        and raises :class:`ValueError` for bad values.
         """
         if not self.is_connected():
             raise ClientException('Not connected to voice.')
@@ -89,7 +236,6 @@ class VoiceClient(_DiscordVoiceClient):
             raise TypeError(f'source must be an AudioSource not {source.__class__.__name__}')
 
         if not source.is_opus():
-            # Validates the parameters and raises ValueError, exactly like discord.opus.Encoder.
             self.encoder = opus.Encoder(
                 application=application,
                 bitrate=bitrate,
@@ -102,11 +248,53 @@ class VoiceClient(_DiscordVoiceClient):
         self._player = AudioPlayer(source, self, after=after)
         self._player.start()
 
+    def is_playing(self) -> bool:
+        """Indicates if we're currently playing audio."""
+        return self._player is not None and self._player.is_playing()
+
+    def is_paused(self) -> bool:
+        """Indicates if we're playing audio, but if we're paused."""
+        return self._player is not None and self._player.is_paused()
+
+    def stop(self) -> None:
+        """Stops playing audio."""
+        if self._player:
+            self._player.stop()
+            self._player = None
+
+    def pause(self) -> None:
+        """Pauses the audio playing."""
+        if self._player:
+            self._player.pause()
+
+    def resume(self) -> None:
+        """Resumes the audio playing."""
+        if self._player:
+            self._player.resume()
+
+    @property
+    def source(self) -> Optional[AudioSource]:
+        """Optional[:class:`AudioSource`]: The audio source being played, if playing.
+
+        This property can also be used to change the audio source currently being played.
+        """
+        return self._player.source if self._player else None
+
+    @source.setter
+    def source(self, value: AudioSource) -> None:
+        if not isinstance(value, AudioSource):
+            raise TypeError(f'expected AudioSource not {value.__class__.__name__}.')
+
+        if self._player is None:
+            raise ValueError('Not playing anything.')
+
+        self._player.set_source(value)
+
     def send_audio_packet(self, data: bytes, *, encode: bool = True) -> None:
         """Sends an audio packet composed of the data.
 
-        The packet is Opus-encoded (when ``encode`` is set), DAVE-encrypted when the session
-        is ready, RTP-encrypted and transmitted by the native transport.
+        The packet is Opus-encoded (when ``encode`` is set), DAVE-encrypted when the session is
+        ready, RTP-encrypted and transmitted — all by the native transport.
 
         Parameters
         ----------
@@ -120,3 +308,9 @@ class VoiceClient(_DiscordVoiceClient):
             self._connection.native.send_audio_packet(data, encode=encode, encoder=encoder)
         except NotConnected as exc:
             raise ClientException(str(exc)) from exc
+
+    def __repr__(self) -> str:
+        return (
+            f'<VoiceClient guild={getattr(self.channel.guild, "id", None)} '
+            f'channel={getattr(self.channel, "id", None)} connected={self.is_connected()}>'
+        )

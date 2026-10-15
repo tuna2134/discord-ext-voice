@@ -7,13 +7,11 @@ working for code that mixes both clients.
 
 from __future__ import annotations
 
-from discord.errors import (  # noqa: F401  (re-exported)
+from discord.errors import (  # noqa: F401  (re-exported: this library raises both)
     ClientException,
     ConnectionClosed,
-    DiscordException,
     FFmpegProcessError,
 )
-from discord.opus import OpusNotLoaded  # noqa: F401  (re-exported)
 
 from ._native import (  # noqa: F401  (re-exported)
     AlreadyConnected,
@@ -44,9 +42,7 @@ __all__ = (
     # discord.py's
     'ClientException',
     'ConnectionClosed',
-    'DiscordException',
     'FFmpegProcessError',
-    'OpusNotLoaded',
 )
 
 

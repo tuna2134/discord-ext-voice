@@ -10,10 +10,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use tokio::net::UdpSocket;
-use voice_model as vm;
-use voice_model::payload as vp;
 
 use crate::crypto::Mode;
 use crate::dave::Outgoing;
@@ -68,18 +65,6 @@ pub struct VoiceConnection {
     encoder: Arc<Mutex<Option<OpusEncoder>>>,
 }
 
-impl VoiceConnection {
-    fn send_commands(&self, outgoing: Vec<Outgoing>) {
-        for frame in outgoing {
-            let command = match frame {
-                Outgoing::Json(value) => WsCommand::Json(value),
-                Outgoing::Binary(bytes) => WsCommand::Binary(bytes),
-            };
-            self.hub.send(command);
-        }
-    }
-}
-
 #[pymethods]
 impl VoiceConnection {
     #[new]
@@ -115,26 +100,6 @@ impl VoiceConnection {
         state.dave.set_channel_id(channel_id);
     }
 
-    #[getter]
-    fn server_id(&self) -> Option<u64> {
-        self.hub.state.lock().server_id
-    }
-
-    #[getter]
-    fn session_id(&self) -> Option<String> {
-        self.hub.state.lock().session_id.clone()
-    }
-
-    #[getter]
-    fn token(&self) -> Option<String> {
-        self.hub.state.lock().token.clone()
-    }
-
-    #[getter]
-    fn endpoint(&self) -> Option<String> {
-        self.hub.state.lock().endpoint.clone()
-    }
-
     // ----------------------------------------------------------------- handshake inputs
 
     /// Store the `session_id` from a `VOICE_STATE_UPDATE` payload.
@@ -164,12 +129,6 @@ impl VoiceConnection {
         self.hub.bump();
     }
 
-    /// Whether everything needed to open the voice websocket has arrived.
-    fn has_voice_updates(&self) -> bool {
-        let state = self.hub.state.lock();
-        state.session_id.is_some() && state.token.is_some() && state.endpoint.is_some()
-    }
-
     // ----------------------------------------------------------------- connection state
 
     #[getter]
@@ -196,54 +155,6 @@ impl VoiceConnection {
 
     fn is_connected(&self) -> bool {
         self.hub.state.lock().phase.is_connected()
-    }
-
-    /// Block until the connection is established (or the timeout expires).
-    fn wait_until_connected(&self, timeout: Option<f64>) -> bool {
-        let deadline =
-            timeout.map(|t| std::time::Instant::now() + Duration::from_secs_f64(t.max(0.0)));
-        loop {
-            {
-                let state = self.hub.state.lock();
-                if state.phase.is_connected() {
-                    return true;
-                }
-                if state.closed {
-                    return false;
-                }
-            }
-            if let Some(deadline) = deadline
-                && std::time::Instant::now() >= deadline
-            {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Await a specific connection flow state.
-    #[pyo3(signature = (phase, timeout=None))]
-    fn wait_for_phase<'py>(
-        &self,
-        py: Python<'py>,
-        phase: u8,
-        timeout: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let Some(target) = phase_from_u8(phase) else {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{phase} is not a valid connection flow state"
-            )));
-        };
-        let hub = self.hub.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let reached = hub
-                .wait_for(
-                    timeout.map(|t| Duration::from_secs_f64(t.max(0.0))),
-                    |state| state.phase == target || state.closed,
-                )
-                .await;
-            Ok(reached && hub.state.lock().phase == target)
-        })
     }
 
     #[getter]
@@ -301,14 +212,6 @@ impl VoiceConnection {
         self.hub.state.lock().dave.protocol_version()
     }
 
-    fn set_dave_protocol_version(&self, version: u16) {
-        {
-            let mut state = self.hub.state.lock();
-            state.dave.set_protocol_version(version);
-        }
-        self.hub.bump();
-    }
-
     fn can_encrypt(&self) -> bool {
         self.hub.state.lock().dave.can_encrypt()
     }
@@ -343,18 +246,6 @@ impl VoiceConnection {
         })
     }
 
-    /// Feed a binary DAVE frame that did not come from the websocket (used by tests).
-    fn handle_dave_binary(&self, data: &[u8]) -> PyResult<()> {
-        let outgoing = { self.hub.state.lock().dave.handle_binary(data) };
-        match outgoing {
-            Ok(frames) => {
-                self.send_commands(frames);
-                Ok(())
-            }
-            Err(err) => Err(DaveError::new_err(err.to_string())),
-        }
-    }
-
     // ----------------------------------------------------------------- websocket control
 
     /// Serialize and send a JSON frame, returning whether the socket accepted it.
@@ -382,28 +273,6 @@ impl VoiceConnection {
             ));
         };
         send_datagram(&socket, packet.to_vec());
-        Ok(())
-    }
-
-    /// Send a `SPEAKING` (opcode 5) frame.
-    fn speak(&self, state: u8) -> PyResult<()> {
-        let ssrc = self.hub.state.lock().ssrc;
-        let event = vm::Event::Speaking(vp::Speaking {
-            delay: Some(0),
-            speaking: vm::SpeakingState::from_bits_truncate(state),
-            ssrc,
-            user_id: None,
-        });
-        let value = serde_json::to_value(&event).map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "unable to serialize SPEAKING: {err}"
-            ))
-        })?;
-        if !self.hub.send(WsCommand::Json(value)) {
-            return Err(NotConnected::new_err(
-                "the voice websocket is not connected",
-            ));
-        }
         Ok(())
     }
 
@@ -522,59 +391,6 @@ impl VoiceConnection {
 
     // ----------------------------------------------------------------- audio
 
-    /// Create the Opus encoder used by `send_audio_packet(encode=True)`.
-    ///
-    /// The parameter list intentionally mirrors `discord.opus.Encoder.__init__`.
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (application="audio", bitrate=128, fec=true, expected_packet_loss=0.15, bandwidth="full", signal_type="auto"))]
-    fn set_encoder(
-        &self,
-        py: Python<'_>,
-        application: &str,
-        bitrate: u16,
-        fec: bool,
-        expected_packet_loss: f64,
-        bandwidth: &str,
-        signal_type: &str,
-    ) -> PyResult<()> {
-        let config = EncoderConfig {
-            application: intern_application(application)?,
-            bitrate,
-            fec,
-            expected_packet_loss,
-            bandwidth: intern_bandwidth(bandwidth)?,
-            signal_type: intern_signal(signal_type)?,
-        };
-        crate::opus::validate_config(&config)?;
-        let slot = self.encoder.clone();
-
-        py.detach(move || {
-            let encoder = OpusEncoder::new(&config).map_err(OpusError::new_err)?;
-            *slot.lock() = Some(encoder);
-            Ok(())
-        })
-    }
-
-    fn clear_encoder(&self) {
-        *self.encoder.lock() = None;
-    }
-
-    fn has_encoder(&self) -> bool {
-        self.encoder.lock().is_some()
-    }
-
-    /// Encode PCM into a single Opus frame without sending it.
-    fn encode<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        let mut slot = self.encoder.lock();
-        let encoder = slot.get_or_insert_with(|| {
-            OpusEncoder::new(&EncoderConfig::default())
-                .expect("the default Opus encoder must build")
-        });
-        let samples = crate::opus::bytes_to_samples(data);
-        let encoded = encoder.encode_frame(&samples).map_err(OpusError::new_err)?;
-        Ok(PyBytes::new(py, &encoded))
-    }
-
     /// Build, encrypt and send one RTP audio packet.
     #[pyo3(signature = (data, *, encode=true, encoder=None))]
     fn send_audio_packet(
@@ -669,12 +485,6 @@ impl VoiceConnection {
             .map_err(|err| EncryptionError::new_err(err.to_string()))
     }
 
-    /// Decrypt an E2EE Opus frame from `user_id` if DAVE is active.
-    fn decrypt_dave(&self, user_id: u64, data: &[u8]) -> PyResult<Option<Vec<u8>>> {
-        let result = { self.hub.state.lock().dave.decrypt_opus(user_id, data) };
-        result.map_err(|err| DaveError::new_err(err.to_string()))
-    }
-
     fn __repr__(&self) -> String {
         let state = self.hub.state.lock();
         format!(
@@ -686,47 +496,6 @@ impl VoiceConnection {
             state.dave.protocol_version()
         )
     }
-}
-
-fn intern_application(value: &str) -> PyResult<&'static str> {
-    Ok(match value {
-        "audio" => "audio",
-        "voip" => "voip",
-        "lowdelay" => "lowdelay",
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other} is not a valid application setting. Try one of: audiovoip lowdelay"
-            )));
-        }
-    })
-}
-
-fn intern_bandwidth(value: &str) -> PyResult<&'static str> {
-    Ok(match value {
-        "narrow" => "narrow",
-        "medium" => "medium",
-        "wide" => "wide",
-        "superwide" => "superwide",
-        "full" => "full",
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other:?} is not a valid bandwidth setting. Try one of: narrow,medium,wide,superwide,full"
-            )));
-        }
-    })
-}
-
-fn intern_signal(value: &str) -> PyResult<&'static str> {
-    Ok(match value {
-        "auto" => "auto",
-        "voice" => "voice",
-        "music" => "music",
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other:?} is not a valid signal type setting. Try one of: auto,voice,music"
-            )));
-        }
-    })
 }
 
 /// The encryption modes this build supports, most preferred first.

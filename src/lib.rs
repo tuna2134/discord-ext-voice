@@ -15,7 +15,6 @@
 //! `serenity-voice-model` after its upstream rename).
 
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 
 mod connection;
 mod crypto;
@@ -39,19 +38,13 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<opus::PyOpusDecoder>()?;
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
 
-    // Constants mirroring `discord.opus` and `discord.voice_client`.
+    // Constants the Python layer reads. Frame geometry lives on `OpusEncoder`, and the
+    // silence packet is discord.opus's, so neither is duplicated here.
     module.add(
         "DAVE_PROTOCOL_VERSION",
         dave::DaveState::max_protocol_version(),
     )?;
-    module.add("SAMPLES_PER_FRAME", opus::SAMPLES_PER_FRAME)?;
-    module.add("FRAME_LENGTH", opus::FRAME_LENGTH)?;
-    module.add("SAMPLING_RATE", opus::SAMPLING_RATE)?;
-    module.add("CHANNELS", opus::CHANNELS)?;
-    module.add("OPUS_SILENCE", PyBytes::new(py, &opus::OPUS_SILENCE))?;
     module.add("SUPPORTED_MODES", connection::supported_modes())?;
-    module.add("HAS_DAVE", true)?;
-    module.add("HAS_NACL", true)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     // Exception types.

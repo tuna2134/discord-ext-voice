@@ -20,9 +20,6 @@ pub const FRAME_LENGTH: usize = 20;
 pub const SAMPLING_RATE: u32 = 48_000;
 /// Number of channels Discord voice uses.
 pub const CHANNELS: usize = 2;
-/// The Opus packet Discord interprets as 20ms of silence.
-pub const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EncoderConfig {
     pub application: &'static str,

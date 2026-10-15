@@ -167,4 +167,6 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
   `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `close_reason`,
   `wait_closed`, ...
 * `FFmpegPCMAudio(..., force_cli=True)` and `FFmpegOpusAudio.probe_codec(source)`.
+* `DISCORD_EXT_VOICE_MAX_DAVE_VERSION=0` disables the DAVE advertisement in IDENTIFY (a
+  diagnostic switch for calls that refuse to come up; end-to-end encryption is then off).
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

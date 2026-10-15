@@ -476,8 +476,7 @@ fn identify_payload(hub: &Arc<Hub>) -> Value {
         session_id,
         token,
         user_id: UserId(state.user_id),
-        max_dave_protocol_version: (state.max_dave_protocol_version > 0)
-            .then_some(state.max_dave_protocol_version),
+        max_dave_protocol_version: max_dave_protocol_version(&state, dave_version_override()),
     });
     let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
     // The voice gateway rejects an unknown `d` shape silently, so keep this defensive.
@@ -496,6 +495,22 @@ fn log_outgoing(value: &Value) {
         }
     }
     log_debug!("sending voice frame: {redacted}");
+}
+
+/// The `max_dave_protocol_version` to advertise, honouring an explicit override.
+///
+/// `DISCORD_EXT_VOICE_MAX_DAVE_VERSION=0` turns the DAVE advertisement off, which is a useful
+/// A/B switch when a call refuses to come up (Discord answers a client that promises DAVE with
+/// a different handshake, and the E2EE path is optional while `davey` negotiates it).
+fn max_dave_protocol_version(state: &VoiceState, override_version: Option<u16>) -> Option<u16> {
+    let version = override_version.unwrap_or(state.max_dave_protocol_version);
+    (version > 0).then_some(version)
+}
+
+fn dave_version_override() -> Option<u16> {
+    std::env::var("DISCORD_EXT_VOICE_MAX_DAVE_VERSION")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 fn resume_payload(hub: &Arc<Hub>) -> Result<Value, TransportError> {
@@ -966,8 +981,10 @@ fn handle_session_description(
         dispatch(hub, tx, outgoing)?;
     }
 
-    // Discord needs to learn our SSRC before it will accept RTP, and `discord.py` does that
-    // by sending a "not speaking" SPEAKING frame here.
+    // "The client must send this at least once before sending audio to update the SSRC and set
+    // the initial speaking mode." `discord.py`'s player does that when playback starts; doing it
+    // here as well means the SSRC is announced before the first packet no matter who plays.
+    // https://docs.discord.com/developers/topics/voice-connections#speaking
     let event = vm::Event::Speaking(vp::Speaking {
         delay: Some(0),
         speaking: vm::SpeakingState::empty(),
@@ -1041,6 +1058,19 @@ mod tests {
             ("us-east1.discord.media".into(), 443)
         );
         assert_eq!(split_endpoint("localhost:8443"), ("localhost".into(), 8443));
+    }
+
+    #[test]
+    fn dave_version_can_be_turned_off_for_the_identify_payload() {
+        let hub = Hub::new(1, 2, 3);
+        let mut state = hub.state.lock();
+        state.max_dave_protocol_version = 1;
+        assert_eq!(max_dave_protocol_version(&state, None), Some(1));
+        assert_eq!(max_dave_protocol_version(&state, Some(0)), None);
+        assert_eq!(max_dave_protocol_version(&state, Some(2)), Some(2));
+
+        state.max_dave_protocol_version = 0;
+        assert_eq!(max_dave_protocol_version(&state, None), None);
     }
 
     #[test]

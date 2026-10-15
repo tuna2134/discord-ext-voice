@@ -18,6 +18,7 @@ meaningful.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from discord.errors import ConnectionClosed
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
     from .voice_state import VoiceConnectionState
 
 __all__ = ('DiscordVoiceWebSocket',)
+
+_log = logging.getLogger(__name__)
 
 
 class DiscordVoiceWebSocket:
@@ -139,6 +142,7 @@ class DiscordVoiceWebSocket:
 
             state = SpeakingState.voice
 
+        _log.debug('sending SPEAKING %s (ssrc=%s)', int(state), self._native.ssrc)
         await self.send_as_json(
             {
                 'op': self.SPEAKING,

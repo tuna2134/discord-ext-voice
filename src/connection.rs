@@ -446,7 +446,8 @@ impl VoiceConnection {
                 data.to_vec()
             };
 
-            let payload = if state.dave.can_encrypt() {
+            let dave_active = state.dave.can_encrypt();
+            let payload = if dave_active {
                 match state.dave.encrypt_opus(&payload) {
                     Ok(Some(encrypted)) => encrypted,
                     Ok(None) => payload,
@@ -475,6 +476,15 @@ impl VoiceConnection {
             let packet = encryptor
                 .encrypt(&header, &payload)
                 .map_err(|err| EncryptionError::new_err(err.to_string()))?;
+
+            log_debug!(
+                "sending RTP: seq={} ssrc={} {} bytes (opus={}, dave={})",
+                state.sequence,
+                ssrc,
+                packet.len(),
+                if encode { "encoded" } else { "passthrough" },
+                if dave_active { "on" } else { "off" }
+            );
 
             state.timestamp = crate::transport::VoiceState::checked_add(
                 u64::from(state.timestamp),

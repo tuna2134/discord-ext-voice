@@ -212,6 +212,7 @@ impl DaveState {
 
     /// Mirrors `VoiceConnectionState._execute_transition`.
     fn execute_transition(&mut self, transition_id: u16) {
+        let before = (self.protocol_version, self.can_encrypt());
         let Some(new_version) = self.pending_transitions.remove(&transition_id) else {
             crate::log_warning!(
                 "received execute transition, but no pending transition for id {transition_id}"
@@ -233,7 +234,13 @@ impl DaveState {
             crate::log_debug!("DAVE session upgraded");
         }
 
-        crate::log_debug!("DAVE transition {transition_id} executed");
+        crate::log_debug!(
+            "DAVE transition {transition_id} executed: protocol_version {} -> {}, can_encrypt {} -> {}",
+            before.0,
+            self.protocol_version,
+            before.1,
+            self.can_encrypt()
+        );
     }
 
     /// Build the `dave_mls_invalid_commit_welcome` (opcode 31) recovery frame and re-create the

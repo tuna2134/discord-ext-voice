@@ -60,6 +60,22 @@ async def on_message(message: discord.Message) -> None:
             bitrate=128,
         )
 
+    elif message.content == '!status':
+        # Handy when audio does not arrive: it separates "the player is running" from "the
+        # transport is encrypting", which is what the log alone makes hard to tell apart.
+        voice = message.guild.voice_client
+        if voice is None:
+            await message.reply('not connected')
+            return
+        native = voice.native
+        await message.reply(
+            f'connected={voice.is_connected()} playing={voice.is_playing()} '
+            f'source={voice.source!r}\n'
+            f'mode={native.mode} ssrc={native.ssrc} latency={native.latency:.3f}s\n'
+            f'dave: version={native.dave_protocol_version} '
+            f'session={native.has_dave_session()} can_encrypt={native.can_encrypt()}'
+        )
+
     elif message.content == '!leave':
         voice = message.guild.voice_client
         if voice is not None:

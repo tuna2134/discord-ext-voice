@@ -23,6 +23,7 @@ Usage is unchanged::
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Optional, Tuple
 
 from discord.player import AudioPlayer
@@ -35,6 +36,8 @@ from .sources import AudioSource, is_audio_source
 from .voice_state import VoiceConnectionState
 
 __all__ = ('VoiceClient', 'VoiceProtocol', 'has_nacl', 'has_dave')
+
+_log = logging.getLogger(__name__)
 
 #: Whether RTP encryption is available. Always ``True``: it is implemented natively with
 #: RustCrypto instead of PyNaCl.
@@ -309,6 +312,13 @@ class VoiceClient(VoiceProtocol):
             Indicates if ``data`` should be encoded into Opus.
         """
         encoder = self.encoder if isinstance(self.encoder, opus.Encoder) else None
+        _log.debug(
+            'send_audio_packet: %d bytes, encode=%s, encoder=%s, dave=%s',
+            len(data),
+            encode,
+            'play()' if encoder is not None else 'default',
+            self._connection.native.dave_protocol_version > 0,
+        )
         try:
             self._connection.native.send_audio_packet(data, encode=encode, encoder=encoder)
         except NotConnected as exc:

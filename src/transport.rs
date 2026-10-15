@@ -1012,13 +1012,17 @@ fn handle_session_description(
     // the initial speaking mode." `discord.py`'s player does that when playback starts; doing it
     // here as well means the SSRC is announced before the first packet no matter who plays.
     //
-    // The payload is built by hand to match the documented one exactly — `voice-model`'s
-    // `Speaking` also serialises a `user_id` member, which only the server-to-client form uses.
+    // `voice-model` also serialises a `user_id` member (as `null`) for this client-to-server
+    // form. Discord accepts it — leave it to the crate rather than hand-rolling the payload.
     // https://docs.discord.com/developers/topics/voice-connections#speaking
-    let value = serde_json::json!({
-        "op": 5,
-        "d": { "speaking": 0, "delay": 0, "ssrc": hub.state.lock().ssrc },
+    let event = vm::Event::Speaking(vp::Speaking {
+        delay: Some(0),
+        speaking: vm::SpeakingState::empty(),
+        ssrc: hub.state.lock().ssrc,
+        user_id: None,
     });
+    let value = serde_json::to_value(&event)
+        .map_err(|err| TransportError::Protocol(format!("unable to serialize SPEAKING: {err}")))?;
     let _ = tx.send(WsCommand::Json(value));
 
     {

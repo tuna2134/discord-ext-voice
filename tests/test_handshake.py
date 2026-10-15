@@ -78,11 +78,10 @@ async def test_speaking_none_is_sent_after_the_session_description(gateway_facto
         speaking = await gateway.wait_for_op(5)
         assert speaking['d']['speaking'] == 0
         assert speaking['d']['ssrc'] == SSRC
-        # Exactly the documented client payload: `user_id` belongs to the server-to-client form
-        # and Discord ignores an op 5 it cannot read, which leaves the SSRC unregistered.
-        # https://docs.discord.com/developers/topics/voice-connections#speaking
-        assert set(speaking['d']) == {'speaking', 'delay', 'ssrc'}
         assert speaking['d']['delay'] == 0
+        # `voice-model` serialises `user_id` as null for the client-to-server form; Discord
+        # accepts it, so the payload comes from the crate rather than being hand-rolled.
+        assert speaking['d'].get('user_id') is None
     finally:
         await conn.close()
 

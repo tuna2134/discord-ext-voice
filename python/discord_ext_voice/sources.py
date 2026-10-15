@@ -12,8 +12,8 @@ streamed with ``reqwest``), and use ``seek`` where ``-ss`` used to go.
 
 ":class:`AudioSource` is this package's own base class; nothing here inherits from discord.py.
 A source only has to provide ``read``/``is_opus``/``cleanup``, which is also the contract
-:class:`discord.player.AudioPlayer` (reused as the playback clock) relies on — so a user's own
-``discord.AudioSource`` subclass is still accepted by ``play()``.
+:class:`discord_ext_voice.AudioPlayer` relies on — so a user's own ``discord.AudioSource``
+subclass is still accepted by ``play()``.
 """
 
 from __future__ import annotations

@@ -14,10 +14,10 @@ voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished',
 `dev.VoiceClient` implements `discord.VoiceProtocol` — discord.py's documented extension point
 for alternative voice backends — on top of the native transport, and is the only class in this
 package that inherits from `discord.py`. Everything below it is this package's own:
-`dev.VoiceConnectionState` (the connection flow and reconnect policy),
-`dev.DiscordVoiceWebSocket` (the opcode surface the player talks to) and the audio sources
-(decoding in process with libav). From `discord.py` we *use* the host framework rather than
-inherit it: the client and its gateway, the `AudioPlayer` playback clock, and the exception
+`dev.VoiceConnectionState` (the connection flow, whose decisions are native),
+`dev.DiscordVoiceWebSocket` (the opcode surface the player talks to), `dev.AudioPlayer` (the
+playback clock) and the audio sources (decoding in process with libav). From `discord.py` we
+*use* the host framework rather than inherit it: the client and its gateway, and the exception
 classes the public API raises.
 
 Everything that must be native is native — and that is the whole voice protocol:
@@ -34,10 +34,10 @@ Everything that must be native is native — and that is the whole voice protoco
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
-| Connection flow, reconnect policy | This package: `discord_ext_voice.voice_state` |
+| Connection flow, reconnect policy | Rust: `_native.ConnectionFlow` (phases, close codes, retries, backoff), driven by `discord_ext_voice.voice_state` |
 | Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `ac-ffmpeg` / `libopus` |
 | `http(s)` inputs | `reqwest` (rustls, no OpenSSL), streamed straight into libav |
-| Playback clock (the player thread) | `discord.player.AudioPlayer` |
+| Playback clock (the player thread) | Rust: `discord_ext_voice.player` (20ms pacing, silence, speaking) |
 | Voice gateway opcodes and frame surface | This package: `discord_ext_voice.gateway` (Discord's opcode values) |
 | `ffmpeg` subprocess | **not used** — no binary, no pipe, no process to reap |
 
@@ -52,14 +52,16 @@ Everything that must be native is native — and that is the whole voice protoco
   `libswresample`/`libopus` do the rest, and `seek=` replaces `-ss`. There is no binary to
   install and no child process to reap. Getting the resampler there needed one upstream fix to
   `ac-ffmpeg` — see [patches/README.md](patches/README.md).
-* **Encoding, encryption and the UDP send happen in Rust**, so playback jitter does not
-  compete with Python work — the Python player thread just hands Rust 20ms of PCM.
+* **Encoding, encryption, the UDP send and the playback clock itself happen in Rust**, so
+  playback jitter does not compete with Python work — the player reads one frame from the source
+  and paces it against a native 20ms clock.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
   commit/welcome processing, epoch transitions and the passthrough windows.
-* **A thin Python layer.** About 1100 lines of Python (well over half of it docstrings and type
-  hints). The connection flow and the websocket surface are ours; the player thread and the
-  `VoiceProtocol` plumbing stay discord.py's, because they are the parts a `discord.py` bot
-  already drives.
+* **A thin Python layer.** The Python side holds the awaits and the discord.py-compatible
+  surface, not the decisions: the connection flow's state machine, close-code policy, retry
+  spacing and reconnect backoff are all in `_native.ConnectionFlow`, and Python dispatches on the
+  action it returns. The one thing discord.py provides is what a bot already drives: the client,
+  the main gateway, and the `VoiceProtocol` extension point `VoiceClient` implements.
 
 ## Requirements
 
@@ -158,7 +160,7 @@ and decodes in process with libav — the `ffmpeg` binary is never started:
 | `FFmpegPCMAudio(source, *, seek=None)` | libav decodes and resamples to 48kHz stereo `s16` |
 | `FFmpegOpusAudio(source, *, seek=None)` | Opus packets passed through, otherwise PCM + libopus |
 | `PCMVolumeTransformer(source, volume)` | Volume, scaled by the native core (no `audioop`) |
-| `AudioPlayer` | `discord.player.AudioPlayer`, reused as the playback clock |
+| `AudioPlayer(source, client, after=...)` | This package: a thin wrapper over the native playback thread |
 
 ```python
 dev.FFmpegPCMAudio('song.mp3')                 # decode in process with libav
@@ -250,15 +252,23 @@ frame copy before converting. The change is also exported as
 onto new releases and sent upstream; dropping the fork once a fixed release exists is a three
 line change, see [patches/README.md](patches/README.md).
 
-**The audio player thread stays in Python**, because it is discord.py's. Each 20ms frame goes
-from that thread into Rust for encoding, encryption and transmission, so the timing model is
-identical to discord.py's while the work is native.
+**The connection flow's decisions are native.** `discord_ext_voice.voice_state` awaits what only
+Python can await (discord.py's `Guild.change_voice_state`, the native handshake, the websocket
+close) and asks `_native.ConnectionFlow` what to do: which gateway event moves the phase where,
+what a close code means (1000/4014/4015/4021/4022/other), how long a retry waits and how long a
+reconnect backs off. The phase itself is the transport's, so there is one state rather than two.
+
+**The playback clock is native.** `discord_ext_voice.AudioPlayer` is a thin wrapper over a Rust
+thread that paces each 20ms frame, feeds silence while paused, announces the `SPEAKING` state and
+waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — `DELAY = 0.02`, the
+`after(error)` callback, and a clock that restarts on `resume` — without importing
+`discord.player`, whose `audioop` dependency would otherwise be pulled in.
 
 ## Testing
 
 ```bash
-cargo test          # 16 Rust unit tests
-pytest -q           # 128 Python tests (the interop module skips itself without PyNaCl)
+cargo test --lib    # 40 Rust unit tests
+pytest -q           # 174 Python tests (6 crypto interop tests need PyNaCl)
 ```
 
 The Python suite includes:
@@ -273,7 +283,10 @@ The Python suite includes:
   acknowledged;
 * end-to-end `VoiceClient` tests covering playback, pause/resume, `after` callbacks,
   `disconnect`, resume-after-4015 and the `discord.py` layering checks (only `VoiceClient`
-  inherits from it).
+  inherits from it);
+* `tests/test_flow.py` for the native connection flow: the phase round-trip, the waiting
+  primitives (including the timeout contract), and that every action Rust can return has a name
+  in Python. The transition table itself is unit-tested in `src/flow.rs`.
 
 ## Limitations
 

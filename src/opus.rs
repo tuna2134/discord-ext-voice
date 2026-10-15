@@ -8,6 +8,8 @@
 //! `VoiceClient.play(..., application=..., bitrate=..., fec=..., bandwidth=..., signal_type=...)`
 //! behaves identically to the pure-Python implementation.
 
+use std::sync::Arc;
+
 use audiopus::coder::Encoder as RawEncoder;
 use audiopus::packet::Packet;
 use audiopus::{Application, Bandwidth, Bitrate, Channels, MutSignals, SampleRate, Signal};
@@ -16,6 +18,9 @@ use audiopus::{Application, Bandwidth, Bitrate, Channels, MutSignals, SampleRate
 pub const SAMPLES_PER_FRAME: usize = 960;
 /// Frame length in milliseconds.
 pub const FRAME_LENGTH: usize = 20;
+/// The three byte packet Discord reads as "nothing is playing": an Opus DTX frame. Sent as is
+/// (never encoded) to fill the jitter buffer while paused, and on the way out.
+pub const OPUS_SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
 /// Sampling rate Discord voice uses.
 pub const SAMPLING_RATE: u32 = 48_000;
 /// Number of channels Discord voice uses.
@@ -305,9 +310,13 @@ pub fn bytes_to_samples(data: &[u8]) -> Vec<i16> {
 }
 
 /// A standalone Opus encoder, the native counterpart of `discord.opus.Encoder`.
+///
+/// The encoder itself is behind an `Arc` so that the playback thread can share it with this
+/// Python object and encode without taking the GIL (`AudioPlayer` owns a handle to the very same
+/// encoder `VoiceClient.play` created, so both paths always agree on the bitrate and FEC state).
 #[pyclass(module = "discord_ext_voice._native", name = "OpusEncoder")]
 pub struct PyOpusEncoder {
-    inner: Mutex<OpusEncoder>,
+    inner: Arc<Mutex<OpusEncoder>>,
 }
 
 #[pymethods]
@@ -332,7 +341,9 @@ impl PyOpusEncoder {
         };
         validate_config(&config)?;
         Ok(Self {
-            inner: Mutex::new(OpusEncoder::new(&config).map_err(OpusError::new_err)?),
+            inner: Arc::new(Mutex::new(
+                OpusEncoder::new(&config).map_err(OpusError::new_err)?,
+            )),
         })
     }
 
@@ -446,10 +457,10 @@ impl PyOpusEncoder {
 }
 
 impl PyOpusEncoder {
-    /// Used by `VoiceConnection.send_audio_packet` when the caller passes its encoder in.
-    pub fn encode_pcm(&self, pcm: &[u8]) -> Result<Vec<u8>, String> {
-        let samples = bytes_to_samples(pcm);
-        self.inner.lock().encode_frame(&samples)
+    /// The shared encoder, for callers on the native side (`AudioPlayer`, `VoiceConnection`)
+    /// that encode without holding the GIL.
+    pub fn handle(&self) -> Arc<Mutex<OpusEncoder>> {
+        Arc::clone(&self.inner)
     }
 }
 

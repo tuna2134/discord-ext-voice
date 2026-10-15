@@ -18,24 +18,10 @@ use crate::errors::{
     AlreadyConnected, ConnectionClosedError, DaveError, EncryptionError, HandshakeError,
     NotConnected, OpusError,
 };
+use crate::flow::{Backoff, PyConnectionFlow};
 use crate::opus::{EncoderConfig, OpusEncoder, SAMPLES_PER_FRAME};
 use crate::transport::{self, Hub, Phase, Session, WsCommand};
 use crate::{log_debug, log_info};
-
-fn phase_from_u8(value: u8) -> Option<Phase> {
-    Some(match value {
-        0 => Phase::Disconnected,
-        1 => Phase::SetGuildVoiceState,
-        2 => Phase::GotVoiceStateUpdate,
-        3 => Phase::GotVoiceServerUpdate,
-        4 => Phase::GotBothVoiceUpdates,
-        5 => Phase::WebsocketConnected,
-        6 => Phase::GotWebsocketReady,
-        7 => Phase::GotIpDiscovery,
-        8 => Phase::Connected,
-        _ => return None,
-    })
-}
 
 /// Send a UDP datagram without ever blocking the GIL.
 fn send_datagram(socket: &Arc<UdpSocket>, packet: Vec<u8>) {
@@ -62,7 +48,9 @@ fn send_datagram(socket: &Arc<UdpSocket>, packet: Vec<u8>) {
 pub struct VoiceConnection {
     hub: Arc<Hub>,
     session: Arc<Mutex<Option<Session>>>,
-    encoder: Arc<Mutex<Option<OpusEncoder>>>,
+    /// The reconnect backoff of the flow, which outlives a single poller run but restarts when
+    /// one does.
+    backoff: Arc<Mutex<Backoff>>,
 }
 
 #[pymethods]
@@ -72,7 +60,7 @@ impl VoiceConnection {
         Self {
             hub: Hub::new(guild_id, user_id, channel_id),
             session: Arc::new(Mutex::new(None)),
-            encoder: Arc::new(Mutex::new(None)),
+            backoff: Arc::new(Mutex::new(Backoff::default())),
         }
     }
 
@@ -137,24 +125,22 @@ impl VoiceConnection {
     }
 
     fn set_phase(&self, phase: u8) -> PyResult<()> {
-        let Some(phase) = phase_from_u8(phase) else {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+        crate::flow::set_phase(&self.hub, phase).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
                 "{phase} is not a valid connection flow state"
-            )));
-        };
-        {
-            let mut state = self.hub.state.lock();
-            if phase != Phase::Disconnected {
-                state.closed = false;
-            }
-            state.phase = phase;
-        }
-        self.hub.bump();
+            ))
+        })?;
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
         self.hub.state.lock().phase.is_connected()
+    }
+
+    /// The connection flow: the decisions the Python `VoiceConnectionState` dispatches on.
+    #[getter]
+    fn flow(&self) -> PyConnectionFlow {
+        PyConnectionFlow::new(Arc::clone(&self.hub), Arc::clone(&self.backoff))
     }
 
     #[getter]
@@ -422,101 +408,13 @@ impl VoiceConnection {
         encode: bool,
         encoder: Option<PyRef<'_, crate::opus::PyOpusEncoder>>,
     ) -> PyResult<()> {
-        // Records are collected and emitted after the lock is released: logging needs the GIL,
-        // and a Python thread that holds the GIL may be waiting for this lock.
-        let packet = {
-            let mut pending: Vec<(&'static str, String)> = Vec::new();
-            let mut state = self.hub.state.lock();
-
-            state.sequence =
-                crate::transport::VoiceState::checked_add(u64::from(state.sequence), 1, 65_535)
-                    as u16;
-
-            let payload = if encode {
-                match encoder.as_ref() {
-                    Some(encoder) => encoder.encode_pcm(data).map_err(OpusError::new_err)?,
-                    None => {
-                        let mut slot = self.encoder.lock();
-                        let encoder = slot.get_or_insert_with(|| {
-                            OpusEncoder::new(&EncoderConfig::default())
-                                .expect("the default Opus encoder must build")
-                        });
-                        let samples = crate::opus::bytes_to_samples(data);
-                        encoder.encode_frame(&samples).map_err(OpusError::new_err)?
-                    }
-                }
-            } else {
-                data.to_vec()
-            };
-
-            let dave_active = state.dave.can_encrypt();
-            let payload = if dave_active {
-                match state.dave.encrypt_opus(&payload) {
-                    Ok(Some(encrypted)) => encrypted,
-                    Ok(None) => payload,
-                    Err(err) => {
-                        pending.push((
-                            "warning",
-                            format!("DAVE encryption failed, sending plaintext: {err}"),
-                        ));
-                        payload
-                    }
-                }
-            } else {
-                payload
-            };
-
-            let mut header = [0u8; 12];
-            header[0] = 0x80;
-            header[1] = 0x78;
-            header[2..4].copy_from_slice(&state.sequence.to_be_bytes());
-            header[4..8].copy_from_slice(&state.timestamp.to_be_bytes());
-            header[8..12].copy_from_slice(&state.ssrc.to_be_bytes());
-
-            let ssrc = state.ssrc;
-            let encryptor = state.encryptor.as_mut().ok_or_else(|| {
-                NotConnected::new_err(format!(
-                    "the voice encryption key is not available yet (ssrc={ssrc})"
-                ))
-            })?;
-            let packet = encryptor
-                .encrypt(&header, &payload)
-                .map_err(|err| EncryptionError::new_err(err.to_string()))?;
-
-            pending.push((
-                "debug",
-                format!(
-                    "sending RTP: seq={} ssrc={} {} bytes (opus={}, dave={})",
-                    state.sequence,
-                    ssrc,
-                    packet.len(),
-                    if encode { "encoded" } else { "passthrough" },
-                    if dave_active { "on" } else { "off" }
-                ),
-            ));
-
-            state.timestamp = crate::transport::VoiceState::checked_add(
-                u64::from(state.timestamp),
-                SAMPLES_PER_FRAME as u64,
-                u64::from(u32::MAX),
-            ) as u32;
-
-            let socket = state.udp.clone();
-            (packet, socket, pending)
-        };
-
-        let (packet, socket, pending) = packet;
-        for (level, message) in pending {
-            crate::logging::log(level, &message);
-        }
-
-        let Some(socket) = socket else {
-            return Err(NotConnected::new_err(
-                "the voice UDP socket is not connected",
-            ));
-        };
-        send_datagram(&socket, packet);
-        Ok(())
+        send_audio_frame(
+            &self.hub,
+            data,
+            encode,
+            encoder.as_ref().map(|encoder| encoder.handle()),
+        )
+        .map_err(SendError::into_pyerr)
     }
 
     /// Decrypt a received RTP payload (for receive-side extensions and tests).
@@ -544,7 +442,159 @@ impl VoiceConnection {
     }
 }
 
+impl VoiceConnection {
+    /// The transport hub, shared with the playback thread so that it can send frames and see
+    /// the connection state without going through Python.
+    pub fn hub(&self) -> Arc<Hub> {
+        Arc::clone(&self.hub)
+    }
+}
+
 /// The encryption modes this build supports, most preferred first.
 pub fn supported_modes() -> Vec<&'static str> {
     Mode::supported().iter().map(|mode| mode.as_str()).collect()
+}
+
+/// Why a frame could not be sent, in the form both callers need: a Python exception for
+/// `VoiceConnection.send_audio_packet`, a message for the playback thread's `after` callback.
+pub enum SendError {
+    /// No encryption key, or no UDP socket: the handshake has not got that far, or is over.
+    NotConnected(String),
+    /// The Opus encoder rejected the frame.
+    Opus(String),
+    /// RTP encryption failed.
+    Encryption(String),
+}
+
+impl SendError {
+    pub fn into_pyerr(self) -> PyErr {
+        match self {
+            Self::NotConnected(message) => NotConnected::new_err(message),
+            Self::Opus(message) => OpusError::new_err(message),
+            Self::Encryption(message) => EncryptionError::new_err(message),
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::NotConnected(message) | Self::Opus(message) | Self::Encryption(message) => {
+                message
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Encode (when asked), DAVE-encrypt, RTP-encrypt and transmit one audio frame.
+///
+/// Callable from any thread: the playback thread uses it without holding the GIL, and
+/// `VoiceConnection.send_audio_packet` uses it for a frame a caller sends by hand. The Opus
+/// encode happens *before* the connection lock is taken, so no Python call can run while the
+/// state is locked (see `crate::logging` for why that ordering matters).
+pub fn send_audio_frame(
+    hub: &Arc<Hub>,
+    data: &[u8],
+    encode: bool,
+    encoder: Option<Arc<Mutex<OpusEncoder>>>,
+) -> Result<(), SendError> {
+    let payload = if encode {
+        let samples = crate::opus::bytes_to_samples(data);
+        match encoder {
+            Some(encoder) => encoder
+                .lock()
+                .encode_frame(&samples)
+                .map_err(SendError::Opus)?,
+            None => {
+                let mut slot = hub.encoder.lock();
+                let encoder = slot.get_or_insert_with(|| {
+                    OpusEncoder::new(&EncoderConfig::default())
+                        .expect("the default Opus encoder must build")
+                });
+                encoder.encode_frame(&samples).map_err(SendError::Opus)?
+            }
+        }
+    } else {
+        data.to_vec()
+    };
+
+    // Records are collected and emitted after the lock is released: logging needs the GIL,
+    // and a Python thread that holds the GIL may be waiting for this lock.
+    let mut pending: Vec<(&'static str, String)> = Vec::new();
+    let (packet, socket) = {
+        let mut state = hub.state.lock();
+
+        state.sequence =
+            crate::transport::VoiceState::checked_add(u64::from(state.sequence), 1, 65_535) as u16;
+
+        let dave_active = state.dave.can_encrypt();
+        let payload = if dave_active {
+            match state.dave.encrypt_opus(&payload) {
+                Ok(Some(encrypted)) => encrypted,
+                Ok(None) => payload,
+                Err(err) => {
+                    pending.push((
+                        "warning",
+                        format!("DAVE encryption failed, sending plaintext: {err}"),
+                    ));
+                    payload
+                }
+            }
+        } else {
+            payload
+        };
+
+        let mut header = [0u8; 12];
+        header[0] = 0x80;
+        header[1] = 0x78;
+        header[2..4].copy_from_slice(&state.sequence.to_be_bytes());
+        header[4..8].copy_from_slice(&state.timestamp.to_be_bytes());
+        header[8..12].copy_from_slice(&state.ssrc.to_be_bytes());
+
+        let ssrc = state.ssrc;
+        let encryptor = state.encryptor.as_mut().ok_or_else(|| {
+            SendError::NotConnected(format!(
+                "the voice encryption key is not available yet (ssrc={ssrc})"
+            ))
+        })?;
+        let packet = encryptor
+            .encrypt(&header, &payload)
+            .map_err(|err| SendError::Encryption(err.to_string()))?;
+
+        pending.push((
+            "debug",
+            format!(
+                "sending RTP: seq={} ssrc={} {} bytes (opus={}, dave={})",
+                state.sequence,
+                ssrc,
+                packet.len(),
+                if encode { "encoded" } else { "passthrough" },
+                if dave_active { "on" } else { "off" }
+            ),
+        ));
+
+        state.timestamp = crate::transport::VoiceState::checked_add(
+            u64::from(state.timestamp),
+            SAMPLES_PER_FRAME as u64,
+            u64::from(u32::MAX),
+        ) as u32;
+
+        (packet, state.udp.clone())
+    };
+
+    for (level, message) in pending {
+        crate::logging::log(level, &message);
+    }
+
+    let Some(socket) = socket else {
+        return Err(SendError::NotConnected(
+            "the voice UDP socket is not connected".to_owned(),
+        ));
+    };
+    send_datagram(&socket, packet);
+    Ok(())
 }

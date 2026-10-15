@@ -120,7 +120,43 @@ impl Phase {
     pub const fn is_connected(self) -> bool {
         matches!(self, Phase::Connected)
     }
+
+    /// The phase for a `ConnectionFlowState` value from Python.
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Phase::Disconnected,
+            1 => Phase::SetGuildVoiceState,
+            2 => Phase::GotVoiceStateUpdate,
+            3 => Phase::GotVoiceServerUpdate,
+            4 => Phase::GotBothVoiceUpdates,
+            5 => Phase::WebsocketConnected,
+            6 => Phase::GotWebsocketReady,
+            7 => Phase::GotIpDiscovery,
+            8 => Phase::Connected,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
 }
+
+/// A timeout from Python, as a [`Duration`].
+///
+/// Clamped so that a silly float cannot overflow `Duration::from_secs_f64` (which panics rather
+/// than saturating): negative and NaN become zero, infinity becomes a day.
+pub fn wait_duration(seconds: f64) -> Duration {
+    let seconds = if seconds.is_nan() {
+        0.0
+    } else {
+        seconds.clamp(0.0, MAX_WAIT)
+    };
+    Duration::from_secs_f64(seconds)
+}
+
+/// The longest anything here waits: a day.
+pub const MAX_WAIT: f64 = 24.0 * 60.0 * 60.0;
 
 /// Outgoing websocket frames, produced from any thread.
 #[derive(Debug)]
@@ -169,6 +205,13 @@ pub struct VoiceState {
 
     // ---- connection bookkeeping ----
     pub phase: Phase,
+    /// Whether the main gateway has been asked to put us in a channel and has not been asked to
+    /// take us out again. The phase alone cannot answer that: while the poller reconnects, the
+    /// phase is not `Connected` but we are still in the channel.
+    pub joined: bool,
+    /// Whether a leave request is in flight, so a `channel_id: None` update is expected rather
+    /// than a sign that Discord moved us.
+    pub expecting_disconnect: bool,
     pub latency: f64,
     pub recent_latencies: VecDeque<f64>,
     pub pending_heartbeats: HashMap<u64, std::time::Instant>,
@@ -204,6 +247,8 @@ impl VoiceState {
             udp: None,
             udp_target: None,
             phase: Phase::Disconnected,
+            joined: false,
+            expecting_disconnect: false,
             latency: f64::INFINITY,
             recent_latencies: VecDeque::new(),
             pending_heartbeats: HashMap::new(),
@@ -236,6 +281,9 @@ pub struct Hub {
     pub state: Mutex<VoiceState>,
     pub notify: Notify,
     pub ws_tx: Mutex<Option<mpsc::UnboundedSender<WsCommand>>>,
+    /// The encoder used when a caller sends PCM without passing one of its own. Shared with the
+    /// playback thread, which encodes through the same handle.
+    pub encoder: Mutex<Option<crate::opus::OpusEncoder>>,
 }
 
 impl Hub {
@@ -244,6 +292,7 @@ impl Hub {
             state: Mutex::new(VoiceState::new(guild_id, user_id, channel_id)),
             notify: Notify::new(),
             ws_tx: Mutex::new(None),
+            encoder: Mutex::new(None),
         })
     }
 
@@ -1009,21 +1058,9 @@ fn handle_session_description(
     }
 
     // "The client must send this at least once before sending audio to update the SSRC and set
-    // the initial speaking mode." `discord.py`'s player does that when playback starts; doing it
-    // here as well means the SSRC is announced before the first packet no matter who plays.
-    //
-    // `voice-model` also serialises a `user_id` member (as `null`) for this client-to-server
-    // form. Discord accepts it — leave it to the crate rather than hand-rolling the payload.
-    // https://docs.discord.com/developers/topics/voice-connections#speaking
-    let event = vm::Event::Speaking(vp::Speaking {
-        delay: Some(0),
-        speaking: vm::SpeakingState::empty(),
-        ssrc: hub.state.lock().ssrc,
-        user_id: None,
-    });
-    let value = serde_json::to_value(&event)
-        .map_err(|err| TransportError::Protocol(format!("unable to serialize SPEAKING: {err}")))?;
-    let _ = tx.send(WsCommand::Json(value));
+    // the initial speaking mode." Doing it here means the SSRC is announced before the first
+    // packet whatever plays; the playback thread announces the voice state again when it starts.
+    send_speaking(hub, vm::SpeakingState::empty());
 
     {
         let mut state = hub.state.lock();
@@ -1033,6 +1070,31 @@ fn handle_session_description(
     log_info!("voice connection established");
 
     Ok(())
+}
+
+/// Send the client `SPEAKING` frame (opcode 5) with the SSRC this connection announced.
+///
+/// The payload is built from `voice-model`'s `Event::Speaking` rather than by hand; the crate
+/// also serialises a `user_id` member (as `null`) for this client-to-server form, which Discord
+/// accepts.
+///
+/// https://docs.discord.com/developers/topics/voice-connections#speaking
+pub fn send_speaking(hub: &Arc<Hub>, speaking: vm::SpeakingState) {
+    let event = vm::Event::Speaking(vp::Speaking {
+        delay: Some(0),
+        speaking,
+        ssrc: hub.state.lock().ssrc,
+        user_id: None,
+    });
+    match serde_json::to_value(&event) {
+        Ok(value) => {
+            hub.send(WsCommand::Json(value));
+        }
+        Err(err) => crate::logging::log(
+            "warning",
+            &format!("unable to serialize the SPEAKING frame: {err}"),
+        ),
+    }
 }
 
 /// The `discord.py` IP discovery ping: a 74 byte packet whose response reveals the public

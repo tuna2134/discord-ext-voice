@@ -2,8 +2,8 @@
 
 The :class:`Encoder` and :class:`Decoder` here are the native ones (libopus through
 ``audiopus``), which means they work without ``discord.opus.load_opus``. The parameter type
-aliases, the silence packet and the error type come from :mod:`discord.opus` so the two
-implementations can never disagree.
+aliases come from :mod:`discord.opus` so the two implementations can never disagree, and the
+silence packet is the native constant the player sends.
 """
 
 from __future__ import annotations
@@ -12,9 +12,9 @@ from discord.opus import (  # noqa: F401  (re-exported)
     APPLICATION_AUDIO,
     APPLICATION_LOWDELAY,
     APPLICATION_VOIP,
-    OPUS_SILENCE,
 )
 
+from ._native import OPUS_SILENCE
 from ._native import OpusDecoder as Decoder
 from ._native import OpusEncoder as Encoder
 from ._native import OpusError

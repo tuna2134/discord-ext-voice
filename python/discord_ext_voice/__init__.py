@@ -9,9 +9,8 @@ Quick start::
     voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('done', error))
 
 The Python layer is a thin extension of ``discord.py``: :class:`VoiceClient` implements
-``discord.VoiceProtocol`` and reuses its connection flow state machine, gateway opcodes and
-audio player thread. The audio sources (:mod:`discord_ext_voice.sources`) and everything
-voice-specific are this package's own and happen in Rust:
+``discord.VoiceProtocol`` and is hosted by discord.py's connection machinery. Everything
+voice-specific is this package's own and happens in Rust:
 
 ======================  ==========================================================
 Concern                 Rust crate
@@ -23,14 +22,13 @@ End-to-end encryption   ``davey`` (DAVE / MLS)
 Opus codec              ``audiopus``
 Audio sources           :mod:`discord_ext_voice.sources` (``ac-ffmpeg``, no binary)
 Audio decode/resample   ``ac-ffmpeg`` + ``libswresample``
+Connection flow         :mod:`discord_ext_voice.voice_state` + ``_native.ConnectionFlow``
+Playback clock          :mod:`discord_ext_voice.player` (own thread)
 Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)
 ======================  ==========================================================
 """
 
 from __future__ import annotations
-
-from discord.opus import OPUS_SILENCE
-from discord.player import AudioPlayer  # the playback clock, reused unchanged
 
 from . import opus
 from ._native import DAVE_PROTOCOL_VERSION, SUPPORTED_MODES, __version__, probe
@@ -50,6 +48,8 @@ from .errors import (
     VoiceError,
 )
 from .gateway import DiscordVoiceWebSocket
+from .opus import OPUS_SILENCE
+from .player import AudioPlayer
 from .sources import (
     AudioSource,
     FFmpegOpusAudio,

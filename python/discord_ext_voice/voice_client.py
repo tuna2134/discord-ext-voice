@@ -6,12 +6,11 @@ voice, such as Lavalink or a native library implementation"). This module implem
 of the native transport, so nothing from discord.py's own `VoiceClient` — its PyNaCl-based
 encryption, its Python `davey` session, its capability guards — is inherited or worked around.
 
-The connection flow itself is :class:`discord.voice_state.VoiceConnectionState`, subclassed in
-:mod:`discord_ext_voice.voice_state`; the playback clock is
-:class:`discord.player.AudioPlayer` and the audio sources are
-:mod:`discord_ext_voice.sources`.
-So the pieces discord.py provides are still reused — just not its *implementation* of this
-class, which is exactly what ``VoiceProtocol`` exists for.
+The connection flow is :class:`discord_ext_voice.VoiceConnectionState`, the playback clock is
+:class:`discord_ext_voice.AudioPlayer` (a native thread) and the audio sources are
+:mod:`discord_ext_voice.sources`; all three are this package's own. discord.py provides the host
+framework — the client, the gateway, and the `VoiceProtocol` extension point this class
+implements.
 
 Usage is unchanged::
 
@@ -26,12 +25,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional, Tuple
 
-from discord.player import AudioPlayer
 from discord.voice_client import VoiceClient as _DiscordVoiceClient
 from discord.voice_client import VoiceProtocol
 
 from . import opus
 from .errors import ClientException, NotConnected
+from .player import AudioPlayer
 from .sources import AudioSource, is_audio_source
 from .voice_state import VoiceConnectionState
 

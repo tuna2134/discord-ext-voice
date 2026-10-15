@@ -5,7 +5,7 @@ encryption negotiation, the DAVE/MLS session and every incoming frame are handle
 native reader. This class is the thin Python object the rest of the layer talks to:
 
 * the voice opcode constants,
-* :meth:`speak`, which discord.py's player calls before it sends audio,
+* :meth:`speak`, the ``SPEAKING`` announcement the native player also sends,
 * :meth:`close` / :meth:`wait_closed`, which the reconnect loop drives,
 * the negotiated session values, read straight from the native connection.
 
@@ -65,10 +65,18 @@ class DiscordVoiceWebSocket:
     MLS_INVALID_COMMIT_WELCOME     = 31
     # fmt: on
 
-    def __init__(self, connection: _native.VoiceConnection, state: 'VoiceConnectionState') -> None:
+    def __init__(
+        self,
+        connection: _native.VoiceConnection,
+        state: 'VoiceConnectionState',
+        *,
+        resume: bool = False,
+    ) -> None:
         self._native = connection
         self._connection = state
         self._close_code: Optional[int] = None
+        #: Whether this connection's handshake sends RESUME rather than IDENTIFY.
+        self.resume = resume
 
     def __repr__(self) -> str:
         return f'<{type(self).__name__} close_code={self._close_code!r}>'
@@ -134,8 +142,10 @@ class DiscordVoiceWebSocket:
     async def speak(self, state: Any = None) -> None:
         """|coro| Announce our SSRC and speaking state.
 
-        discord.py's player calls this with a :class:`discord.enums.SpeakingState` before it
-        sends audio; Discord drops audio from an SSRC it has not been told about.
+        Discord drops audio from an SSRC it has not been told about. The native player sends
+        this frame itself from the playback thread; this method is the same announcement for
+        anything driving the websocket by hand, and keeps `discord.py`'s signature (defaulting
+        to :class:`discord.enums.SpeakingState.voice`).
         """
         if state is None:
             from discord.enums import SpeakingState

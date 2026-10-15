@@ -95,7 +95,7 @@ class FakeClient:
     def __init__(self) -> None:
         self._connection = FakeConnectionState()
         self.endpoint: str | None = None
-        # `discord.player.AudioPlayer._speak` schedules `ws.speak` on `client.loop`.
+        # `discord.py` schedules coroutines on this loop; the native transport does not use it.
         self.loop = asyncio.get_running_loop()
 
 
@@ -185,6 +185,35 @@ async def test_handshake_close_is_translated_to_discord_connection_closed(gatewa
         assert info.value.code == 4006
         assert voice._connection.native.close_code == 4006
         assert voice.is_connected() is False
+    finally:
+        await voice.disconnect()
+
+
+async def test_connect_times_out_waiting_for_the_gateway(gateway_factory):
+    """A gateway that never sends the voice updates must time out, not hang.
+
+    This is the native flow wait (`ConnectionFlow.wait_for_state`): the timeout has to reach
+    `_wrap_connect` as an `asyncio.TimeoutError`, and the cancelled wait must not leave the flow
+    wedged.
+    """
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+
+    voice = dev.VoiceClient(client, channel)
+    client._connection._add_voice_client(KEY, voice)
+
+    async def never(*args, **kwargs):
+        return None
+
+    # The fake main gateway dispatches through these, so nothing ever reaches the flow.
+    voice.on_voice_server_update = never
+    voice.on_voice_state_update = never
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await voice.connect(timeout=0.2, reconnect=False)
+        assert voice.is_connected() is False
+        assert voice._connection.state is dev.ConnectionFlowState.disconnected
     finally:
         await voice.disconnect()
 

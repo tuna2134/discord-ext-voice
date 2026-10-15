@@ -14,12 +14,14 @@ It reflects `discord.py` **2.7.1** (`discord/voice_client.py`, `discord/voice_st
 ```python
 class VoiceClient(discord.voice_client.VoiceProtocol): ...    # the only discord.py inheritance
 class VoiceConnectionState: ...                               # our own connection flow
+# its decisions live in _native.ConnectionFlow (Rust): phases, close codes, retries, backoff
 class DiscordVoiceWebSocket: ...                              # our own websocket facade
 class AudioSource: ...                                        # our own source base class
 class PCMAudio(AudioSource): ...
 class FFmpegPCMAudio(AudioSource): ...
 class FFmpegOpusAudio(AudioSource): ...
 class PCMVolumeTransformer(AudioSource): ...
+class AudioPlayer: ...                                        # our own playback clock (native thread)
 ```
 
 `discord.VoiceProtocol` is discord.py's documented extension point for third-party backends
@@ -30,9 +32,10 @@ inheriting it would mean bypassing its constructor and carrying code paths that 
 here.
 
 Everything else `discord.py` still provides is *used*, not inherited: `discord.Client` (the main
-gateway that delivers `VOICE_STATE_UPDATE`/`VOICE_SERVER_UPDATE`), `discord.player.AudioPlayer`
-(the playback clock), `Guild.change_voice_state`, `discord.utils.MISSING`, the `SpeakingState`
-enum and discord.py's exception classes, which the public API raises.
+gateway that delivers `VOICE_STATE_UPDATE`/`VOICE_SERVER_UPDATE`), `Guild.change_voice_state`,
+`discord.utils.MISSING`, the `SpeakingState` enum and discord.py's exception classes, which the
+public API raises. `discord.player` is not imported at all — not even for its constants — so its
+`audioop` dependency and its `ffmpeg` subprocess handling never load.
 
 The Rust core is reached through a single object, `discord_ext_voice._native.VoiceConnection`,
 exposed as `voice.native` (`voice._connection.native`).
@@ -49,7 +52,7 @@ implementation, so its members are written here rather than inherited:
 | `connect`, `disconnect`, `move_to`, `is_connected`, `wait_until_connected` | thin delegations to the connection state |
 | `guild`, `user`, `session_id`, `token`, `endpoint`, `ssrc`, `mode`, `secret_key`, `ws`, `timeout` | read from the connection state |
 | `latency`, `average_latency`, `voice_privacy_code` | read from the native transport |
-| `play`, `is_playing`, `is_paused`, `stop`, `pause`, `resume`, `source` | discord.py's semantics; `play` installs the native Opus encoder and then uses `discord.player.AudioPlayer` |
+| `play`, `is_playing`, `is_paused`, `stop`, `pause`, `resume`, `source` | discord.py's semantics; `play` builds the native Opus encoder and starts a `discord_ext_voice.AudioPlayer` |
 | `send_audio_packet` | encodes, DAVE-encrypts, RTP-encrypts and sends in Rust |
 | `supported_modes` | read from `discord.VoiceClient.supported_modes` so the two cannot drift |
 | `cleanup` | inherited from `VoiceProtocol` (removes the client from the state cache) |
@@ -64,21 +67,26 @@ and the `_encrypt_*` helpers (the PyNaCl-based packet builder).
 
 ## `VoiceConnectionState`
 
-The connection flow is implemented in `discord_ext_voice/voice_state.py`, following the flow
-`discord.py` encodes (op 4 over the main gateway, wait for both voice updates, handshake, then
-the close-code policy) without inheriting it. The differences from a pure port are listed below;
-everything else — the state names, the order of the transitions, the 5 connection attempts, the
-`1 + i * 2` retry spacing and the close-code handling — is the same on purpose.
+The connection flow is split in two. The *decisions* are Rust
+(`_native.ConnectionFlow`, `src/flow.rs`): the phase ladder, which gateway event moves it where,
+what a close code means, the 5 connection attempts, the `1 + i * 2` retry spacing, the jittered
+reconnect backoff, and the "wait until the flow reaches one of these phases" primitive.
+`discord_ext_voice/voice_state.py` is the awaiting half — discord.py's `Guild.change_voice_state`,
+the native handshake, the websocket close — and dispatches on the action the flow returns.
+
+The behaviour is `discord.py`'s: the state names and their order, the transition table, the
+close-code handling and the retry/backoff policy are the same on purpose. The phase itself is the
+transport's, so `state` and `VoiceConnection.phase` cannot disagree.
 
 | Member | Behaviour |
 | --- | --- |
-| `connect`, `_connect`, `_inner_connect`, `_wrap_connect` | our flow: 5 attempts, `asyncio.wait_for(timeout)` around each |
-| `disconnect`, `soft_disconnect`, `move_to`, `wait`, `wait_async`, `_wait_for_state`, `is_connected` | ours |
-| `_poll_voice_ws` (close codes 1000/4014/4015/4021/4022), `_potential_reconnect` | ours, with a jittered exponential backoff like discord.py's poller |
+| `connect`, `_connect`, `_inner_connect`, `_wrap_connect` | our flow: `asyncio.wait_for(timeout)` around each attempt, with the attempt count and spacing from `_native.ConnectionFlow` |
+| `disconnect`, `soft_disconnect`, `move_to`, `is_connected` | ours; `wait`/`wait_async`/`_wait_for_state` wait on the native flow (and `_wait_for_state` keeps `asyncio.TimeoutError`) |
+| `_poll_voice_ws`, `_potential_reconnect` | ours: they await the socket and dispatch on the native close-code verdict (`CloseAction`); the backoff is native |
 | `ConnectionFlowState` | **ours**, with discord.py's names and values (`disconnected` = 0 … `connected` = 8) |
 | `timeout`, `reconnect`, `self_deaf`, `self_mute`, `token`, `session_id`, `endpoint`, `server_id` | plain attributes, as in discord.py |
 | `ip`, `port`, `voice_port`, `endpoint_ip`, `ssrc`, `mode`, `secret_key` | populated from the native handshake |
-| `state` (getter/setter) | also pushes the phase into the native state machine |
+| `state` (getter/setter) | a view of the native phase: reading and writing it moves the transport with it |
 | `dave_protocol_version`, `dave_session`, `can_encrypt`, `max_dave_protocol_version` | live values from the native session (writes ignored) |
 | `_connect_websocket`, `_handshake_websocket` | the native handshake, with errors translated |
 | `send_packet` | native UDP send |
@@ -102,7 +110,7 @@ reader left to wrap.
 | Member | Behaviour |
 | --- | --- |
 | Opcode constants (`IDENTIFY` … `MLS_INVALID_COMMIT_WELCOME`) | **ours**, with Discord's values, so the numbers match `discord.gateway.DiscordVoiceWebSocket` |
-| `speak` | sends `SPEAKING` with the native SSRC; this is what `discord.py`'s player calls before it sends audio |
+| `speak` | sends `SPEAKING` with the native SSRC, for anything driving the websocket by hand; the native player sends the same frame itself |
 | `close`, `wait_closed` | close the native socket / wait for it to end and return `(code, reason)` |
 | `poll_event` | waits for the native socket to end and raises `discord.ConnectionClosed` |
 | `send_as_json`, `send_binary`, `send_heartbeat` | raw frame writers, for anything not covered above |
@@ -118,7 +126,7 @@ reader left to wrap.
 | `PCMAudio` | **ours**: raw PCM from a file object |
 | `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`), which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
 | `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
-| `AudioPlayer` | `discord.player.AudioPlayer`, reused unchanged as the playback clock |
+| `AudioPlayer` | **ours**, a thin wrapper over the native thread: 20ms pacing, pause/resume, the silence frames, the `SPEAKING` announcements and the reconnection wait are Rust |
 
 `FFmpegPCMAudio`/`FFmpegOpusAudio` take the media plus `seek` (the native `-ss`). discord.py's
 FFmpeg-CLI arguments (`executable`, `pipe`, `stderr`, `before_options`, `options`,
@@ -181,9 +189,11 @@ else is reachable through the native `VoiceError` hierarchy.
 7. **`state.socket` is `discord.utils.MISSING`.** Rust owns the UDP socket; use
    `state.native` (or `state.native.send_packet/...`) instead.
 8. **Nothing inherits from `discord.py` except `VoiceClient`.** `VoiceConnectionState`,
-   `DiscordVoiceWebSocket` and the audio sources are this package's own classes, so an
-   `isinstance` check against discord.py's equivalents is `False` (the *behaviour* is the same,
-   and the enums keep discord.py's names and values).
+   `DiscordVoiceWebSocket`, the audio sources and the player are this package's own classes, so
+   an `isinstance` check against discord.py's equivalents is `False` (the *behaviour* is the
+   same, and the enums keep discord.py's names and values). `dev.AudioPlayer` is not a
+   `threading.Thread`: `start`/`stop`/`pause`/`resume`/`join` behave the same, but `is_alive()`
+   reports the native playback thread and attributes like `loops`/`_start` do not exist.
 
 ## Additions
 
@@ -195,6 +205,14 @@ else is reachable through the native `VoiceError` hierarchy.
   `wait_closed`, ...
 * `FFmpegPCMAudio(source, seek=...)` / `FFmpegOpusAudio(source, seek=...)` — the native `-ss`,
   implemented by seeking the demuxer and rebuilding the decoder.
+* `AudioPlayer.join(timeout=None)` / `is_alive()` — wait for the playback thread from Python.
+* `voice.native.flow` — the `_native.ConnectionFlow`: `state` (the same 0-8 ladder as
+  `ConnectionFlowState`), `joined`, `expecting_disconnect`, `voice_state_update(...)`,
+  `voice_server_update(...)`, `close_action(code, disconnected, reconnect)`,
+  `note_attempt()`, `retry_wait(attempt)`, `reconnect_delay()`, `reset_backoff()`,
+  `wait_for_state(states, timeout)` and the blocking `wait_connected(timeout)`.
+  `MAX_ATTEMPTS` and the action numbers are class attributes, so the Python enums are built
+  from them rather than restated.
 * `FFmpegOpusAudio.probe_codec(source)` and the native `_native.scale_pcm` behind
   `PCMVolumeTransformer`.
 * `is_audio_source(candidate)` — whether an object can be played (our sources, or anything with

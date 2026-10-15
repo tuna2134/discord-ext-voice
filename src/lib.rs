@@ -9,19 +9,24 @@
 //! * [`dave`] — the DAVE/MLS end-to-end encryption session built on `davey`.
 //! * [`opus`] — Opus encode/decode built on `audiopus`.
 //! * [`source`] — in-process FFmpeg demuxing, decoding and resampling built on `ac-ffmpeg`.
+//! * [`player`] — the playback clock, reading an `AudioSource` and pacing 20ms frames.
+//! * [`flow`] — the connection flow's decisions: phase transitions, close codes, retries.
 //! * [`connection`] — the `VoiceConnection` Python object tying it all together.
 //!
 //! The protocol payload types come from the `voice-model` crate (published as
 //! `serenity-voice-model` after its upstream rename).
 
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 mod connection;
 mod crypto;
 mod dave;
 mod errors;
+mod flow;
 mod logging;
 mod opus;
+mod player;
 mod source;
 mod transport;
 
@@ -35,11 +40,13 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<source::PyOpusSource>()?;
     module.add_class::<opus::PyOpusEncoder>()?;
     module.add_class::<opus::PyOpusDecoder>()?;
+    module.add_class::<player::PyAudioPlayer>()?;
+    module.add_class::<flow::PyConnectionFlow>()?;
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
     module.add_function(wrap_pyfunction!(source::scale_pcm, module)?)?;
 
-    // Constants the Python layer reads. Frame geometry lives on `OpusEncoder`, and the
-    // silence packet is discord.opus's, so neither is duplicated here.
+    // Constants the Python layer reads. Frame geometry lives on `OpusEncoder`.
+    module.add("OPUS_SILENCE", PyBytes::new(py, &opus::OPUS_SILENCE))?;
     module.add(
         "DAVE_PROTOCOL_VERSION",
         dave::DaveState::max_protocol_version(),

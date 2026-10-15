@@ -109,20 +109,19 @@ def test_voice_websocket_is_this_packages_own():
     assert callable(ours.close)
 
 
-def test_discord_implementations_are_reused_verbatim():
+def test_nothing_of_discord_pys_implementation_is_reused():
     """Only the host framework comes from discord.py; nothing of ours inherits from it."""
     import discord.gateway
     import discord.player
     import discord.voice_state
 
-    # The playback clock is discord.py's, unchanged.
-    assert dev.AudioPlayer is discord.player.AudioPlayer
     # `VoiceClient` implements discord.py's documented extension point: the one inheritance this
     # package has, and the only one it wants.
     assert dev.VoiceProtocol is discord.voice_client.VoiceProtocol
     assert issubclass(dev.VoiceClient, discord.voice_client.VoiceProtocol)
 
     for ours, theirs in (
+        (dev.AudioPlayer, discord.player.AudioPlayer),
         (dev.VoiceConnectionState, discord.voice_state.VoiceConnectionState),
         (dev.ConnectionFlowState, discord.voice_state.ConnectionFlowState),
         (dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket),
@@ -134,6 +133,39 @@ def test_discord_implementations_are_reused_verbatim():
     ):
         assert ours is not theirs
         assert not issubclass(ours, theirs), f'{ours.__name__} must not inherit discord.py'
+
+
+def test_no_discord_py_implementation_is_merely_reexported():
+    """Every public name is either ours, a Discord constant/exception, or the host framework."""
+    allowed = {
+        # The one class discord.py hands to us as an extension point.
+        'VoiceProtocol',
+        # Exception and enum types that must stay identical to discord.py's so that a caller can
+        # catch them.
+        'ClientException',
+        'ConnectionClosed',
+    }
+
+    for name in dev.__all__:
+        value = getattr(dev, name)
+        module = getattr(value, '__module__', '')
+        if not module.startswith('discord.'):
+            continue
+        assert name in allowed, f'{name} comes from {module} and should be our own'
+
+
+def test_the_audio_player_is_this_packages_own():
+    """The playback clock is native; discord.py's `audioop` based thread is not used."""
+    import discord.player
+
+    assert dev.AudioPlayer is not discord.player.AudioPlayer
+    assert not issubclass(dev.AudioPlayer, discord.player.AudioPlayer)
+    assert dev.AudioPlayer.__module__ == 'discord_ext_voice.player'
+    # The wrapper is thin: the thread, the clock and the silence frames are native.
+    assert isinstance(dev.AudioPlayer.DELAY, float)
+    for name in ('start', 'stop', 'pause', 'resume', 'is_playing', 'is_paused', 'set_source'):
+        assert callable(getattr(dev.AudioPlayer, name))
+
 
 
 def test_audio_sources_are_this_packages_own():

@@ -74,12 +74,30 @@ def test_audio_player_signature_matches_discord_py():
     assert dev.AudioPlayer.DELAY == 0.02
 
 
-def test_ffmpeg_pcm_audio_accepts_discord_py_arguments():
-    parameters = inspect.signature(dev.FFmpegPCMAudio.__init__).parameters
-    for name in ('source', 'executable', 'pipe', 'stderr', 'before_options', 'options'):
-        assert name in parameters, f'FFmpegPCMAudio is missing {name}'
-    assert parameters['executable'].default == 'ffmpeg'
-    assert parameters['pipe'].default is False
+def test_ffmpeg_sources_have_a_native_signature():
+    """The sources take the media plus `seek`; the FFmpeg CLI arguments are gone."""
+    for cls in (dev.FFmpegPCMAudio, dev.FFmpegOpusAudio):
+        parameters = inspect.signature(cls.__init__).parameters
+        assert list(parameters)[:2] == ['self', 'source']
+        assert parameters['seek'].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters['seek'].default is None
+        # Anything else (before_options, options, executable, ...) is rejected, which is what
+        # the catch-all is for.
+        assert any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ), f'{cls.__name__} should reject unknown arguments with a useful message'
+
+
+def test_sources_are_this_packages_own():
+    import discord.player
+
+    for cls in (dev.AudioSource, dev.PCMAudio, dev.FFmpegPCMAudio, dev.FFmpegOpusAudio):
+        assert cls.__module__ == 'discord_ext_voice.sources'
+    assert dev.PCMVolumeTransformer.__module__ == 'discord_ext_voice.sources'
+    # ... while staying compatible with anything that expects discord.py's contract.
+    assert issubclass(dev.AudioSource, discord.player.AudioSource)
+    assert not issubclass(dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio)
 
 
 def test_opus_encoder_surface():
@@ -114,7 +132,6 @@ def test_gateway_opcode_constants():
 def test_exception_types_line_up_with_discord():
     # The exceptions this library can raise at the discord.py boundary are discord.py's own.
     assert dev.ClientException is discord.ClientException
-    assert dev.FFmpegProcessError is discord.errors.FFmpegProcessError
     assert dev.ConnectionClosed is discord.errors.ConnectionClosed
 
     # A native FFmpeg failure is catchable as either flavour.

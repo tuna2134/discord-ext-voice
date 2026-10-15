@@ -30,7 +30,6 @@ def test_voice_client_implements_voice_protocol():
 
 def test_the_discord_exception_types_are_reused():
     assert dev.ClientException is discord.errors.ClientException
-    assert dev.FFmpegProcessError is discord.errors.FFmpegProcessError
     assert dev.ConnectionClosed is discord.errors.ConnectionClosed
 
 
@@ -101,15 +100,28 @@ def test_discord_implementations_are_reused_verbatim():
     import discord.player
     import discord.voice_state
 
+    # The playback clock, the connection flow state machine and the gateway frame builders are
+    # discord.py's own, unchanged.
     assert dev.AudioPlayer is discord.player.AudioPlayer
-    assert dev.PCMAudio is discord.player.PCMAudio
-    assert dev.PCMVolumeTransformer is discord.player.PCMVolumeTransformer
-    assert dev.AudioSource is discord.player.AudioSource
-    assert issubclass(dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio)
-    assert issubclass(dev.FFmpegOpusAudio, discord.player.FFmpegOpusAudio)
     assert issubclass(dev.VoiceConnectionState, discord.voice_state.VoiceConnectionState)
     assert dev.ConnectionFlowState is discord.voice_state.ConnectionFlowState
     assert dev.VoiceProtocol is discord.voice_client.VoiceProtocol
+
+
+def test_audio_sources_are_this_packages_own():
+    """The sources decode natively, so discord.py's `ffmpeg`-subprocess ones are not reused."""
+    import discord.player
+
+    for name in ('AudioSource', 'PCMAudio', 'FFmpegPCMAudio', 'FFmpegOpusAudio', 'PCMVolumeTransformer'):
+        ours = getattr(dev, name)
+        assert ours is not getattr(discord.player, name), f'{name} must be ours'
+        assert ours.__module__ == 'discord_ext_voice.sources'
+
+    # `discord.AudioSource` derives from nothing, so subclassing it is what keeps our sources
+    # usable with anything that checks for discord.py's contract.
+    assert issubclass(dev.AudioSource, discord.player.AudioSource)
+    assert not issubclass(dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio)
+    assert not issubclass(dev.FFmpegOpusAudio, discord.player.FFmpegOpusAudio)
 
 
 def test_discord_voice_protocol_contract_methods_exist():

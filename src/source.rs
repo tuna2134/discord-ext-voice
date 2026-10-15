@@ -22,9 +22,10 @@ use ac_ffmpeg::codec::audio::AudioResampler;
 use ac_ffmpeg::codec::audio::frame::{
     AudioFrame, ChannelLayout, SampleFormat, get_channel_layout, get_sample_format,
 };
-use ac_ffmpeg::format::demuxer::{Demuxer, DemuxerWithStreamInfo};
+use ac_ffmpeg::format::demuxer::{Demuxer, DemuxerWithStreamInfo, SeekTarget};
 use ac_ffmpeg::format::io::IO;
 use ac_ffmpeg::format::stream::Stream;
+use ac_ffmpeg::time::Timestamp;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -205,7 +206,7 @@ fn demux(source: &Bound<'_, PyAny>) -> PyResult<DemuxedInput> {
 
 /// A decoding audio source: libav input -> decoder -> resampler -> 20ms PCM frames.
 pub struct DecodeSource {
-    demuxer: Demuxer<Input>,
+    demuxer: DemuxerWithStreamInfo<Input>,
     stream_index: usize,
     decoder: AudioDecoder,
     resampler: Option<AudioResampler>,
@@ -234,7 +235,7 @@ impl DecodeSource {
             .map_err(|err| ffmpeg_err(format!("FFmpeg could not open the audio decoder: {err}")))?;
 
         Ok(Self {
-            demuxer: demuxed.demuxer.into_demuxer(),
+            demuxer: demuxed.demuxer,
             stream_index,
             decoder,
             resampler: None,
@@ -359,6 +360,41 @@ impl DecodeSource {
         }
     }
 
+    /// Restart the stream `seconds` from its beginning.
+    ///
+    /// This is the native equivalent of the `-ss` argument of the `ffmpeg` binary: the demuxer
+    /// seeks, and everything downstream is rebuilt because it holds samples from the old
+    /// position. `ac-ffmpeg` only exposes draining a decoder (it pushes a null packet), not
+    /// `avcodec_flush_buffers`, so the decoder is recreated from the same stream instead.
+    fn seek(&mut self, seconds: f64) -> Result<(), PyErr> {
+        let micros = seek_micros(seconds)?;
+        self.demuxer
+            .seek_to_timestamp(Timestamp::from_micros(micros), SeekTarget::Precise)
+            .map_err(|err| {
+                ffmpeg_err(format!(
+                    "FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}"
+                ))
+            })?;
+
+        let decoder = AudioDecoder::from_stream(&self.demuxer.streams()[self.stream_index])
+            .and_then(|builder| builder.build())
+            .map_err(|err| {
+                ffmpeg_err(format!(
+                    "FFmpeg could not reopen the audio decoder after seeking: {err}"
+                ))
+            })?;
+
+        self.decoder = decoder;
+        self.resampler = None;
+        self.resampler_source = None;
+        self.pending.clear();
+        self.input_done = false;
+        self.flushed = false;
+        self.finished = false;
+        log_debug!("seeked the audio source to {seconds}s");
+        Ok(())
+    }
+
     fn read_frame(&mut self) -> Result<Vec<u8>, PyErr> {
         if self.finished && self.pending.is_empty() {
             return Ok(Vec::new());
@@ -380,7 +416,7 @@ impl DecodeSource {
 
 /// A pass-through source that yields the raw Opus packets of an already-encoded stream.
 pub struct OpusSource {
-    demuxer: Demuxer<Input>,
+    demuxer: DemuxerWithStreamInfo<Input>,
     stream_index: usize,
     finished: bool,
 }
@@ -407,10 +443,25 @@ impl OpusSource {
         log_info!("using the Opus packet pass-through source (codec {codec})");
 
         Ok(Self {
-            demuxer: demuxed.demuxer.into_demuxer(),
+            demuxer: demuxed.demuxer,
             stream_index,
             finished: false,
         })
+    }
+
+    /// Restart the stream `seconds` from its beginning, keeping the packets as they are.
+    fn seek(&mut self, seconds: f64) -> Result<(), PyErr> {
+        let micros = seek_micros(seconds)?;
+        self.demuxer
+            .seek_to_timestamp(Timestamp::from_micros(micros), SeekTarget::Precise)
+            .map_err(|err| {
+                ffmpeg_err(format!(
+                    "FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}"
+                ))
+            })?;
+        self.finished = false;
+        log_debug!("seeked the Opus source to {seconds}s");
+        Ok(())
     }
 
     fn read_packet(&mut self) -> Result<Vec<u8>, PyErr> {
@@ -432,6 +483,40 @@ impl OpusSource {
             }
         }
     }
+}
+
+/// Translate a position in seconds into the microseconds a seek expects.
+fn seek_micros(seconds: f64) -> Result<i64, PyErr> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "the seek position must be a finite, non-negative number of seconds",
+        ));
+    }
+    Ok((seconds * 1_000_000.0).round().min(i64::MAX as f64) as i64)
+}
+
+/// Multiply every signed 16 bit little endian sample by `volume`, clamping to the `i16` range.
+///
+/// This replaces `audioop.mul`, which was removed from the standard library in Python 3.13.
+pub fn scale_pcm_s16(data: &[u8], volume: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        let scaled = (f32::from(sample) * volume)
+            .round()
+            .clamp(-32768.0, 32767.0) as i16;
+        out.extend_from_slice(&scaled.to_le_bytes());
+    }
+    // A trailing odd byte cannot be a sample; pass it through rather than dropping audio.
+    out.extend_from_slice(chunks.remainder());
+    out
+}
+
+/// Scale 16 bit PCM in place of `audioop.mul`.
+#[pyfunction]
+pub fn scale_pcm<'py>(py: Python<'py>, data: &[u8], volume: f32) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &scale_pcm_s16(data, volume))
 }
 
 /// What [`probe_source`] reports: codec name, sample rate, channel count and duration.
@@ -487,6 +572,11 @@ impl PyDecodeSource {
         Ok(PyBytes::new(py, &data))
     }
 
+    /// Restart the stream `seconds` from the beginning (the native `-ss` of `ffmpeg`).
+    fn seek(&self, seconds: f64) -> PyResult<()> {
+        self.inner.lock().seek(seconds)
+    }
+
     fn is_opus(&self) -> bool {
         false
     }
@@ -528,6 +618,11 @@ impl PyOpusSource {
         Ok(PyBytes::new(py, &data))
     }
 
+    /// Restart the stream `seconds` from the beginning (the native `-ss` of `ffmpeg`).
+    fn seek(&self, seconds: f64) -> PyResult<()> {
+        self.inner.lock().seek(seconds)
+    }
+
     fn is_opus(&self) -> bool {
         true
     }
@@ -557,6 +652,34 @@ mod tests {
     fn frame_geometry_matches_discord() {
         assert_eq!(FRAME_SAMPLES, 960);
         assert_eq!(FRAME_BYTES, 3840);
+    }
+
+    #[test]
+    fn scaling_pcm_clamps_to_the_sixteen_bit_range() {
+        // 16 -> 8
+        assert_eq!(scale_pcm_s16(&[0x10, 0x00], 0.5), vec![0x08, 0x00]);
+        // untouched at 1.0
+        assert_eq!(
+            scale_pcm_s16(&[0x10, 0x00, 0x00, 0x80], 1.0),
+            vec![0x10, 0x00, 0x00, 0x80]
+        );
+        // -32768 * 2 and 32767 * 2 clamp instead of wrapping around
+        assert_eq!(scale_pcm_s16(&[0x00, 0x80], 2.0), vec![0x00, 0x80]);
+        assert_eq!(scale_pcm_s16(&[0xff, 0x7f], 2.0), vec![0xff, 0x7f]);
+        // silence stays silent, and a trailing odd byte is not dropped
+        assert_eq!(scale_pcm_s16(&[0x00, 0x00], 0.25), vec![0x00, 0x00]);
+        assert_eq!(
+            scale_pcm_s16(&[0x10, 0x00, 0x7f], 1.0),
+            vec![0x10, 0x00, 0x7f]
+        );
+    }
+
+    #[test]
+    fn seek_positions_are_validated() {
+        assert_eq!(seek_micros(0.5).unwrap(), 500_000);
+        assert!(seek_micros(-1.0).is_err());
+        assert!(seek_micros(f64::NAN).is_err());
+        assert!(seek_micros(f64::INFINITY).is_err());
     }
 
     #[test]

@@ -36,6 +36,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<opus::PyOpusEncoder>()?;
     module.add_class::<opus::PyOpusDecoder>()?;
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
+    module.add_function(wrap_pyfunction!(source::scale_pcm, module)?)?;
 
     // Constants the Python layer reads. Frame geometry lives on `OpusEncoder`, and the
     // silence packet is discord.opus's, so neither is duplicated here.

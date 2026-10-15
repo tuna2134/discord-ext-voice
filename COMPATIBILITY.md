@@ -14,8 +14,10 @@ It reflects `discord.py` **2.7.1** (`discord/voice_client.py`, `discord/voice_st
 class VoiceClient(discord.voice_client.VoiceProtocol): ...                   # implements the protocol
 class VoiceConnectionState(discord.voice_state.VoiceConnectionState): ...    # 12 overrides
 class DiscordVoiceWebSocket(discord.gateway.DiscordVoiceWebSocket): ...      # read side only
-class FFmpegPCMAudio(_InProcessFirst, discord.player.FFmpegPCMAudio): ...    # read/cleanup
-class FFmpegOpusAudio(_InProcessFirst, discord.player.FFmpegOpusAudio): ...  # read/cleanup/probe
+class AudioSource(discord.player.AudioSource): ...                           # our own base class
+class FFmpegPCMAudio(AudioSource): ...                                       # native reader
+class FFmpegOpusAudio(AudioSource): ...                                      # native reader
+class PCMVolumeTransformer(AudioSource): ...                                 # native scaling
 ```
 
 `discord.VoiceProtocol` is discord.py's documented extension point for third-party backends
@@ -97,19 +99,21 @@ Outgoing frames therefore go through discord.py's own payload builders, into a
 
 | Class | Source |
 | --- | --- |
-| `AudioSource`, `PCMAudio`, `PCMVolumeTransformer`, `AudioPlayer`, `FFmpegAudio` | re-exported from `discord.player` unchanged |
-| `FFmpegPCMAudio` | subclass: in-process libav decode when possible, otherwise discord.py's subprocess path |
-| `FFmpegOpusAudio` | subclass: Opus pass-through or libav+libopus, otherwise discord.py's subprocess path |
+| `AudioSource` | **ours**, subclassing `discord.player.AudioSource` so discord.py's contract (and any `isinstance` check) still holds |
+| `PCMAudio` | **ours**: raw PCM from a file object |
+| `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`) |
+| `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
+| `AudioPlayer` | `discord.player.AudioPlayer`, reused unchanged as the playback clock |
 
-The in-process path is taken when all of the following hold: no `pipe`, no `stderr`, no
-`executable` override, no `before_options`/`options`, `force_cli` is false, and the source is a
-local path or a file object (URLs need libav's protocol layer, which the in-process path does
-not have). If libav still cannot open the input, discord.py's `ffmpeg` implementation is used
-as a fallback.
+`FFmpegPCMAudio`/`FFmpegOpusAudio` take the media plus `seek` (the native `-ss`). discord.py's
+FFmpeg-CLI arguments (`executable`, `pipe`, `stderr`, `before_options`, `options`,
+`force_cli`) raise `TypeError` naming the argument, and `FFmpegAudio` is not re-exported: there
+is no subprocess to configure.
 
-`FFmpegOpusAudio.probe` uses libav (`_native.probe`) instead of spawning
-`ffprobe`/`ffmpeg`; `method` and `executable` are accepted and ignored. `from_probe` is
-inherited and calls it.
+`FFmpegOpusAudio.probe`/`probe_codec` use libav (`_native.probe`) instead of spawning
+`ffprobe`/`ffmpeg`, so the reported bitrate is always `None` and the `method`/`executable`
+arguments do not exist. `from_probe` is not needed: the constructor already probes and passes
+Opus packets through when the input has them.
 
 ## `discord.opus`
 
@@ -125,7 +129,7 @@ inherited and calls it.
 
 | Type | Source |
 | --- | --- |
-| `ClientException`, `FFmpegProcessError`, `ConnectionClosed`, `DiscordException` | re-exported from `discord.errors` |
+| `ClientException`, `ConnectionClosed`, `DiscordException` | re-exported from `discord.errors` |
 | `OpusNotLoaded` | re-exported from `discord.opus` |
 | `VoiceError`, `NotConnected`, `AlreadyConnected`, `HandshakeError`, `ConnectionClosedError`, `ProtocolError`, `EncryptionError`, `DaveError`, `OpusError`, `FFmpegError` | native (`VoiceError` is the base) |
 | `FFmpegSourceError` | **added**, subclasses both `discord.ClientException` and the native `FFmpegError` |
@@ -143,12 +147,11 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
    `isinstance(voice, discord.VoiceProtocol)` (which is what `channel.connect` checks).
 2. **A missing local file raises `FFmpegSourceError` at construction**, where discord.py only
    surfaces it once the subprocess exits. A `PathLike` is accepted.
-3. **`FFmpegAudio._check_process_returncode` waits for the child** (up to 5s) before reading
-   `Popen.poll()`, so an `ffmpeg` failure is always reported. discord.py can miss it if the
-   process has not been reaped yet.
-4. **`before_options`/`options` always take the subprocess path.** The in-process decoder
-   accepts no FFmpeg CLI options at all: `-ss`/`-t`/`-f` and friends are CLI grammar that
-   libav's option table cannot express, so they are handed to the binary as-is.
+3. **`before_options`/`options` raise `TypeError`.** They are FFmpeg CLI grammar, which the
+   in-process decoder cannot express; `seek=` replaces the common `-ss` case, and there is no
+   subprocess to hand the rest to. `force_cli`, `pipe`, `stderr` and `executable` go with them.
+4. **Network URLs are not supported.** The native reader takes a path or a file object; fetch
+   the URL with your own HTTP client first.
 5. **Reconnect event ordering.** The inherited `_inner_connect` reaches
    `got_both_voice_updates` after a `4015` resume only if the server update arrives before the
    state update, because `voice_state_update` does not transition away from `connected`. This
@@ -166,7 +169,10 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
   `secret_key`, `dave_protocol_version`, `can_encrypt`, `has_dave_session`,
   `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `close_reason`,
   `wait_closed`, ...
-* `FFmpegPCMAudio(..., force_cli=True)` and `FFmpegOpusAudio.probe_codec(source)`.
+* `FFmpegPCMAudio(source, seek=...)` / `FFmpegOpusAudio(source, seek=...)` — the native `-ss`,
+  implemented by seeking the demuxer and rebuilding the decoder.
+* `FFmpegOpusAudio.probe_codec(source)` and the native `_native.scale_pcm` behind
+  `PCMVolumeTransformer`.
 * `DISCORD_EXT_VOICE_MAX_DAVE_VERSION=0` disables the DAVE advertisement in IDENTIFY (a
   diagnostic switch for calls that refuse to come up; end-to-end encryption is then off).
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

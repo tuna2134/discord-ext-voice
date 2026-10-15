@@ -10,7 +10,6 @@ from __future__ import annotations
 from discord.errors import (  # noqa: F401  (re-exported: this library raises both)
     ClientException,
     ConnectionClosed,
-    FFmpegProcessError,
 )
 
 from ._native import (  # noqa: F401  (re-exported)
@@ -42,7 +41,6 @@ __all__ = (
     # discord.py's
     'ClientException',
     'ConnectionClosed',
-    'FFmpegProcessError',
 )
 
 

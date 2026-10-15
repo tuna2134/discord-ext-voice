@@ -7,7 +7,9 @@ of the native transport, so nothing from discord.py's own `VoiceClient` — its 
 encryption, its Python `davey` session, its capability guards — is inherited or worked around.
 
 The connection flow itself is :class:`discord.voice_state.VoiceConnectionState`, subclassed in
-:mod:`discord_ext_voice.voice_state`; the audio player is :class:`discord.player.AudioPlayer`.
+:mod:`discord_ext_voice.voice_state`; the playback clock is
+:class:`discord.player.AudioPlayer` and the audio sources are
+:mod:`discord_ext_voice.sources`.
 So the pieces discord.py provides are still reused — just not its *implementation* of this
 class, which is exactly what ``VoiceProtocol`` exists for.
 
@@ -23,12 +25,14 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Tuple
 
-from discord.player import AudioPlayer, AudioSource
+from discord.player import AudioPlayer
+from discord.player import AudioSource as _DiscordAudioSource
 from discord.voice_client import VoiceClient as _DiscordVoiceClient
 from discord.voice_client import VoiceProtocol
 
 from . import opus
 from .errors import ClientException, NotConnected
+from .sources import AudioSource
 from .voice_state import VoiceConnectionState
 
 __all__ = ('VoiceClient', 'VoiceProtocol', 'has_nacl', 'has_dave')
@@ -232,7 +236,9 @@ class VoiceClient(VoiceProtocol):
         if self.is_playing():
             raise ClientException('Already playing audio.')
 
-        if not isinstance(source, AudioSource):
+        # Any `discord.AudioSource` is accepted, not only the ones this package ships, so a
+        # user's own source keeps working.
+        if not isinstance(source, _DiscordAudioSource):
             raise TypeError(f'source must be an AudioSource not {source.__class__.__name__}')
 
         if not source.is_opus():
@@ -282,7 +288,7 @@ class VoiceClient(VoiceProtocol):
 
     @source.setter
     def source(self, value: AudioSource) -> None:
-        if not isinstance(value, AudioSource):
+        if not isinstance(value, _DiscordAudioSource):
             raise TypeError(f'expected AudioSource not {value.__class__.__name__}.')
 
         if self._player is None:

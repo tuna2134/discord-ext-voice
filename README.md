@@ -15,9 +15,10 @@ voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished',
 for alternative voice backends — on top of the native transport. `dev.VoiceConnectionState`
 subclasses `discord.voice_state.VoiceConnectionState` (the connection flow and reconnect
 policy), `dev.DiscordVoiceWebSocket` subclasses `discord.gateway.DiscordVoiceWebSocket` (the
-opcodes and frame builders), and the audio player, audio sources and volume transformer are
-discord.py's own classes re-exported unchanged. What is *not* reused is discord.py's own
-`VoiceClient`, which is built on PyNaCl and the Python `davey` bindings.
+opcodes and frame builders), the playback clock is discord.py's `AudioPlayer`, and the audio
+sources and volume transformer are this package's own, decoding in process with libav. What is
+*not* reused is discord.py's own `VoiceClient`, which is built on PyNaCl, the Python `davey`
+bindings and an `ffmpeg` subprocess.
 
 Everything that must be native is native — and that is the whole voice protocol:
 
@@ -34,9 +35,10 @@ Everything that must be native is native — and that is the whole voice protoco
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
 | Connection flow state machine, reconnect policy | `discord.voice_state.VoiceConnectionState` |
-| Audio player thread, `PCMAudio`, `PCMVolumeTransformer` | `discord.player` |
+| Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `ac-ffmpeg` / `libopus` |
+| Playback clock (the player thread) | `discord.player.AudioPlayer` |
 | Gateway opcodes and outgoing frame builders | `discord.gateway.DiscordVoiceWebSocket` |
-| `ffmpeg` subprocess fallback | `discord.player.FFmpegPCMAudio` |
+| `ffmpeg` subprocess | **not used** — no binary, no pipe, no process to reap |
 
 ## Why
 
@@ -44,10 +46,11 @@ Everything that must be native is native — and that is the whole voice protoco
   `aead_xchacha20_poly1305_rtpsize` are implemented natively, including the incrementing nonce
   behaviour discord.py relies on. The test suite decrypts every mode with PyNaCl to prove
   byte-level compatibility.
-* **No `ffmpeg` subprocess for local media.** `FFmpegPCMAudio` demuxes, decodes and resamples
-  in process with libav; the binary is only used for URLs, pipes and explicit CLI options.
-  Getting there needed one upstream fix to `ac-ffmpeg` — see
-  [patches/README.md](patches/README.md).
+* **No `ffmpeg` subprocess, ever.** The audio sources are this package's own
+  (`discord_ext_voice.sources`): libav demuxes, decodes and resamples in process,
+  `libswresample`/`libopus` do the rest, and `seek=` replaces `-ss`. There is no binary to
+  install and no child process to reap. Getting the resampler there needed one upstream fix to
+  `ac-ffmpeg` — see [patches/README.md](patches/README.md).
 * **Encoding, encryption and the UDP send happen in Rust**, so playback jitter does not
   compete with Python work — the Python player thread just hands Rust 20ms of PCM.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
@@ -140,22 +143,30 @@ accepts it because it implements `discord.VoiceProtocol`.
 
 ### Audio sources
 
+Every source is implemented in this package ([`discord_ext_voice.sources`](python/discord_ext_voice/sources.py))
+and decodes in process with libav — the `ffmpeg` binary is never started:
+
 | Class | Behaviour |
 | --- | --- |
-| `PCMAudio(stream)` | `discord.player.PCMAudio`, reused unchanged |
-| `FFmpegPCMAudio(source)` | Subclass of discord.py's, decoding in process with libav when it can |
-| `FFmpegOpusAudio(source)` | Subclass of discord.py's: Opus pass-through, otherwise libopus |
-| `PCMVolumeTransformer(source, volume)` | `discord.player.PCMVolumeTransformer`, reused unchanged |
-| `AudioPlayer` | `discord.player.AudioPlayer`, reused unchanged |
-
-`FFmpegPCMAudio` takes discord.py's arguments plus `force_cli: bool = False`:
+| `PCMAudio(stream)` | Raw 16-bit 48kHz stereo PCM from a file object |
+| `FFmpegPCMAudio(source, *, seek=None)` | libav decodes and resamples to 48kHz stereo `s16` |
+| `FFmpegOpusAudio(source, *, seek=None)` | Opus packets passed through, otherwise PCM + libopus |
+| `PCMVolumeTransformer(source, volume)` | Volume, scaled by the native core (no `audioop`) |
+| `AudioPlayer` | `discord.player.AudioPlayer`, reused as the playback clock |
 
 ```python
-dev.FFmpegPCMAudio('song.mp3')                        # in-process libav decode
-dev.FFmpegPCMAudio('stream.mp3', before_options='-ss 30')  # ffmpeg CLI (option grammar)
-dev.FFmpegPCMAudio('https://example.com/a.mp3')       # ffmpeg CLI (network protocol)
-dev.FFmpegPCMAudio('song.mp3', force_cli=True)        # ffmpeg CLI, explicitly
+dev.FFmpegPCMAudio('song.mp3')                 # decode in process with libav
+dev.FFmpegPCMAudio('song.mp3', seek=30.0)      # start 30s in (what `-ss 30` used to do)
+dev.FFmpegPCMAudio(open('song.mp3', 'rb'))     # a seekable file object works too
+dev.FFmpegOpusAudio('voice.ogg')               # Opus packets passed through untouched
+dev.PCMVolumeTransformer(dev.FFmpegPCMAudio('song.mp3'), 0.5)
 ```
+
+`dev.AudioSource` is this package's own base class. It subclasses `discord.player.AudioSource`,
+so a source is still accepted by anything that checks for discord.py's contract, and any
+`discord.AudioSource` can be handed to `play()`. discord.py's FFmpeg-CLI arguments —
+`before_options`, `options`, `executable`, `pipe`, `stderr`, `force_cli` — do not exist here and
+raise `TypeError` naming the argument.
 
 ### Opus
 
@@ -190,7 +201,7 @@ python/discord_ext_voice/        # thin discord.py extension
 ├── voice_client.py              # VoiceClient: create_connection_state, play, send_audio_packet
 ├── voice_state.py               # VoiceConnectionState: the native integration points
 ├── gateway.py                   # DiscordVoiceWebSocket: native socket, inherited opcodes
-├── player.py                    # native-first FFmpegPCMAudio / FFmpegOpusAudio
+├── sources.py                   # our AudioSource / PCMAudio / FFmpeg*Audio / volume
 ├── opus.py                      # native Encoder/Decoder + discord.opus constants
 └── errors.py                    # native errors + discord.py's, and FFmpegSourceError
 src/                             # the core
@@ -256,9 +267,12 @@ The Python suite includes:
 * **Receiving audio is not implemented.** `VoiceConnectionState.add_socket_listener` raises
   `NotImplementedError`, matching the scope of discord.py's own voice support (the sending
   side); the `voice_recv` use case is not covered.
-* **`before_options`/`options` always use the `ffmpeg` binary.** They are FFmpeg CLI grammar,
-  so they cannot be mapped onto the in-process decoder; the binary is invoked exactly as
-  discord.py would.
+* **`before_options`/`options` are gone** (they raise `TypeError`): FFmpeg CLI grammar cannot
+  be mapped onto the in-process decoder. `seek=` covers `-ss`, and everything else belongs in
+  the media file.
+* **Network URLs are not supported.** Fetch the URL with your own HTTP client and hand the
+  response (or a temporary file) to `FFmpegPCMAudio`; decoding a URL directly would mean
+  bundling an HTTP client and pulling network I/O into the player thread.
 * **A missing local file fails at construction**, not on the first `read()`, so a typo is
   reported immediately.
 * **Wheels are dynamically linked** against the system FFmpeg and Opus.

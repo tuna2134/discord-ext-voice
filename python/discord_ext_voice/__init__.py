@@ -8,10 +8,10 @@ Quick start::
     voice = await channel.connect(cls=dev.VoiceClient)
     voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('done', error))
 
-The Python layer is a thin extension of ``discord.py``: :class:`VoiceClient` subclasses
-``discord.VoiceClient`` and reuses its audio player, connection flow state machine, gateway
-opcodes and ``ffmpeg`` subprocess fallback. Everything voice-specific actually happens in
-Rust:
+The Python layer is a thin extension of ``discord.py``: :class:`VoiceClient` implements
+``discord.VoiceProtocol`` and reuses its connection flow state machine, gateway opcodes and
+audio player thread. The audio sources (:mod:`discord_ext_voice.sources`) and everything
+voice-specific are this package's own and happen in Rust:
 
 ======================  ==========================================================
 Concern                 Rust crate
@@ -21,6 +21,7 @@ Voice gateway payloads  ``voice-model``
 RTP encryption          ``xsalsa20poly1305`` / ``chacha20poly1305``
 End-to-end encryption   ``davey`` (DAVE / MLS)
 Opus codec              ``audiopus``
+Audio sources           :mod:`discord_ext_voice.sources` (``ac-ffmpeg``, no binary)
 Audio decode/resample   ``ac-ffmpeg`` + ``libswresample``
 Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)
 ======================  ==========================================================
@@ -29,6 +30,7 @@ Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)
 from __future__ import annotations
 
 from discord.opus import OPUS_SILENCE
+from discord.player import AudioPlayer  # the playback clock, reused unchanged
 
 from . import opus
 from ._native import DAVE_PROTOCOL_VERSION, SUPPORTED_MODES, __version__, probe
@@ -40,7 +42,6 @@ from .errors import (
     DaveError,
     EncryptionError,
     FFmpegError,
-    FFmpegProcessError,
     FFmpegSourceError,
     HandshakeError,
     NotConnected,
@@ -49,10 +50,8 @@ from .errors import (
     VoiceError,
 )
 from .gateway import DiscordVoiceWebSocket
-from .player import (
-    AudioPlayer,
+from .sources import (
     AudioSource,
-    FFmpegAudio,
     FFmpegOpusAudio,
     FFmpegPCMAudio,
     PCMAudio,
@@ -78,10 +77,9 @@ __all__ = (
     'ConnectionFlowState',
     'DiscordVoiceWebSocket',
     # audio
-    'AudioSource',
     'AudioPlayer',
+    'AudioSource',
     'PCMAudio',
-    'FFmpegAudio',
     'FFmpegPCMAudio',
     'FFmpegOpusAudio',
     'PCMVolumeTransformer',
@@ -111,7 +109,6 @@ __all__ = (
     'DaveError',
     'OpusError',
     'FFmpegError',
-    'FFmpegProcessError',
     'FFmpegSourceError',
     'ConnectionClosed',
     '__version__',

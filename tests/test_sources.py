@@ -1,4 +1,8 @@
-"""Audio source tests: `ac-ffmpeg` decoding, resampling, Opus pass-through and volume."""
+"""Audio source tests: `ac-ffmpeg` decoding, seeking, resampling, Opus pass-through, volume.
+
+Everything here is this package's own source implementation, so the `ffmpeg` binary is only
+ever used to *create* the Opus fixture; no test decodes through a subprocess.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +15,6 @@ from pathlib import Path
 import pytest
 
 import discord_ext_voice as dev
-
-from conftest import requires_ffmpeg, write_wav
 
 FFMPEG = shutil.which('ffmpeg')
 
@@ -35,6 +37,14 @@ def test_pcm_audio_reads_exact_frames():
 
 def test_pcm_audio_is_not_opus():
     assert dev.PCMAudio(io.BytesIO(b'')).is_opus() is False
+
+
+def test_pcm_audio_drops_a_partial_frame():
+    """`discord.py`'s player reads an incomplete frame as the end of the source."""
+    stream = io.BytesIO(b'\x00' * (dev.FRAME_SIZE + 100))
+    source = dev.PCMAudio(stream)
+    assert len(source.read()) == dev.FRAME_SIZE
+    assert source.read() == b''
 
 
 # ---------------------------------------------------------------------------- probe
@@ -95,7 +105,7 @@ def test_ffmpeg_pcm_audio_resamples_and_upmixes(mono_wav: Path):
         source.cleanup()
 
 
-def test_ffmpeg_pcm_audio_skips_with_seek_options(sine_wav: Path):
+def test_ffmpeg_pcm_audio_seeks_natively(sine_wav: Path):
     full = dev.FFmpegPCMAudio(str(sine_wav))
     try:
         full_bytes = 0
@@ -104,7 +114,8 @@ def test_ffmpeg_pcm_audio_skips_with_seek_options(sine_wav: Path):
     finally:
         full.cleanup()
 
-    trimmed = dev.FFmpegPCMAudio(str(sine_wav), before_options='-ss 0.25')
+    # `seek` is the native form of `-ss`: the demuxer moves and the decoder is rebuilt.
+    trimmed = dev.FFmpegPCMAudio(str(sine_wav), seek=0.25)
     try:
         trimmed_bytes = 0
         while (chunk := trimmed.read()):
@@ -137,50 +148,68 @@ def test_ffmpeg_pcm_audio_fails_fast_for_a_missing_file(tmp_path: Path):
     assert isinstance(info.value, dev.ClientException)
 
 
-@requires_ffmpeg
 def test_ffmpeg_pcm_audio_reports_a_non_media_file(tmp_path: Path):
+    """With no CLI to fall back to, an undecodable input fails at construction."""
     bogus = tmp_path / 'file.txt'
     bogus.write_text('not audio at all')
-    # The in-process decoder fails, the ffmpeg CLI fallback fails too, and discord.py records
-    # that in `_current_error`, which `AudioPlayer` turns into the `after` callback's error.
-    source = dev.FFmpegPCMAudio(bogus)
-    try:
-        while source.read():
-            pass
-        assert isinstance(source._current_error, dev.ClientException)
-    finally:
-        source.cleanup()
+    with pytest.raises(dev.FFmpegSourceError) as info:
+        dev.FFmpegPCMAudio(bogus)
+    assert isinstance(info.value, dev.ClientException)
 
 
-@requires_ffmpeg
-def test_ffmpeg_pcm_audio_cli_fallback(sine_wav: Path):
-    source = dev.FFmpegPCMAudio(str(sine_wav), force_cli=True)
+def test_ffmpeg_pcm_audio_rejects_ffmpeg_cli_arguments(sine_wav: Path):
+    """discord.py's FFmpeg-CLI arguments do not exist: there is no `ffmpeg` process."""
+    for options in (
+        {'before_options': '-ss 0.25'},
+        {'options': '-vn'},
+        {'executable': 'avconv'},
+        {'pipe': True},
+        {'stderr': True},
+        {'force_cli': True},
+    ):
+        with pytest.raises(TypeError) as info:
+            dev.FFmpegPCMAudio(str(sine_wav), **options)
+        # The message names what was passed and points at the native alternative.
+        assert next(iter(options)) in str(info.value)
+        assert 'seek=' in str(info.value)
+
+
+class _Unseekable(io.RawIOBase):
+    """A read-only stream that reports itself as unseekable, like a pipe or a socket."""
+
+    def __init__(self, data: bytes) -> None:
+        self._buffer = io.BytesIO(data)
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def readinto(self, target: bytearray) -> int:
+        data = self._buffer.read(len(target))
+        target[: len(data)] = data
+        return len(data)
+
+
+def test_ffmpeg_pcm_audio_reads_an_unseekable_stream(sine_wav: Path):
+    source = dev.FFmpegPCMAudio(_Unseekable(sine_wav.read_bytes()))
     try:
         assert len(source.read()) == dev.FRAME_SIZE
     finally:
         source.cleanup()
 
 
-@requires_ffmpeg
-def test_ffmpeg_pcm_audio_cli_fallback_pipes_stdin(sine_wav: Path):
-    """`pipe=True` writes a file-like source into the ffmpeg process, like discord.py."""
-    with open(sine_wav, 'rb') as handle:
-        source = dev.FFmpegPCMAudio(handle, pipe=True)
-        try:
-            # The audio comes back as raw PCM frames.
-            for _ in range(10):
-                data = source.read()
-                if not data:
-                    break
-                assert len(data) == dev.FRAME_SIZE
-        finally:
-            source.cleanup()
+def test_ffmpeg_pcm_audio_reports_a_failed_seek(sine_wav: Path):
+    with pytest.raises(dev.FFmpegSourceError):
+        dev.FFmpegPCMAudio(_Unseekable(sine_wav.read_bytes()), seek=0.25)
 
 
-@requires_ffmpeg
-def test_ffmpeg_pcm_audio_rejects_a_path_when_piping(sine_wav: Path):
-    with pytest.raises(TypeError):
-        dev.FFmpegPCMAudio(str(sine_wav), pipe=True)
+@pytest.mark.parametrize('seek', [-1.0, float('nan'), float('inf'), 'soon'])
+def test_ffmpeg_pcm_audio_rejects_a_bad_seek_position(sine_wav: Path, seek: object):
+    with pytest.raises(ValueError) as info:
+        dev.FFmpegPCMAudio(str(sine_wav), seek=seek)  # type: ignore[arg-type]
+    assert 'non-negative' in str(info.value)
 
 
 # ---------------------------------------------------------------------------- FFmpegOpusAudio
@@ -231,10 +260,18 @@ def test_ffmpeg_opus_audio_falls_back_to_pcm_for_non_opus(sine_wav: Path):
 async def test_ffmpeg_opus_audio_probe(opus_file: Path):
     codec, bitrate = await dev.FFmpegOpusAudio.probe(str(opus_file))
     assert codec is not None and codec.startswith('opus')
+    # No `ffprobe`/`ffmpeg` process is started, so there is no bitrate to report.
+    assert bitrate is None
 
-    source = await dev.FFmpegOpusAudio.from_probe(str(opus_file))
+    assert dev.FFmpegOpusAudio.probe_codec(str(opus_file)).startswith('opus')
+    assert dev.FFmpegOpusAudio.probe_codec('/nonexistent') is None
+
+
+def test_ffmpeg_opus_audio_seeks_natively(opus_file: Path):
+    source = dev.FFmpegOpusAudio(str(opus_file), seek=0.1)
     try:
         assert source.is_opus() is True
+        assert len(source.read()) > 0
     finally:
         source.cleanup()
 
@@ -260,11 +297,8 @@ def test_volume_transformer_scales_samples(sine_wav: Path):
         transformer.cleanup()
 
 
-@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
 def test_volume_transformer_rejects_opus_sources(opus_file: Path):
-    # `discord.PCMVolumeTransformer` raises before setting `self.original`, so its
-    # `AudioSource.__del__` -> `cleanup()` path raises again during garbage collection.
-    # That is discord.py's behaviour, reused verbatim.
+    """`self.original` is set before the check, so `__del__` -> `cleanup()` stays safe."""
     source = dev.FFmpegOpusAudio(str(opus_file))
     try:
         with pytest.raises(dev.ClientException):
@@ -273,8 +307,13 @@ def test_volume_transformer_rejects_opus_sources(opus_file: Path):
         source.cleanup()
 
 
+def test_volume_transformer_rejects_a_non_source():
+    with pytest.raises(TypeError):
+        dev.PCMVolumeTransformer(b'not a source')  # type: ignore[arg-type]
+
+
 def test_volume_transformer_forwards_cleanup():
-    """`discord.PCMVolumeTransformer` is reused as-is, so cleanup must still be forwarded."""
+    """Cleanup is forwarded to the wrapped source."""
     cleaned: list[bool] = []
 
     class Source(dev.AudioSource):
@@ -287,3 +326,8 @@ def test_volume_transformer_forwards_cleanup():
     transformer = dev.PCMVolumeTransformer(Source(), 0.5)
     transformer.cleanup()
     assert cleaned == [True]
+
+
+def test_volume_transformer_of_silence_stays_empty():
+    transformer = dev.PCMVolumeTransformer(dev.PCMAudio(io.BytesIO(b'')), 0.5)
+    assert transformer.read() == b''

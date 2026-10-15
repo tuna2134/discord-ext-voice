@@ -130,9 +130,16 @@ class VoiceConnectionState(_VoiceConnectionState):
             # discord.py treats a connect timeout as `asyncio.TimeoutError` (and retries).
             raise asyncio.TimeoutError(str(exc)) from exc
         except _native.ConnectionClosedError as exc:
-            raise ConnectionClosed(
-                self.ws, shard_id=None, code=self._native.close_code or None
-            ) from exc
+            # Discord puts the interesting part in the close code: 4006 and 4014/4015 mean the
+            # session is gone and discord.py should retry, 4021 means it was rate limited.
+            # `discord.py` only retries a `ConnectionClosed`, so log what we are handing over.
+            code = self._native.close_code
+            _log.warning(
+                'The voice websocket closed during the handshake (code=%s, reason=%s)',
+                code if code is not None else '<none>',
+                self._native.close_reason or '<none>',
+            )
+            raise ConnectionClosed(self.ws, shard_id=None, code=code or None) from exc
 
         self.endpoint_ip = self._native.ip
         self.ssrc = self._native.ssrc

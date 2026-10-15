@@ -64,12 +64,16 @@ class FakeVoiceGateway:
         dave_protocol_version: int = 0,
         heartbeat_interval_ms: float = 400.0,
         address: str = '127.0.0.1',
+        close_on_identify: Optional[tuple[int, str]] = None,
     ) -> None:
         self.modes = list(modes or ('aead_xchacha20_poly1305_rtpsize', 'xsalsa20_poly1305'))
         self.secret_key = list(secret_key if secret_key is not None else make_secret_key())
         self.dave_protocol_version = dave_protocol_version
         self.heartbeat_interval_ms = heartbeat_interval_ms
         self.address = address
+        #: Close the socket with this `(code, reason)` instead of answering IDENTIFY, which is
+        #: how Discord rejects a stale session (4006 "Session is no longer valid").
+        self.close_on_identify = close_on_identify
 
         self.received_json: list[dict[str, Any]] = []
         self.received_binary: list[bytes] = []
@@ -239,6 +243,10 @@ class FakeVoiceGateway:
                 data = frame.get('d') or {}
 
                 if op == 0:  # IDENTIFY
+                    if self.close_on_identify is not None:
+                        code, reason = self.close_on_identify
+                        await connection.close(code, reason)
+                        return
                     await self._send(
                         {
                             'op': 2,

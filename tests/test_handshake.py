@@ -130,6 +130,25 @@ async def test_close_code_is_reported(gateway_factory):
         await conn.close()
 
 
+async def test_close_during_the_handshake_reports_code_and_reason(gateway_factory):
+    """Discord closes a rejected session mid-handshake: Python still needs the close code."""
+    gateway = await gateway_factory(close_on_identify=(4006, 'Session is no longer valid.'))
+    conn = _native.VoiceConnection(GUILD_ID, USER_ID, CHANNEL_ID)
+    conn.set_session_id('stale-session')
+    conn.set_server_info(GUILD_ID, 'voice-token', gateway.endpoint)
+    # ConnectionFlowState.got_both_voice_updates.
+    conn.set_phase(4)
+
+    with pytest.raises(dev.ConnectionClosedError) as info:
+        await conn.handshake(resume=False, timeout=5.0)
+
+    # The message carries the code: the interesting part of a voice close is the number.
+    assert '4006' in str(info.value)
+    assert conn.close_code == 4006
+    assert conn.close_reason == 'Session is no longer valid.'
+    assert conn.is_connected() is False
+
+
 async def test_send_audio_packet_before_connect_raises():
     conn = _native.VoiceConnection(GUILD_ID, USER_ID, CHANNEL_ID)
     with pytest.raises(dev.NotConnected):

@@ -172,6 +172,22 @@ impl VoiceConnection {
         self.hub.state.lock().seq_ack
     }
 
+    /// The websocket close code, once the socket is gone (`None` while it is alive).
+    ///
+    /// `VoiceConnectionState` puts this on the `discord.ConnectionClosed` it raises for a
+    /// failed handshake, which is how discord.py decides whether to retry (a 4006 or a 4015
+    /// is worth another attempt, a 4021 rate limit is not).
+    #[getter]
+    fn close_code(&self) -> Option<u16> {
+        self.hub.state.lock().close_code
+    }
+
+    /// The websocket close reason, once the socket is gone.
+    #[getter]
+    fn close_reason(&self) -> String {
+        self.hub.state.lock().close_reason.clone()
+    }
+
     // ----------------------------------------------------------------- negotiated session
 
     #[getter]
@@ -331,12 +347,13 @@ impl VoiceConnection {
             })
             .await;
 
-            let (connected, closed, reason) = {
+            let (connected, closed, reason, code) = {
                 let state = hub.state.lock();
                 (
                     state.phase.is_connected(),
                     state.closed,
                     state.close_reason.clone(),
+                    state.close_code,
                 )
             };
 
@@ -350,10 +367,16 @@ impl VoiceConnection {
             }
 
             if closed {
+                // `finish` is a no-op here: the reader already recorded this close, and
+                // passing `None` keeps its code and reason intact.
                 hub.finish(None, reason.clone());
-                Err(ConnectionClosedError::new_err(format!(
-                    "the voice websocket closed during the handshake: {reason}"
-                )))
+                Err(ConnectionClosedError::new_err(match code {
+                    Some(code) => format!(
+                        "the voice websocket closed during the handshake: {reason} \
+                         (close code {code})"
+                    ),
+                    None => format!("the voice websocket closed during the handshake: {reason}"),
+                }))
             } else {
                 hub.finish(None, "handshake timed out".to_owned());
                 Err(HandshakeError::new_err(

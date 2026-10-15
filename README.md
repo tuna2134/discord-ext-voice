@@ -29,7 +29,7 @@ Everything that must be native is native — and that is the whole voice protoco
 | RTP encryption (all four modes) | Rust: `xsalsa20poly1305` / `chacha20poly1305` |
 | DAVE end-to-end encryption (MLS) | Rust: `davey` |
 | Opus codec | Rust: `audiopus` (libopus) |
-| Audio decode + resample | Rust: `ac-ffmpeg` (vendored with one upstream fix, see [vendor/README.md](vendor/README.md)) |
+| Audio decode + resample | Rust: `ac-ffmpeg` (a fork carrying one fix, see [patches/README.md](patches/README.md)) |
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
@@ -47,7 +47,7 @@ Everything that must be native is native — and that is the whole voice protoco
 * **No `ffmpeg` subprocess for local media.** `FFmpegPCMAudio` demuxes, decodes and resamples
   in process with libav; the binary is only used for URLs, pipes and explicit CLI options.
   Getting there needed one upstream fix to `ac-ffmpeg` — see
-  [vendor/README.md](vendor/README.md).
+  [patches/README.md](patches/README.md).
 * **Encoding, encryption and the UDP send happen in Rust**, so playback jitter does not
   compete with Python work — the Python player thread just hands Rust 20ms of PCM.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
@@ -64,6 +64,8 @@ Build time:
 * `pkg-config`
 * FFmpeg development libraries: `libavformat`, `libavcodec`, `libavutil`, `libswresample`
 * `libopus` development libraries
+* `git`, for the first build: `ac-ffmpeg` comes from a fork on GitHub (see
+  [patches/README.md](patches/README.md)) and Cargo clones it once into its own cache
 
 Debian/Ubuntu:
 
@@ -84,13 +86,16 @@ out of scope.
 ## Install
 
 ```bash
+git clone <this repository> && cd discord-ext-voice
 python -m venv .venv && . .venv/bin/activate
 pip install maturin
 maturin develop --release
 ```
 
-`ac-ffmpeg` is vendored in-tree (`vendor/ac-ffmpeg`, patched — see
-[vendor/README.md](vendor/README.md)), so a plain checkout builds without any extra step.
+`ac-ffmpeg` is used through a small fork that carries one fix (see
+[patches/README.md](patches/README.md)). Cargo fetches it automatically — no submodule, no
+vendored tree — and `Cargo.lock` pins the exact commit, so the first build needs `git` and
+network access and every later build is offline.
 
 Only plain `discord.py` is required. `discord.py[voice]` (PyNaCl + the Python `davey`
 bindings) is **not** needed: `VoiceClient` implements `VoiceProtocol` directly, so discord.py's
@@ -211,14 +216,16 @@ top-level member without consuming its value, and Discord's voice gateway sends 
 alongside `op`/`d`. Every incoming frame is filtered down to `op` + `d` (recording `seq` for
 `RESUME`) and re-parsed from text.
 
-**`ac-ffmpeg` is vendored with one resampler fix.** Its `AudioResampler` hands frames straight
-to `swr_convert_frame`, which rejects the *unspecified* channel layouts that current FFmpeg
+**`ac-ffmpeg` is patched to a fork that carries one resampler fix.** Its `AudioResampler`
+hands frames straight to `swr_convert_frame`, which rejects the *unspecified* channel layouts
+that current FFmpeg
 decoders emit for plain PCM streams (`AVERROR_INPUT_CHANGED`, "Input changed"), and its public
-API offers no configuration that avoids it. `vendor/ac-ffmpeg` is upstream `09f1421`
-(release 0.19.0) plus a small fix that normalises the layout of a shallow frame copy before
-converting, exported as `patches/0001-resampler-accept-unspecified-channel-layout.patch` for
-upstream. Dropping the vendored copy once a fixed release exists is a three line change; see
-[vendor/README.md](vendor/README.md).
+API offers no configuration that avoids it. The build therefore patches `ac-ffmpeg` to a fork
+of upstream `09f1421` (release 0.19.0) with a small fix that normalises the layout of a shallow
+frame copy before converting. The change is also exported as
+`patches/0001-resampler-accept-unspecified-channel-layout.patch`, which is what gets rebased
+onto new releases and sent upstream; dropping the fork once a fixed release exists is a three
+line change, see [patches/README.md](patches/README.md).
 
 **The audio player thread stays in Python**, because it is discord.py's. Each 20ms frame goes
 from that thread into Rust for encoding, encryption and transmission, so the timing model is

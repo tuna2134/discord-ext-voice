@@ -17,9 +17,10 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-    # `VoiceClient` subclasses `discord.VoiceClient` for its API and connection flow. The
-    # `voice` extra (PyNaCl + the Python `davey` bindings) is deliberately *not* needed: the
-    # RTP encryption and the DAVE/MLS session are implemented natively in Rust.
+    # `VoiceClient` implements `discord.VoiceProtocol` and reuses discord.py's player, audio
+    # sources and connection-flow state machine. The `voice` extra (PyNaCl + the Python
+    # `davey` bindings) is deliberately *not* needed: the RTP encryption and the DAVE/MLS
+    # session are implemented natively in Rust.
     "discord.py>=2.7",
 ]
 
@@ -32,9 +33,9 @@ dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5"]
 module-name = "discord_ext_voice._native"
 python-source = "python"
 features = ["extension-module", "abi3"]
-# `cargo package` leaves path dependencies out of the sdist, so the vendored, patched
-# `ac-ffmpeg` has to be added back explicitly (see vendor/README.md).
-include = [{ path = "vendor/ac-ffmpeg/**/*", format = "sdist" }]
+# Patching `ac-ffmpeg` with a git dependency (see patches/README.md) keeps the sdist small:
+# `pip install <sdist>` fetches the fork rather than shipping a copy of it, at the cost of
+# needing `git` and network access — exactly like building from a source checkout.
 # The reference `discord.py` checkout some working copies carry is not part of this package.
 exclude = ["discord.py/**"]
 

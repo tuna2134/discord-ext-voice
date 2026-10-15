@@ -166,6 +166,29 @@ async def test_native_connection_is_exposed(gateway_factory):
         await voice.disconnect()
 
 
+async def test_handshake_close_is_translated_to_discord_connection_closed(gateway_factory):
+    """Regression: a 4006 used to escape as an ``AttributeError`` instead of a retryable error.
+
+    ``discord.py`` retries a connect only for :class:`discord.ConnectionClosed`, so the code
+    and the reason have to survive the trip through the native connection.
+    """
+    gateway = await gateway_factory(close_on_identify=(4006, 'Session is no longer valid.'))
+    client, channel = await make_client(gateway)
+
+    voice = dev.VoiceClient(client, channel)
+    client._connection._add_voice_client(KEY, voice)
+
+    try:
+        with pytest.raises(dev.ConnectionClosed) as info:
+            await voice.connect(timeout=10.0, reconnect=False)
+
+        assert info.value.code == 4006
+        assert voice._connection.native.close_code == 4006
+        assert voice.is_connected() is False
+    finally:
+        await voice.disconnect()
+
+
 # ---------------------------------------------------------------------------- playback
 
 

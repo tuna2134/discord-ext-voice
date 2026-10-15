@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "A discord.py VoiceClient-compatible voice library built on pyo3, tokio-tungstenite, ac-ffmpeg, davey and audiopus"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/tuna2134/discord-ext-voice"
 rust-version = "1.85"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -60,16 +62,14 @@ thiserror = "2"
 parking_lot = "0.12"
 rand = "0.8"
 
-[workspace]
-# `vendor/ac-ffmpeg` is a workspace of its own (see vendor/README.md). Excluding it keeps
-# `cargo fmt`, `clippy` and `test` from ever wandering into the vendored sources.
-exclude = ["vendor/ac-ffmpeg"]
-
-# The vendored copy carries one fix on top of the released 0.19.0: its audio resampler
+# The fork below is upstream 09f1421 ("Release v0.19.0") plus one fix: its audio resampler
 # rejected the unspecified channel layouts that current FFmpeg decoders produce for plain PCM
-# streams (`AVERROR_INPUT_CHANGED`). See vendor/ac-ffmpeg and patches/.
+# streams (`AVERROR_INPUT_CHANGED`). The change is exported for upstream as
+# patches/0001-resampler-accept-unspecified-channel-layout.patch; see patches/README.md.
+# `Cargo.lock` pins the exact commit, so bump the fork deliberately with
+# `cargo update -p ac-ffmpeg`.
 [patch.crates-io]
-ac-ffmpeg = { path = "vendor/ac-ffmpeg/ac-ffmpeg" }
+ac-ffmpeg = { git = "https://github.com/tuna2134/rust-ac-ffmpeg", branch = "master" }
 
 [profile.release]
 lto = "thin"

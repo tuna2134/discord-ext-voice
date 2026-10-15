@@ -447,10 +447,34 @@ pub fn spawn_session(
 
 fn identify_payload(hub: &Arc<Hub>) -> Value {
     let state = hub.state.lock();
+    let session_id = state.session_id.clone().unwrap_or_default();
+    let token = state.token.clone().unwrap_or_default();
+
+    // `server_id`, `session_id` and `token` come from two different gateway events. An
+    // IDENTIFY that is missing any of them is answered with a close (4006 "Session is no
+    // longer valid"), which reads like a protocol error but is really a missing
+    // VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE, so say that instead of letting the caller
+    // guess from the close code.
+    let missing: Vec<&str> = [
+        state.server_id.is_none().then_some("server_id"),
+        session_id.is_empty().then_some("session_id"),
+        token.is_empty().then_some("token"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !missing.is_empty() {
+        log_warning!(
+            "voice IDENTIFY is missing {}; Discord closes such a session with 4006. Both \
+             VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE have to be handled before connecting.",
+            missing.join(", ")
+        );
+    }
+
     let event = vm::Event::Identify(vp::Identify {
         server_id: GuildId(state.server_id.unwrap_or(0)),
-        session_id: state.session_id.clone().unwrap_or_default(),
-        token: state.token.clone().unwrap_or_default(),
+        session_id,
+        token,
         user_id: UserId(state.user_id),
         max_dave_protocol_version: (state.max_dave_protocol_version > 0)
             .then_some(state.max_dave_protocol_version),
@@ -460,7 +484,19 @@ fn identify_payload(hub: &Arc<Hub>) -> Value {
     if value.get("d").is_none() {
         value = serde_json::json!({ "op": 0, "d": {} });
     }
+    log_outgoing("IDENTIFY", &value);
     value
+}
+
+/// Log an outgoing handshake frame with the token redacted.
+fn log_outgoing(kind: &str, value: &Value) {
+    let mut redacted = value.clone();
+    if let Some(data) = redacted.get_mut("d") {
+        if data.get("token").is_some() {
+            data["token"] = Value::from("<redacted>");
+        }
+    }
+    log_debug!("sending voice {kind}: {redacted}");
 }
 
 fn resume_payload(hub: &Arc<Hub>) -> Result<Value, TransportError> {
@@ -477,6 +513,7 @@ fn resume_payload(hub: &Arc<Hub>) -> Result<Value, TransportError> {
     if let Some(data) = value.get_mut("d") {
         data["seq_ack"] = Value::from(state.seq_ack);
     }
+    log_outgoing("RESUME", &value);
     Ok(value)
 }
 

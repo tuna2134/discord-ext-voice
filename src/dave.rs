@@ -391,6 +391,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn logs_are_buffered_until_the_caller_takes_them() {
+        // The caller holds the connection lock while this runs, so nothing may be emitted yet:
+        // handing a record to Python needs the GIL, which the audio thread may be holding while
+        // it waits for that very lock.
+        let mut dave = DaveState::new(1, 2);
+        let outgoing = dave.handle_binary(&[99, 1, 2, 3]).unwrap();
+        assert!(outgoing.is_empty());
+
+        let logs = dave.take_logs();
+        assert_eq!(logs.len(), 1, "the record has to wait for the caller");
+        assert_eq!(logs[0].0, "debug");
+        assert!(
+            logs[0].1.contains("unknown DAVE binary frame"),
+            "{:?}",
+            logs[0]
+        );
+
+        // Taking them drains the buffer.
+        assert!(dave.take_logs().is_empty());
+    }
+
+    #[test]
     fn pending_transition_downgrade_and_upgrade() {
         let mut dave = DaveState::new(1, 2);
         dave.protocol_version = 1;

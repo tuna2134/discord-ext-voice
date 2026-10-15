@@ -31,11 +31,19 @@ pub struct DaveState {
     downgraded: bool,
     user_id: u64,
     channel_id: u64,
+    /// Records produced while the connection state was locked.
+    ///
+    /// Logging hands the message to Python, which needs the GIL. A Python thread that holds the
+    /// GIL may be waiting for the very lock the caller holds (the audio path does exactly that),
+    /// so emitting a record here would deadlock. The caller drains these once it has released
+    /// the lock, through `with_state` in `transport`.
+    pending_logs: Vec<(&'static str, String)>,
 }
 
 impl DaveState {
     pub fn new(user_id: u64, channel_id: u64) -> Self {
         Self {
+            pending_logs: Vec::new(),
             session: None,
             protocol_version: 0,
             pending_transitions: HashMap::new(),
@@ -56,6 +64,24 @@ impl DaveState {
 
     pub fn set_protocol_version(&mut self, version: u16) {
         self.protocol_version = version;
+    }
+
+    fn note(&mut self, level: &'static str, message: String) {
+        self.pending_logs.push((level, message));
+    }
+
+    fn note_debug(&mut self, message: String) {
+        self.note("debug", message);
+    }
+
+    fn note_warning(&mut self, message: String) {
+        self.note("warning", message);
+    }
+
+    /// Take the records produced since the last call. The caller has to have released the
+    /// connection lock by now.
+    pub fn take_logs(&mut self) -> Vec<(&'static str, String)> {
+        std::mem::take(&mut self.pending_logs)
     }
 
     pub fn set_channel_id(&mut self, channel_id: u64) {
@@ -155,14 +181,16 @@ impl DaveState {
         Ok(())
     }
 
-    fn transition_ready(&self, transition_id: u16, outgoing: &mut Vec<Outgoing>) {
+    fn transition_ready(&mut self, transition_id: u16, outgoing: &mut Vec<Outgoing>) {
         let event = vm::Event::DaveTransitionReady(vp::DaveTransitionReady {
             transition_id,
             protocol_version: self.protocol_version,
         });
         match serde_json::to_value(&event) {
             Ok(value) => outgoing.push(Outgoing::Json(value)),
-            Err(err) => crate::log_warning!("unable to serialize DAVE transition ready: {err}"),
+            Err(err) => {
+                self.note_warning(format!("unable to serialize DAVE transition ready: {err}"))
+            }
         }
     }
 
@@ -214,9 +242,9 @@ impl DaveState {
     fn execute_transition(&mut self, transition_id: u16) {
         let before = (self.protocol_version, self.can_encrypt());
         let Some(new_version) = self.pending_transitions.remove(&transition_id) else {
-            crate::log_warning!(
+            self.note_warning(format!(
                 "received execute transition, but no pending transition for id {transition_id}"
-            );
+            ));
             return;
         };
 
@@ -225,22 +253,21 @@ impl DaveState {
 
         if old_version != new_version && new_version == 0 {
             self.downgraded = true;
-            crate::log_debug!("DAVE session downgraded");
+            self.note_debug("DAVE session downgraded".to_owned());
         } else if transition_id > 0 && self.downgraded {
             self.downgraded = false;
             if let Some(session) = self.session.as_mut() {
                 session.set_passthrough_mode(true, Some(10));
             }
-            crate::log_debug!("DAVE session upgraded");
+            self.note_debug("DAVE session upgraded".to_owned());
         }
 
-        crate::log_debug!(
-            "DAVE transition {transition_id} executed: protocol_version {} -> {}, can_encrypt {} -> {}",
-            before.0,
-            self.protocol_version,
-            before.1,
-            self.can_encrypt()
-        );
+        let (version_before, encrypted_before) = before;
+        let (version_after, encrypted_after) = (self.protocol_version, self.can_encrypt());
+        self.note_debug(format!(
+            "DAVE transition {transition_id} executed: protocol_version {version_before} -> \
+             {version_after}, can_encrypt {encrypted_before} -> {encrypted_after}"
+        ));
     }
 
     /// Build the `dave_mls_invalid_commit_welcome` (opcode 31) recovery frame and re-create the
@@ -266,7 +293,7 @@ impl DaveState {
         let event = match vm::deserialize_binary_event(payload) {
             Ok(event) => event,
             Err(err) => {
-                crate::log_debug!("ignoring unknown DAVE binary frame: {err}");
+                self.note_debug(format!("ignoring unknown DAVE binary frame: {err}"));
                 return Ok(Vec::new());
             }
         };
@@ -283,7 +310,7 @@ impl DaveState {
                     .expect("checked above")
                     .set_external_sender(&data.external_sender)
                     .map_err(Self::to_dave_err)?;
-                crate::log_debug!("set MLS external sender");
+                self.note_debug("set MLS external sender".to_owned());
             }
             vm::Event::DaveMlsProposals(data) => {
                 let op = match data.operation_type {
@@ -306,7 +333,7 @@ impl DaveState {
                         &mut outgoing,
                     )?;
                 }
-                crate::log_debug!("MLS proposals processed");
+                self.note_debug("MLS proposals processed".to_owned());
             }
             vm::Event::DaveMlsAnnounceCommitTransition(data) => {
                 let transition_id = data.transition_id;
@@ -317,7 +344,7 @@ impl DaveState {
                     .process_commit(&data.commit_message);
 
                 if let Err(err) = processed {
-                    crate::log_warning!("invalid MLS commit: {err}");
+                    self.note_warning(format!("invalid MLS commit: {err}"));
                     outgoing.extend(self.recover_from_invalid_commit(transition_id)?);
                 } else {
                     if transition_id != 0 {
@@ -325,7 +352,9 @@ impl DaveState {
                             .insert(transition_id, self.protocol_version);
                         self.transition_ready(transition_id, &mut outgoing);
                     }
-                    crate::log_debug!("MLS commit processed for transition {transition_id}");
+                    self.note_debug(format!(
+                        "MLS commit processed for transition {transition_id}"
+                    ));
                 }
             }
             vm::Event::DaveMlsWelcome(data) => {
@@ -337,7 +366,7 @@ impl DaveState {
                     .process_welcome(&data.welcome);
 
                 if let Err(err) = processed {
-                    crate::log_warning!("invalid MLS welcome: {err}");
+                    self.note_warning(format!("invalid MLS welcome: {err}"));
                     outgoing.extend(self.recover_from_invalid_commit(transition_id)?);
                 } else {
                     if transition_id != 0 {
@@ -345,7 +374,9 @@ impl DaveState {
                             .insert(transition_id, self.protocol_version);
                         self.transition_ready(transition_id, &mut outgoing);
                     }
-                    crate::log_debug!("MLS welcome processed for transition {transition_id}");
+                    self.note_debug(format!(
+                        "MLS welcome processed for transition {transition_id}"
+                    ));
                 }
             }
             _ => {}

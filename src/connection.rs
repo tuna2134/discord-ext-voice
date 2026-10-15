@@ -20,7 +20,7 @@ use crate::errors::{
 };
 use crate::opus::{EncoderConfig, OpusEncoder, SAMPLES_PER_FRAME};
 use crate::transport::{self, Hub, Phase, Session, WsCommand};
-use crate::{log_debug, log_info, log_warning};
+use crate::{log_debug, log_info};
 
 fn phase_from_u8(value: u8) -> Option<Phase> {
     Some(match value {
@@ -245,7 +245,7 @@ impl VoiceConnection {
     fn reinit_dave_session(&self, py: Python<'_>) -> PyResult<()> {
         let hub = self.hub.clone();
         py.detach(move || {
-            let outgoing = { hub.state.lock().dave.reinit() };
+            let outgoing = transport::with_state(&hub, |state| state.dave.reinit());
             match outgoing {
                 Ok(frames) => {
                     for frame in frames {
@@ -422,7 +422,10 @@ impl VoiceConnection {
         encode: bool,
         encoder: Option<PyRef<'_, crate::opus::PyOpusEncoder>>,
     ) -> PyResult<()> {
+        // Records are collected and emitted after the lock is released: logging needs the GIL,
+        // and a Python thread that holds the GIL may be waiting for this lock.
         let packet = {
+            let mut pending: Vec<(&'static str, String)> = Vec::new();
             let mut state = self.hub.state.lock();
 
             state.sequence =
@@ -452,7 +455,10 @@ impl VoiceConnection {
                     Ok(Some(encrypted)) => encrypted,
                     Ok(None) => payload,
                     Err(err) => {
-                        log_warning!("DAVE encryption failed, sending plaintext: {err}");
+                        pending.push((
+                            "warning",
+                            format!("DAVE encryption failed, sending plaintext: {err}"),
+                        ));
                         payload
                     }
                 }
@@ -477,14 +483,17 @@ impl VoiceConnection {
                 .encrypt(&header, &payload)
                 .map_err(|err| EncryptionError::new_err(err.to_string()))?;
 
-            log_debug!(
-                "sending RTP: seq={} ssrc={} {} bytes (opus={}, dave={})",
-                state.sequence,
-                ssrc,
-                packet.len(),
-                if encode { "encoded" } else { "passthrough" },
-                if dave_active { "on" } else { "off" }
-            );
+            pending.push((
+                "debug",
+                format!(
+                    "sending RTP: seq={} ssrc={} {} bytes (opus={}, dave={})",
+                    state.sequence,
+                    ssrc,
+                    packet.len(),
+                    if encode { "encoded" } else { "passthrough" },
+                    if dave_active { "on" } else { "off" }
+                ),
+            ));
 
             state.timestamp = crate::transport::VoiceState::checked_add(
                 u64::from(state.timestamp),
@@ -493,10 +502,14 @@ impl VoiceConnection {
             ) as u32;
 
             let socket = state.udp.clone();
-            (packet, socket)
+            (packet, socket, pending)
         };
 
-        let (packet, socket) = packet;
+        let (packet, socket, pending) = packet;
+        for (level, message) in pending {
+            crate::logging::log(level, &message);
+        }
+
         let Some(socket) = socket else {
             return Err(NotConnected::new_err(
                 "the voice UDP socket is not connected",

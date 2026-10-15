@@ -299,6 +299,26 @@ impl Hub {
     }
 }
 
+/// Run `f` with the connection state locked, then emit the log records it produced.
+///
+/// Logging hands the message to Python, which needs the GIL, while a Python thread that holds
+/// the GIL may be waiting for this very lock (the audio path does exactly that). Emitting a
+/// record inside the lock would deadlock the connection, so everything logged on this path is
+/// buffered by the caller (`DaveState::take_logs`) and flushed here, after the guard is gone.
+pub(crate) fn with_state<T>(hub: &Arc<Hub>, f: impl FnOnce(&mut VoiceState) -> T) -> T {
+    let (value, logs) = {
+        let mut state = hub.state.lock();
+        let value = f(&mut state);
+        (value, state.dave.take_logs())
+    };
+
+    for (level, message) in logs {
+        crate::logging::log(level, &message);
+    }
+
+    value
+}
+
 /// A running voice websocket: the command channel plus the reader/writer tasks.
 pub struct Session {
     pub tx: mpsc::UnboundedSender<WsCommand>,
@@ -783,27 +803,26 @@ async fn handle_text(
         }
         vm::Event::DavePrepareTransition(data) => {
             let outgoing = {
-                let mut state = hub.state.lock();
-                state
-                    .dave
-                    .handle_prepare_transition(data.transition_id, data.protocol_version)
+                with_state(hub, |state| {
+                    state
+                        .dave
+                        .handle_prepare_transition(data.transition_id, data.protocol_version)
+                })
             };
             dispatch(hub, tx, outgoing)?;
         }
         vm::Event::DaveExecuteTransition(data) => {
-            let outgoing = {
-                let mut state = hub.state.lock();
+            let outgoing = with_state(hub, |state| {
                 state.dave.handle_execute_transition(data.transition_id)
-            };
+            });
             dispatch(hub, tx, Ok(outgoing))?;
         }
         vm::Event::DavePrepareEpoch(data) => {
-            let outgoing = {
-                let mut state = hub.state.lock();
+            let outgoing = with_state(hub, |state| {
                 state
                     .dave
                     .handle_prepare_epoch(data.epoch, data.protocol_version)
-            };
+            });
             dispatch(hub, tx, outgoing)?;
         }
         vm::Event::ClientConnect(data) => {
@@ -836,10 +855,7 @@ fn handle_binary(
     let seq_ack = u16::from_be_bytes([data[0], data[1]]);
     hub.state.lock().seq_ack = i32::from(seq_ack);
 
-    let outgoing = {
-        let mut state = hub.state.lock();
-        state.dave.handle_binary(&data[2..])
-    };
+    let outgoing = with_state(hub, |state| state.dave.handle_binary(&data[2..]));
     dispatch(hub, tx, outgoing)
 }
 
@@ -977,7 +993,7 @@ fn handle_session_description(
     }
 
     if description.dave_protocol_version > 0 {
-        let outgoing = { hub.state.lock().dave.reinit() };
+        let outgoing = with_state(hub, |state| state.dave.reinit());
         dispatch(hub, tx, outgoing)?;
     }
 

@@ -26,13 +26,12 @@ from __future__ import annotations
 from typing import Any, Callable, Optional, Tuple
 
 from discord.player import AudioPlayer
-from discord.player import AudioSource as _DiscordAudioSource
 from discord.voice_client import VoiceClient as _DiscordVoiceClient
 from discord.voice_client import VoiceProtocol
 
 from . import opus
 from .errors import ClientException, NotConnected
-from .sources import AudioSource
+from .sources import AudioSource, is_audio_source
 from .voice_state import VoiceConnectionState
 
 __all__ = ('VoiceClient', 'VoiceProtocol', 'has_nacl', 'has_dave')
@@ -236,9 +235,9 @@ class VoiceClient(VoiceProtocol):
         if self.is_playing():
             raise ClientException('Already playing audio.')
 
-        # Any `discord.AudioSource` is accepted, not only the ones this package ships, so a
-        # user's own source keeps working.
-        if not isinstance(source, _DiscordAudioSource):
+        # Any `discord.AudioSource` (or duck-typed equivalent) is accepted, not only the
+        # sources this package ships, so a user's own source keeps working.
+        if not is_audio_source(source):
             raise TypeError(f'source must be an AudioSource not {source.__class__.__name__}')
 
         if not source.is_opus():
@@ -288,7 +287,7 @@ class VoiceClient(VoiceProtocol):
 
     @source.setter
     def source(self, value: AudioSource) -> None:
-        if not isinstance(value, _DiscordAudioSource):
+        if not is_audio_source(value):
             raise TypeError(f'expected AudioSource not {value.__class__.__name__}.')
 
         if self._player is None:

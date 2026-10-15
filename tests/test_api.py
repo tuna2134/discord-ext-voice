@@ -95,9 +95,10 @@ def test_sources_are_this_packages_own():
     for cls in (dev.AudioSource, dev.PCMAudio, dev.FFmpegPCMAudio, dev.FFmpegOpusAudio):
         assert cls.__module__ == 'discord_ext_voice.sources'
     assert dev.PCMVolumeTransformer.__module__ == 'discord_ext_voice.sources'
-    # ... while staying compatible with anything that expects discord.py's contract.
-    assert issubclass(dev.AudioSource, discord.player.AudioSource)
-    assert not issubclass(dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio)
+    # Nothing in the package inherits from discord.py; only the method contract is shared, which
+    # is what keeps a foreign source usable.
+    for name in ('AudioSource', 'PCMAudio', 'FFmpegPCMAudio', 'FFmpegOpusAudio'):
+        assert not issubclass(getattr(dev, name), getattr(discord.player, name))
 
 
 def test_opus_encoder_surface():
@@ -134,13 +135,25 @@ def test_exception_types_line_up_with_discord():
     assert dev.ClientException is discord.ClientException
     assert dev.ConnectionClosed is discord.errors.ConnectionClosed
 
-    # A native FFmpeg failure is catchable as either flavour.
+    # A native FFmpeg failure is catchable as our own error type; nothing inherits from
+    # discord.py, so `except discord.ClientException` does not catch it.
     assert issubclass(dev.FFmpegSourceError, dev.FFmpegError)
-    assert issubclass(dev.FFmpegSourceError, discord.ClientException)
+    assert not issubclass(dev.FFmpegSourceError, discord.ClientException)
 
 
 def test_connection_flow_state_values():
-    # discord.py's `ConnectionFlowState` is a custom Enum, so compare `.value`.
+    # The flow enum is ours, with discord.py's names and values so the numbers keep matching.
+    assert [state.name for state in dev.ConnectionFlowState] == [
+        'disconnected',
+        'set_guild_voice_state',
+        'got_voice_state_update',
+        'got_voice_server_update',
+        'got_both_voice_updates',
+        'websocket_connected',
+        'got_websocket_ready',
+        'got_ip_discovery',
+        'connected',
+    ]
     assert [state.value for state in dev.ConnectionFlowState] == list(range(9))
     assert dev.ConnectionFlowState.connected.value == 8
-    assert dev.ConnectionFlowState is discord.voice_state.ConnectionFlowState
+    assert dev.ConnectionFlowState is not discord.voice_state.ConnectionFlowState

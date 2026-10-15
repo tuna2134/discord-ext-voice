@@ -1,8 +1,9 @@
 """Exception types.
 
 The native core raises ``VoiceError`` subclasses. Where ``discord.py`` defines an equivalent
-error, that class is reused (or subclassed) so ``except discord.ClientException`` keeps
-working for code that mixes both clients.
+error, that class is *raised* (``ClientException`` for the client API, ``ConnectionClosed`` for
+the websocket) so ``except discord.ClientException`` keeps working; nothing here inherits from
+discord.py, so an ``except`` clause has to name the class it wants to catch.
 """
 
 from __future__ import annotations
@@ -44,9 +45,9 @@ __all__ = (
 )
 
 
-class FFmpegSourceError(ClientException, FFmpegError):
-    """FFmpeg could not open or decode an audio source.
+class FFmpegSourceError(FFmpegError):
+    """FFmpeg could not open, decode or seek an audio source.
 
-    Inherits from both :class:`discord.ClientException` (what ``discord.py`` raises for a bad
-    source) and the native :class:`FFmpegError`, so either ``except`` clause catches it.
+    Raised while the source is being constructed, where ``discord.py`` only surfaces the failure
+    once its ``ffmpeg`` process exits.
     """

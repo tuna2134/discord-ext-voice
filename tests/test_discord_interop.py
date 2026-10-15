@@ -58,14 +58,11 @@ def test_voice_client_does_not_require_pynacl_or_davey(monkeypatch):
         guild = types.SimpleNamespace(id=111)
 
     voice = dev.VoiceClient(_Client(), _Channel())
-    try:
-        assert voice._connection.native is not None
-        assert voice.native.is_connected() is False
-        assert voice.encoder is None
-        assert voice.is_playing() is False
-        assert asyncio.iscoroutinefunction(voice.connect)
-    finally:
-        voice._connection._socket_reader.stop()
+    assert voice._connection.native is not None
+    assert voice.native.is_connected() is False
+    assert voice.encoder is None
+    assert voice.is_playing() is False
+    assert asyncio.iscoroutinefunction(voice.connect)
 
 
 def test_voice_client_constructor_signature_matches_discord():
@@ -80,32 +77,63 @@ def test_connect_signature_is_accepted_by_discord():
     assert set(ours.parameters) == set(theirs.parameters)
 
 
-def test_voice_websocket_reuses_discord_gateway():
+def test_voice_websocket_is_this_packages_own():
+    """The websocket facade is ours: Rust owns the socket, so only the surface is left."""
     import discord.gateway
 
-    assert issubclass(dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket)
-    # The opcode constants and every outgoing frame builder are discord.py's.
-    assert dev.DiscordVoiceWebSocket.IDENTIFY == 0
-    assert dev.DiscordVoiceWebSocket.MLS_INVALID_COMMIT_WELCOME == 31
-    for name in ('send_as_json', 'send_binary', 'speak', 'identify', 'resume', 'select_protocol'):
-        assert (
-            getattr(dev.DiscordVoiceWebSocket, name)
-            is getattr(discord.gateway.DiscordVoiceWebSocket, name)
-        ), f'{name} should be inherited from discord.py'
+    assert not issubclass(dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket)
+    assert dev.DiscordVoiceWebSocket.__module__ == 'discord_ext_voice.gateway'
+
+    # The opcode constants keep Discord's values, so the frames stay interchangeable.
+    ours = dev.DiscordVoiceWebSocket
+    theirs = discord.gateway.DiscordVoiceWebSocket
+    for name in (
+        'IDENTIFY',
+        'SELECT_PROTOCOL',
+        'READY',
+        'HEARTBEAT',
+        'SESSION_DESCRIPTION',
+        'SPEAKING',
+        'HEARTBEAT_ACK',
+        'RESUME',
+        'HELLO',
+        'RESUMED',
+        'MLS_EXTERNAL_SENDER',
+        'MLS_KEY_PACKAGE',
+        'MLS_INVALID_COMMIT_WELCOME',
+    ):
+        assert getattr(ours, name) == getattr(theirs, name), f'{name} must match Discord'
+
+    # What discord.py's player calls is implemented here.
+    assert callable(ours.speak)
+    assert callable(ours.close)
 
 
 def test_discord_implementations_are_reused_verbatim():
-    """The point of the dependency: no re-implementation of discord.py's voice plumbing."""
+    """Only the host framework comes from discord.py; nothing of ours inherits from it."""
     import discord.gateway
     import discord.player
     import discord.voice_state
 
-    # The playback clock, the connection flow state machine and the gateway frame builders are
-    # discord.py's own, unchanged.
+    # The playback clock is discord.py's, unchanged.
     assert dev.AudioPlayer is discord.player.AudioPlayer
-    assert issubclass(dev.VoiceConnectionState, discord.voice_state.VoiceConnectionState)
-    assert dev.ConnectionFlowState is discord.voice_state.ConnectionFlowState
+    # `VoiceClient` implements discord.py's documented extension point: the one inheritance this
+    # package has, and the only one it wants.
     assert dev.VoiceProtocol is discord.voice_client.VoiceProtocol
+    assert issubclass(dev.VoiceClient, discord.voice_client.VoiceProtocol)
+
+    for ours, theirs in (
+        (dev.VoiceConnectionState, discord.voice_state.VoiceConnectionState),
+        (dev.ConnectionFlowState, discord.voice_state.ConnectionFlowState),
+        (dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket),
+        (dev.AudioSource, discord.player.AudioSource),
+        (dev.PCMAudio, discord.player.PCMAudio),
+        (dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio),
+        (dev.FFmpegOpusAudio, discord.player.FFmpegOpusAudio),
+        (dev.PCMVolumeTransformer, discord.player.PCMVolumeTransformer),
+    ):
+        assert ours is not theirs
+        assert not issubclass(ours, theirs), f'{ours.__name__} must not inherit discord.py'
 
 
 def test_audio_sources_are_this_packages_own():
@@ -117,11 +145,14 @@ def test_audio_sources_are_this_packages_own():
         assert ours is not getattr(discord.player, name), f'{name} must be ours'
         assert ours.__module__ == 'discord_ext_voice.sources'
 
-    # `discord.AudioSource` derives from nothing, so subclassing it is what keeps our sources
-    # usable with anything that checks for discord.py's contract.
-    assert issubclass(dev.AudioSource, discord.player.AudioSource)
-    assert not issubclass(dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio)
-    assert not issubclass(dev.FFmpegOpusAudio, discord.player.FFmpegOpusAudio)
+    # A source with the same three methods is still accepted, which is what makes a
+    # `discord.AudioSource` subclass playable.
+    class External(discord.AudioSource):
+        def read(self) -> bytes:
+            return b''
+
+    assert dev.is_audio_source(External()) is True
+    assert dev.is_audio_source(b'not a source') is False
 
 
 def test_discord_voice_protocol_contract_methods_exist():

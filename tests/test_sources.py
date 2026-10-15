@@ -145,7 +145,7 @@ def test_ffmpeg_pcm_audio_fails_fast_for_a_missing_file(tmp_path: Path):
     """Unlike discord.py this raises at construction instead of on the first read."""
     with pytest.raises(dev.FFmpegSourceError) as info:
         dev.FFmpegPCMAudio(tmp_path / 'missing.wav')
-    assert isinstance(info.value, dev.ClientException)
+    assert isinstance(info.value, dev.VoiceError)
 
 
 def test_ffmpeg_pcm_audio_reports_a_non_media_file(tmp_path: Path):
@@ -154,7 +154,7 @@ def test_ffmpeg_pcm_audio_reports_a_non_media_file(tmp_path: Path):
     bogus.write_text('not audio at all')
     with pytest.raises(dev.FFmpegSourceError) as info:
         dev.FFmpegPCMAudio(bogus)
-    assert isinstance(info.value, dev.ClientException)
+    assert isinstance(info.value, dev.FFmpegError)
 
 
 def test_ffmpeg_pcm_audio_rejects_ffmpeg_cli_arguments(sine_wav: Path):

@@ -9,10 +9,10 @@ The ``ffmpeg`` binary is never spawned, which is why discord.py's FFmpeg-CLI arg
 (``executable``, ``pipe``, ``stderr``, ``before_options``, ``options``, ``force_cli``) do not
 exist here — pass the media itself, and use ``seek`` where ``-ss`` used to go.
 
-:class:`AudioSource` is this package's own base class. It subclasses
-:class:`discord.player.AudioSource` so the sources satisfy discord.py's ``read``/``is_opus``/
-``cleanup`` contract (:class:`discord.player.AudioPlayer` is reused as the playback clock) and
-so code that checks ``isinstance(source, discord.AudioSource)`` keeps working.
+":class:`AudioSource` is this package's own base class; nothing here inherits from discord.py.
+A source only has to provide ``read``/``is_opus``/``cleanup``, which is also the contract
+:class:`discord.player.AudioPlayer` (reused as the playback clock) relies on — so a user's own
+``discord.AudioSource`` subclass is still accepted by ``play()``.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ import os
 from typing import Any, Optional, TypeVar
 
 from discord.errors import ClientException
-from discord.player import AudioSource as _DiscordAudioSource
 
 from . import _native, opus
 from .errors import FFmpegSourceError
@@ -35,12 +34,27 @@ __all__ = (
     'FFmpegPCMAudio',
     'FFmpegOpusAudio',
     'PCMVolumeTransformer',
+    'is_audio_source',
 )
 
 #: One 20ms frame of 48kHz stereo signed 16 bit PCM, which is what the player sends.
 FRAME_SIZE: int = opus.Encoder.FRAME_SIZE
 
 AT = TypeVar('AT', bound='AudioSource')
+
+
+def is_audio_source(candidate: Any) -> bool:
+    """Whether ``candidate`` can be played.
+
+    Either one of the sources in this module, or anything that provides the same three methods —
+    which is how a ``discord.AudioSource`` subclass, or a user's own duck-typed source, stays
+    usable.
+    """
+    if isinstance(candidate, AudioSource):
+        return True
+    return callable(getattr(candidate, 'read', None)) and callable(
+        getattr(candidate, 'is_opus', None)
+    )
 
 
 def _reject_ffmpeg_cli_options(options: dict[str, Any]) -> None:
@@ -100,7 +114,7 @@ def _open_reader(source: Any, seek: Optional[float], *, opus_first: bool) -> Any
     return reader
 
 
-class AudioSource(_DiscordAudioSource):
+class AudioSource:
     """Base class of this package's audio sources.
 
     A source hands the player 20ms of audio per :meth:`read`: 3840 bytes of 16 bit 48kHz stereo
@@ -124,10 +138,17 @@ class AudioSource(_DiscordAudioSource):
         return bool(reader.is_opus()) if reader is not None else False
 
     def cleanup(self) -> None:
-        """Release the native decoder, demuxer and their buffers."""
-        reader, self._reader = self._reader, None
+        """Release the native decoder, demuxer and their buffers.
+
+        Called by the player when the source is exhausted, and by :meth:`__del__` — so it has to
+        survive being called twice, and on an instance whose ``__init__`` raised.
+        """
+        reader, self._reader = getattr(self, '_reader', None), None
         if reader is not None:
             reader.cleanup()
+
+    def __del__(self) -> None:
+        self.cleanup()
 
     def __repr__(self) -> str:
         return f'<{type(self).__name__}>'
@@ -250,7 +271,7 @@ class PCMVolumeTransformer(AudioSource):
     """
 
     def __init__(self, original: AT, volume: float = 1.0) -> None:
-        if not isinstance(original, _DiscordAudioSource):
+        if not is_audio_source(original):
             raise TypeError(f'expected AudioSource not {original.__class__.__name__}.')
 
         # Set before validating so that `cleanup()` (also reached through `AudioSource.__del__`)

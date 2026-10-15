@@ -114,7 +114,7 @@ reader left to wrap.
 
 | Class | Source |
 | --- | --- |
-| `AudioSource` | **ours**, subclassing `discord.player.AudioSource` so discord.py's contract (and any `isinstance` check) still holds |
+| `AudioSource` | **ours**, a standalone base class (nothing in this package inherits from `discord.py`); `is_audio_source(x)` accepts it, or any object with the same `read`/`is_opus`/`cleanup` methods |
 | `PCMAudio` | **ours**: raw PCM from a file object |
 | `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`) |
 | `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
@@ -147,10 +147,13 @@ Opus packets through when the input has them.
 | `ClientException`, `ConnectionClosed`, `DiscordException` | re-exported from `discord.errors` |
 | `OpusNotLoaded` | re-exported from `discord.opus` |
 | `VoiceError`, `NotConnected`, `AlreadyConnected`, `HandshakeError`, `ConnectionClosedError`, `ProtocolError`, `EncryptionError`, `DaveError`, `OpusError`, `FFmpegError` | native (`VoiceError` is the base) |
-| `FFmpegSourceError` | **added**, subclasses both `discord.ClientException` and the native `FFmpegError` |
+| `FFmpegSourceError` | **added**, subclasses the native `FFmpegError` |
 
-So `except discord.ClientException` catches every client-level failure, and native-only
-failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy.
+The public API still *raises* `discord.ClientException` where discord.py does (`play`,
+`stop`, `move_to`, `send_audio_packet`) and `discord.ConnectionClosed` when the voice websocket
+closes, so user code written against discord.py keeps working. What it does not do is
+*subclass* them: `except discord.ClientException` catches what the API raises, and everything
+else is reachable through the native `VoiceError` hierarchy.
 
 ## Intentional differences
 
@@ -167,7 +170,7 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
    subprocess to hand the rest to. `force_cli`, `pipe`, `stderr` and `executable` go with them.
 4. **Network URLs are not supported.** The native reader takes a path or a file object; fetch
    the URL with your own HTTP client first.
-5. **Reconnect event ordering.** The inherited `_inner_connect` reaches
+5. **Reconnect event ordering.** `_inner_connect` reaches
    `got_both_voice_updates` after a `4015` resume only if the server update arrives before the
    state update, because `voice_state_update` does not transition away from `connected`. This
    is discord.py's own behaviour; the test gateway dispatches in that order.
@@ -175,6 +178,10 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
    silently registering a callback that would never fire.
 7. **`state.socket` is `discord.utils.MISSING`.** Rust owns the UDP socket; use
    `state.native` (or `state.native.send_packet/...`) instead.
+8. **Nothing inherits from `discord.py` except `VoiceClient`.** `VoiceConnectionState`,
+   `DiscordVoiceWebSocket` and the audio sources are this package's own classes, so an
+   `isinstance` check against discord.py's equivalents is `False` (the *behaviour* is the same,
+   and the enums keep discord.py's names and values).
 
 ## Additions
 
@@ -188,6 +195,8 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
   implemented by seeking the demuxer and rebuilding the decoder.
 * `FFmpegOpusAudio.probe_codec(source)` and the native `_native.scale_pcm` behind
   `PCMVolumeTransformer`.
+* `is_audio_source(candidate)` — whether an object can be played (our sources, or anything with
+  the same three methods).
 * `DISCORD_EXT_VOICE_MAX_DAVE_VERSION=0` disables the DAVE advertisement in IDENTIFY (a
   diagnostic switch for calls that refuse to come up; end-to-end encryption is then off).
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

@@ -12,13 +12,13 @@ voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished',
 ```
 
 `dev.VoiceClient` implements `discord.VoiceProtocol` — discord.py's documented extension point
-for alternative voice backends — on top of the native transport. `dev.VoiceConnectionState`
-subclasses `discord.voice_state.VoiceConnectionState` (the connection flow and reconnect
-policy), `dev.DiscordVoiceWebSocket` subclasses `discord.gateway.DiscordVoiceWebSocket` (the
-opcodes and frame builders), the playback clock is discord.py's `AudioPlayer`, and the audio
-sources and volume transformer are this package's own, decoding in process with libav. What is
-*not* reused is discord.py's own `VoiceClient`, which is built on PyNaCl, the Python `davey`
-bindings and an `ffmpeg` subprocess.
+for alternative voice backends — on top of the native transport, and is the only class in this
+package that inherits from `discord.py`. Everything below it is this package's own:
+`dev.VoiceConnectionState` (the connection flow and reconnect policy),
+`dev.DiscordVoiceWebSocket` (the opcode surface the player talks to) and the audio sources
+(decoding in process with libav). From `discord.py` we *use* the host framework rather than
+inherit it: the client and its gateway, the `AudioPlayer` playback clock, and the exception
+classes the public API raises.
 
 Everything that must be native is native — and that is the whole voice protocol:
 
@@ -34,10 +34,10 @@ Everything that must be native is native — and that is the whole voice protoco
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
-| Connection flow state machine, reconnect policy | `discord.voice_state.VoiceConnectionState` |
+| Connection flow, reconnect policy | This package: `discord_ext_voice.voice_state` |
 | Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `ac-ffmpeg` / `libopus` |
 | Playback clock (the player thread) | `discord.player.AudioPlayer` |
-| Gateway opcodes and outgoing frame builders | `discord.gateway.DiscordVoiceWebSocket` |
+| Voice gateway opcodes and frame surface | This package: `discord_ext_voice.gateway` (Discord's opcode values) |
 | `ffmpeg` subprocess | **not used** — no binary, no pipe, no process to reap |
 
 ## Why
@@ -55,9 +55,10 @@ Everything that must be native is native — and that is the whole voice protoco
   compete with Python work — the Python player thread just hands Rust 20ms of PCM.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
   commit/welcome processing, epoch transitions and the passthrough windows.
-* **A thin Python layer.** About 1000 lines of Python (well over half of it docstrings and
-  type hints) instead of the ~2400 it takes to re-implement discord.py's player, state machine
-  and gateway handling.
+* **A thin Python layer.** About 1100 lines of Python (well over half of it docstrings and type
+  hints). The connection flow and the websocket surface are ours; the player thread and the
+  `VoiceProtocol` plumbing stay discord.py's, because they are the parts a `discord.py` bot
+  already drives.
 
 ## Requirements
 
@@ -162,9 +163,10 @@ dev.FFmpegOpusAudio('voice.ogg')               # Opus packets passed through unt
 dev.PCMVolumeTransformer(dev.FFmpegPCMAudio('song.mp3'), 0.5)
 ```
 
-`dev.AudioSource` is this package's own base class. It subclasses `discord.player.AudioSource`,
-so a source is still accepted by anything that checks for discord.py's contract, and any
-`discord.AudioSource` can be handed to `play()`. discord.py's FFmpeg-CLI arguments —
+`dev.AudioSource` is this package's own base class, and nothing here inherits from discord.py: a
+source only has to provide `read`/`is_opus`/`cleanup`, which is also what makes a user's own
+`discord.AudioSource` (or duck-typed equivalent) playable — `dev.is_audio_source(x)` answers that
+question. discord.py's FFmpeg-CLI arguments —
 `before_options`, `options`, `executable`, `pipe`, `stderr`, `force_cli` — do not exist here and
 raise `TypeError` naming the argument.
 
@@ -199,8 +201,8 @@ voice.native.mode                    # negotiated RTP encryption mode
 ```
 python/discord_ext_voice/        # thin discord.py extension
 ├── voice_client.py              # VoiceClient: create_connection_state, play, send_audio_packet
-├── voice_state.py               # VoiceConnectionState: the native integration points
-├── gateway.py                   # DiscordVoiceWebSocket: native socket, inherited opcodes
+├── voice_state.py               # VoiceConnectionState: connect/reconnect flow (ours)
+├── gateway.py                   # DiscordVoiceWebSocket: opcodes + speak/close on the native socket
 ├── sources.py                   # our AudioSource / PCMAudio / FFmpeg*Audio / volume
 ├── opus.py                      # native Encoder/Decoder + discord.opus constants
 └── errors.py                    # native errors + discord.py's, and FFmpegSourceError
@@ -260,7 +262,8 @@ The Python suite includes:
 * DAVE tests asserting a real MLS key package (opcode 26) is produced and that transitions are
   acknowledged;
 * end-to-end `VoiceClient` tests covering playback, pause/resume, `after` callbacks,
-  `disconnect`, resume-after-4015 and `discord.py` subclass checks.
+  `disconnect`, resume-after-4015 and the `discord.py` layering checks (only `VoiceClient`
+  inherits from it).
 
 ## Limitations
 

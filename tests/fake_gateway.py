@@ -274,15 +274,17 @@ class FakeVoiceGateway:
                         }
                     )
                 elif op == 3:  # HEARTBEAT
-                    # Discord's voice heartbeat payload is a plain integer nonce which the
-                    # server echoes back; accept the legacy `{t, seq_ack}` shape too.
-                    if isinstance(data, int):
+                    # Since voice gateway v8 heartbeats are `{t, seq_ack}` and the ACK mirrors
+                    # `t`; the pre-v8 shape (`d` is the nonce itself) is still accepted here so
+                    # that path stays testable too.
+                    # https://docs.discord.com/developers/topics/voice-connections#heartbeating
+                    if isinstance(data, dict):
+                        nonce = data.get('t', data.get('nonce', 0))
+                    elif isinstance(data, int):
                         nonce = data
-                    elif isinstance(data, dict):
-                        nonce = data.get('nonce', data.get('t', 0))
                     else:
                         nonce = 0
-                    await self._send({'op': 6, 'd': nonce})
+                    await self._send({'op': 6, 'd': {'t': nonce}})
                 elif op == 7:  # RESUME
                     await self._send({'op': 9, 'd': None})
                     await self._send(

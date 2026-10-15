@@ -32,6 +32,9 @@ GUILD_ID = 111
 USER_ID = 222
 CHANNEL_ID = 333
 
+#: The close Discord sends when the session in an IDENTIFY/RESUME is not the live one.
+SESSION_INVALID = (4006, 'Session is no longer valid.')
+
 
 async def open_connection(gateway: 'FakeVoiceGateway', *, resume: bool = False):
     """Create a native ``VoiceConnection``, feed it the gateway credentials and handshake.
@@ -64,16 +67,17 @@ class FakeVoiceGateway:
         dave_protocol_version: int = 0,
         heartbeat_interval_ms: float = 400.0,
         address: str = '127.0.0.1',
-        close_on_identify: Optional[tuple[int, str]] = None,
+        reject_identifies: int = 0,
     ) -> None:
         self.modes = list(modes or ('aead_xchacha20_poly1305_rtpsize', 'xsalsa20_poly1305'))
         self.secret_key = list(secret_key if secret_key is not None else make_secret_key())
         self.dave_protocol_version = dave_protocol_version
         self.heartbeat_interval_ms = heartbeat_interval_ms
         self.address = address
-        #: Close the socket with this `(code, reason)` instead of answering IDENTIFY, which is
-        #: how Discord rejects a stale session (4006 "Session is no longer valid").
-        self.close_on_identify = close_on_identify
+        #: Close this many IDENTIFYs with :data:`SESSION_INVALID`, the way Discord rejects a
+        #: session it no longer holds. Later IDENTIFYs are answered normally, which is what a
+        #: reconnecting client (a fresh `VOICE_STATE_UPDATE` -> a new session id) relies on.
+        self.reject_identifies = reject_identifies
 
         self.received_json: list[dict[str, Any]] = []
         self.received_binary: list[bytes] = []
@@ -243,9 +247,9 @@ class FakeVoiceGateway:
                 data = frame.get('d') or {}
 
                 if op == 0:  # IDENTIFY
-                    if self.close_on_identify is not None:
-                        code, reason = self.close_on_identify
-                        await connection.close(code, reason)
+                    if self.reject_identifies > 0:
+                        self.reject_identifies -= 1
+                        await connection.close(*SESSION_INVALID)
                         return
                     await self._send(
                         {

@@ -484,19 +484,18 @@ fn identify_payload(hub: &Arc<Hub>) -> Value {
     if value.get("d").is_none() {
         value = serde_json::json!({ "op": 0, "d": {} });
     }
-    log_outgoing("IDENTIFY", &value);
     value
 }
 
-/// Log an outgoing handshake frame with the token redacted.
-fn log_outgoing(kind: &str, value: &Value) {
+/// Log an outgoing frame to the `discord_ext_voice` logger, with the token redacted.
+fn log_outgoing(value: &Value) {
     let mut redacted = value.clone();
     if let Some(data) = redacted.get_mut("d") {
         if data.get("token").is_some() {
             data["token"] = Value::from("<redacted>");
         }
     }
-    log_debug!("sending voice {kind}: {redacted}");
+    log_debug!("sending voice frame: {redacted}");
 }
 
 fn resume_payload(hub: &Arc<Hub>) -> Result<Value, TransportError> {
@@ -513,7 +512,6 @@ fn resume_payload(hub: &Arc<Hub>) -> Result<Value, TransportError> {
     if let Some(data) = value.get_mut("d") {
         data["seq_ack"] = Value::from(state.seq_ack);
     }
-    log_outgoing("RESUME", &value);
     Ok(value)
 }
 
@@ -525,14 +523,24 @@ async fn writer_loop<S>(
 {
     while let Some(command) = rx.recv().await {
         let result = match command {
-            WsCommand::Json(value) => match serde_json::to_string(&value) {
-                Ok(text) => sink.send(Message::Text(text.into())).await,
-                Err(err) => {
-                    log_warning!("unable to serialize an outgoing voice frame: {err}");
-                    continue;
+            WsCommand::Json(value) => {
+                log_outgoing(&value);
+                match serde_json::to_string(&value) {
+                    Ok(text) => sink.send(Message::Text(text.into())).await,
+                    Err(err) => {
+                        log_warning!("unable to serialize an outgoing voice frame: {err}");
+                        continue;
+                    }
                 }
-            },
-            WsCommand::Binary(bytes) => sink.send(Message::Binary(bytes.into())).await,
+            }
+            WsCommand::Binary(bytes) => {
+                log_debug!(
+                    "sending voice binary frame: {} bytes, opcode {}",
+                    bytes.len(),
+                    bytes.first().copied().unwrap_or_default()
+                );
+                sink.send(Message::Binary(bytes.into())).await
+            }
             WsCommand::Close(code, reason) => {
                 let frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
                     code: code.unwrap_or(1000).into(),
@@ -604,7 +612,10 @@ async fn reader_loop<S>(
                             match handle_text(&hub, &tx, text.as_str()).await {
                                 Ok(Heartbeat::Start(period)) => {
                                     heartbeat_period = Some(period);
-                                    next_heartbeat = Some(tokio::time::Instant::now());
+                                    // `discord.py`'s keep-alive waits one interval before the
+                                    // first beat; beating immediately after HELLO, before the
+                                    // session exists, is not what a v8 client does.
+                                    next_heartbeat = Some(tokio::time::Instant::now() + period);
                                 }
                                 Ok(Heartbeat::Keep) => {}
                                 Err(err) => {
@@ -643,12 +654,21 @@ async fn reader_loop<S>(
 }
 
 fn send_heartbeat(hub: &Arc<Hub>, tx: &mpsc::UnboundedSender<WsCommand>) {
-    let nonce: u64 = rand::random();
-    {
+    // Voice gateway v8 heartbeats are `{"op": 3, "d": {"t": <ms>, "seq_ack": <seq>}}`: the
+    // timestamp is mirrored back in the ACK, and `seq_ack` is the sequence number of the last
+    // numbered frame we saw, which is what lets the gateway replay missed frames on resume.
+    // The pre-v8 shape (`"d": <nonce>`) is not accepted by a v8 session, and `voice-model`
+    // only models the pre-v8 one, so this payload is built by hand.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let seq_ack = {
         let mut state = hub.state.lock();
         state
             .pending_heartbeats
-            .insert(nonce, std::time::Instant::now());
+            .insert(now, std::time::Instant::now());
         if state.pending_heartbeats.len() > 32 {
             // Keep the map bounded if Discord stops acknowledging.
             let oldest = state
@@ -660,11 +680,11 @@ fn send_heartbeat(hub: &Arc<Hub>, tx: &mpsc::UnboundedSender<WsCommand>) {
                 state.pending_heartbeats.remove(&oldest);
             }
         }
-    }
-    let event = vm::Event::Heartbeat(vp::Heartbeat { nonce });
-    if let Ok(value) = serde_json::to_value(&event) {
-        let _ = tx.send(WsCommand::Json(value));
-    }
+        state.seq_ack
+    };
+
+    let value = serde_json::json!({ "op": 3, "d": { "t": now, "seq_ack": seq_ack } });
+    let _ = tx.send(WsCommand::Json(value));
 }
 
 /// Normalise a voice gateway JSON frame down to its `op` and `d` members.
@@ -687,10 +707,20 @@ fn normalize_frame(text: &str) -> Result<(Option<i64>, String), TransportError> 
         _ => None,
     });
 
-    let filtered: serde_json::Map<String, Value> = raw
+    let mut filtered: serde_json::Map<String, Value> = raw
         .into_iter()
         .filter(|(key, _)| key == "op" || key == "d")
         .collect();
+
+    // A v8 heartbeat ACK mirrors the heartbeat's `t` inside `d`; `voice-model`'s
+    // `HeartbeatAck` is transparent over a bare nonce, so unwrap it here.
+    if filtered.get("op").and_then(Value::as_u64) == Some(6) {
+        if let Some(Value::Object(data)) = filtered.get("d") {
+            if let Some(t) = data.get("t") {
+                filtered.insert("d".to_owned(), t.clone());
+            }
+        }
+    }
 
     let text = serde_json::to_string(&filtered).map_err(|err| {
         TransportError::Protocol(format!("unable to re-encode a voice frame: {err}"))

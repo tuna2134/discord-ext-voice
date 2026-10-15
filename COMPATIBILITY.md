@@ -164,6 +164,7 @@ failures (protocol/DAVE/crypto) are catchable through the `VoiceError` hierarchy
 * `voice.native` / `state.native` — the `_native.VoiceConnection`: `is_connected()`, `phase`,
   `latency`, `average_latency`, `seq_ack`, `ssrc`, `ip`/`port`/`voice_port`, `mode`,
   `secret_key`, `dave_protocol_version`, `can_encrypt`, `has_dave_session`,
-  `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `wait_closed`, ...
+  `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `close_reason`,
+  `wait_closed`, ...
 * `FFmpegPCMAudio(..., force_cli=True)` and `FFmpegOpusAudio.probe_codec(source)`.
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

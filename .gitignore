@@ -62,6 +62,11 @@ coverage.xml
 # Sphinx documentation
 docs/_build/
 
+# The reference `discord.py` checkout used while developing this package: a separate clone of
+# upstream, excluded from the sdist as well (see pyproject.toml). Without this rule `git add -A`
+# records it as a submodule-like gitlink that a fresh clone cannot resolve.
+/discord.py/
+
 # Local build caches used by the sandboxed/offline build setup
 /.cargo-home/
 /.uv-cache/

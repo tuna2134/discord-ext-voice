@@ -172,7 +172,7 @@ async def test_handshake_close_is_translated_to_discord_connection_closed(gatewa
     ``discord.py`` retries a connect only for :class:`discord.ConnectionClosed`, so the code
     and the reason have to survive the trip through the native connection.
     """
-    gateway = await gateway_factory(close_on_identify=(4006, 'Session is no longer valid.'))
+    gateway = await gateway_factory(reject_identifies=1)
     client, channel = await make_client(gateway)
 
     voice = dev.VoiceClient(client, channel)
@@ -185,6 +185,22 @@ async def test_handshake_close_is_translated_to_discord_connection_closed(gatewa
         assert info.value.code == 4006
         assert voice._connection.native.close_code == 4006
         assert voice.is_connected() is False
+    finally:
+        await voice.disconnect()
+
+
+async def test_connect_retries_after_a_rejected_session(gateway_factory):
+    """A 4006 is recoverable: the retry gets a fresh session id and the connection comes up."""
+    gateway = await gateway_factory(reject_identifies=1)
+    client, channel = await make_client(gateway)
+
+    voice = await join(client, channel)
+    try:
+        assert voice.is_connected() is True
+        # Two IDENTIFYs: the rejected one and the one that completed the handshake.
+        identifies = [frame for frame in gateway.received_json if frame.get('op') == 0]
+        assert len(identifies) == 2
+        assert voice.native.close_code is None
     finally:
         await voice.disconnect()
 

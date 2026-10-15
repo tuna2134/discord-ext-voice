@@ -1,0 +1,384 @@
+"""End-to-end tests of the Python ``VoiceClient`` layer against the fake gateway.
+
+A minimal stand-in for ``discord.py``'s client objects is used so the whole flow —
+``channel.connect(cls=VoiceClient)`` -> voice state dispatch -> native handshake ->
+``play()`` -> RTP on the wire -> ``disconnect()`` — is exercised.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import types
+from typing import Any
+
+import pytest
+
+import discord_ext_voice as dev
+from fake_gateway import SSRC, FakeVoiceGateway
+
+pytestmark = pytest.mark.asyncio
+
+GUILD_ID = 111
+USER_ID = 222
+CHANNEL_ID = 333
+# discord.py keys voice clients by guild id.
+KEY = GUILD_ID
+
+
+class FakeConnectionState:
+    """Stands in for ``discord.state.ConnectionState``."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.user = types.SimpleNamespace(id=USER_ID, bot=True)
+        self.voice_clients: dict[Any, Any] = {}
+
+    def _get_voice_client(self, key: Any) -> Any:
+        return self.voice_clients.get(key)
+
+    def _add_voice_client(self, key: Any, voice: Any) -> None:
+        self.voice_clients[key] = voice
+
+    def _remove_voice_client(self, key: Any) -> None:
+        self.voice_clients.pop(key, None)
+
+
+class FakeGuild:
+    def __init__(self, client: 'FakeClient') -> None:
+        self.id = GUILD_ID
+        self._client = client
+        self.me = types.SimpleNamespace(voice=None)
+        self.channels: dict[int, 'FakeChannel'] = {}
+        self.voice_state_calls: list[Any] = []
+
+    def get_channel(self, channel_id: int) -> Any:
+        return self.channels.get(channel_id)
+
+    async def change_voice_state(self, *, channel: Any, self_deaf: bool = False, self_mute: bool = False) -> None:
+        """Pretend to be the main gateway: dispatch the updates in the background."""
+        self.voice_state_calls.append((channel, self_deaf, self_mute))
+        voice = self._client._connection._get_voice_client(KEY)
+        endpoint = self._client.endpoint
+
+        async def dispatch() -> None:
+            # A real gateway delivers these as separate events, shortly afterwards.
+            await asyncio.sleep(0)
+            if voice is None:
+                return
+            if channel is None:
+                await voice.on_voice_state_update({'channel_id': None})
+                return
+            await voice.on_voice_state_update(
+                {'channel_id': str(channel.id), 'session_id': 'session-1'}
+            )
+            await voice.on_voice_server_update(
+                {'token': 'voice-token', 'guild_id': str(GUILD_ID), 'endpoint': endpoint}
+            )
+
+        self._dispatch = asyncio.get_running_loop().create_task(dispatch())
+
+
+class FakeChannel:
+    def __init__(self, guild: FakeGuild, channel_id: int = CHANNEL_ID) -> None:
+        self.guild = guild
+        self.id = channel_id
+
+    def _get_voice_client_key(self) -> tuple[int, str]:
+        # Same contract as `discord.abc.Connectable._get_voice_client_key`.
+        return GUILD_ID, 'guild_id'
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self._connection = FakeConnectionState()
+        self.endpoint: str | None = None
+
+
+async def make_client(gateway: FakeVoiceGateway) -> tuple[FakeClient, FakeChannel]:
+    client = FakeClient()
+    client.endpoint = gateway.endpoint
+    guild = FakeGuild(client)
+    channel = FakeChannel(guild)
+    guild.channels[channel.id] = channel
+    return client, channel
+
+
+async def join(client: FakeClient, channel: FakeChannel, **kwargs: Any) -> Any:
+    """`channel.connect(cls=dev.VoiceClient)` without needing real discord.py channel plumbing."""
+    voice = dev.VoiceClient(client, channel)
+    client._connection._add_voice_client(KEY, voice)
+    await voice.connect(timeout=10.0, reconnect=True, **kwargs)
+    return voice
+
+
+# ---------------------------------------------------------------------------- connecting
+
+
+async def test_connect_establishes_the_native_session(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+
+    voice = await join(client, channel)
+    try:
+        assert voice.is_connected() is True
+        assert voice.session_id == 'session-1'
+        assert voice.token == 'voice-token'
+        assert voice.endpoint == gateway.endpoint.replace('ws://', '', 1)
+        assert voice.ssrc == SSRC
+        assert voice.mode == 'aead_xchacha20_poly1305_rtpsize'
+        assert len(voice.secret_key) == 32
+        assert voice.guild.id == GUILD_ID
+        assert voice.user.id == USER_ID
+        assert voice.timeout == 10.0
+    finally:
+        await voice.disconnect()
+
+
+async def test_connect_asks_the_guild_to_change_voice_state(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+
+    voice = await join(client, channel, self_deaf=True, self_mute=True)
+    try:
+        assert channel.guild.voice_state_calls[0] == (channel, True, True)
+    finally:
+        await voice.disconnect()
+
+
+async def test_internal_socket_is_not_required_to_connect(gateway_factory):
+    """`dialect` compatibility: `socket` exists even though it is native."""
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        assert voice._connection.socket is not None
+        assert voice._connection.supported_modes == dev.VoiceClient.supported_modes
+        assert voice._connection.max_dave_protocol_version == dev.DAVE_PROTOCOL_VERSION
+    finally:
+        await voice.disconnect()
+
+
+# ---------------------------------------------------------------------------- playback
+
+
+async def test_play_streams_pcm_over_rtp(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    finished = asyncio.Event()
+    errors: list[Any] = []
+
+    def after(error: Any) -> None:
+        errors.append(error)
+        loop.call_soon_threadsafe(finished.set)
+
+    loop = asyncio.get_running_loop()
+    # 0.2s of stereo 48kHz silence.
+    pcm = b'\x00' * (dev.FRAME_SIZE * 10)
+    voice.play(dev.PCMAudio(io.BytesIO(pcm)), after=after)
+
+    try:
+        assert voice.is_playing() is True
+        assert voice.is_paused() is False
+        assert voice.source is not None
+
+        packets = await gateway.wait_for_rtp(count=3, timeout=10.0)
+        assert len(packets) >= 3
+        assert packets[0][0] == 0x80  # RTP version 2
+
+        await asyncio.wait_for(finished.wait(), timeout=10.0)
+        assert errors == [None]
+        assert voice.is_playing() is False
+    finally:
+        await voice.disconnect()
+
+
+async def test_pause_and_resume(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    try:
+        pcm = b'\x00' * (dev.FRAME_SIZE * 100)
+        voice.play(dev.PCMAudio(io.BytesIO(pcm)))
+        await gateway.wait_for_rtp(count=1, timeout=10.0)
+
+        voice.pause()
+        assert voice.is_paused() is True
+        assert voice.is_playing() is False
+
+        voice.resume()
+        assert voice.is_playing() is True
+
+        voice.stop()
+        assert voice.is_playing() is False
+        assert voice.source is None
+    finally:
+        await voice.disconnect()
+
+
+async def test_send_audio_packet_uses_the_voice_client_encoder(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    try:
+        # `play` normally creates the encoder; make sure an explicit one is honoured.
+        voice.encoder = dev.opus.Encoder(application='voip', bitrate=64)
+        voice.send_audio_packet(b'\x00' * dev.FRAME_SIZE, encode=True)
+        packets = await gateway.wait_for_rtp(count=1, timeout=10.0)
+        assert len(packets[0]) > 12
+    finally:
+        await voice.disconnect()
+
+
+async def test_send_audio_packet_passthrough(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    try:
+        voice.send_audio_packet(dev.OPUS_SILENCE, encode=False)
+        packets = await gateway.wait_for_rtp(count=1, timeout=10.0)
+        assert len(packets[0]) == 12 + len(dev.OPUS_SILENCE) + 16 + 4
+    finally:
+        await voice.disconnect()
+
+
+# ---------------------------------------------------------------------------- errors
+
+
+async def test_play_requires_a_connection():
+    client = FakeClient()
+    guild = FakeGuild(client)
+    channel = FakeChannel(guild)
+    voice = dev.VoiceClient(client, channel)
+
+    with pytest.raises(dev.ClientException):
+        voice.play(dev.PCMAudio(io.BytesIO(b'')))
+
+
+async def test_play_rejects_a_non_source(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        with pytest.raises(TypeError):
+            voice.play('not an audio source')  # type: ignore[arg-type]
+    finally:
+        await voice.disconnect()
+
+
+async def test_play_rejects_a_second_source(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        voice.play(dev.PCMAudio(io.BytesIO(b'\x00' * (dev.FRAME_SIZE * 200))))
+        with pytest.raises(dev.ClientException):
+            voice.play(dev.PCMAudio(io.BytesIO(b'')))
+    finally:
+        await voice.disconnect()
+
+
+async def test_source_setter_swaps_the_stream(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        first = dev.PCMAudio(io.BytesIO(b'\x00' * (dev.FRAME_SIZE * 200)))
+        voice.play(first)
+        second = dev.PCMAudio(io.BytesIO(b'\x00' * (dev.FRAME_SIZE * 200)))
+        voice.source = second
+        assert voice.source is second
+
+        with pytest.raises(TypeError):
+            voice.source = 'nope'  # type: ignore[assignment]
+    finally:
+        await voice.disconnect()
+
+
+# ---------------------------------------------------------------------------- disconnect
+
+
+async def test_disconnect_cleans_up(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    await voice.disconnect()
+    assert voice.is_connected() is False
+    assert client._connection._get_voice_client(KEY) is None
+    assert channel.guild.voice_state_calls[-1][0] is None
+
+
+async def test_move_to_none_disconnects(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    await voice.move_to(None)
+    assert voice.is_connected() is False
+
+
+async def test_move_to_the_same_channel_is_a_noop(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        calls = len(channel.guild.voice_state_calls)
+        await voice.move_to(channel, timeout=1.0)
+        assert len(channel.guild.voice_state_calls) == calls
+    finally:
+        await voice.disconnect()
+
+
+# ---------------------------------------------------------------------------- reconnect
+
+
+async def test_resume_after_voice_server_crash(gateway_factory):
+    """Close code 4015 must trigger a resume, like discord.py."""
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    try:
+        await gateway.close(4015, 'voice server crashed')
+
+        for _ in range(200):
+            if voice.is_connected():
+                break
+            await asyncio.sleep(0.05)
+        assert voice.is_connected() is True
+
+        # The client must have sent RESUME on the new websocket connection.
+        await gateway.wait_for_op(7, timeout=10.0)
+    finally:
+        await voice.disconnect()
+
+
+async def test_voice_privacy_code_is_none_without_dave(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        assert voice.voice_privacy_code is None
+        assert voice.dave_protocol_version == 0
+    finally:
+        await voice.disconnect()
+
+
+async def test_dave_is_negotiated_when_the_server_offers_it(gateway_factory):
+    gateway = await gateway_factory(dave_protocol_version=1)
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        assert voice.dave_protocol_version == 1
+        assert voice._connection.dave_session is not None
+        # The MLS group is not ready yet, so payloads stay in plaintext until it is.
+        assert voice._connection.can_encrypt is False
+        await gateway.wait_for_binary_op(26, timeout=10.0)
+    finally:
+        await voice.disconnect()

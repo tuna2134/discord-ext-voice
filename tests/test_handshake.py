@@ -1,0 +1,321 @@
+"""End-to-end voice handshake tests against a fake Discord voice gateway.
+
+These exercise the real native path: TCP -> websocket upgrade -> IDENTIFY -> READY ->
+UDP IP discovery -> SELECT_PROTOCOL -> SESSION_DESCRIPTION -> heartbeat -> RTP encryption.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import struct
+
+import nacl.secret
+import nacl.utils
+import pytest
+
+import discord_ext_voice as dev
+from discord_ext_voice import _native
+
+from fake_gateway import SSRC, FakeVoiceGateway
+
+pytestmark = pytest.mark.asyncio
+
+GUILD_ID = 111
+USER_ID = 222
+CHANNEL_ID = 333
+
+
+async def connect(gateway: FakeVoiceGateway, *, resume: bool = False, dave_version: int = 0):
+    conn = _native.VoiceConnection(GUILD_ID, USER_ID, CHANNEL_ID)
+    conn.set_session_id('session-abc')
+    conn.set_server_info(GUILD_ID, 'voice-token', gateway.endpoint)
+    conn.set_phase(4)  # ConnectionFlowState.got_both_voice_updates
+    await conn.handshake(resume=resume, timeout=10.0)
+    return conn
+
+
+# ---------------------------------------------------------------------------- handshake
+
+
+async def test_handshake_completes(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+
+    try:
+        assert conn.is_connected() is True
+        assert conn.ssrc == SSRC
+        assert conn.mode == 'aead_xchacha20_poly1305_rtpsize'
+        assert conn.ip == '127.0.0.1'
+        assert conn.port > 0
+        assert conn.voice_port == gateway._udp_port
+        assert len(conn.secret_key) == 32
+        assert conn.phase == 8
+    finally:
+        await conn.close()
+
+
+async def test_identify_payload_matches_discord_protocol(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+
+    try:
+        identify = await gateway.wait_for_op(0)
+        assert identify['d'] == {
+            'server_id': str(GUILD_ID),
+            'user_id': str(USER_ID),
+            'session_id': 'session-abc',
+            'token': 'voice-token',
+            'max_dave_protocol_version': dev.DAVE_PROTOCOL_VERSION,
+        }
+    finally:
+        await conn.close()
+
+
+async def test_select_protocol_and_ip_discovery(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+
+    try:
+        select = await gateway.wait_for_op(1)
+        assert select['d']['protocol'] == 'udp'
+        assert select['d']['data']['address'] == '127.0.0.1'
+        assert select['d']['data']['mode'] == 'aead_xchacha20_poly1305_rtpsize'
+        assert select['d']['data']['port'] > 0
+        assert gateway.ip_discovery_requests >= 1
+    finally:
+        await conn.close()
+
+
+async def test_speaking_none_is_sent_after_the_session_description(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+
+    try:
+        speaking = await gateway.wait_for_op(5)
+        assert speaking['d']['speaking'] == 0
+        assert speaking['d']['ssrc'] == SSRC
+    finally:
+        await conn.close()
+
+
+async def test_heartbeat_is_acknowledged_and_latency_is_measured(gateway_factory):
+    gateway = await gateway_factory(heartbeat_interval_ms=200.0)
+    conn = await connect(gateway)
+
+    try:
+        await gateway.wait_for_op(3, timeout=10.0)
+        for _ in range(50):
+            if conn.latency != float('inf'):
+                break
+            await asyncio.sleep(0.05)
+        assert conn.latency != float('inf')
+        assert 0.0 <= conn.latency < 5.0
+        assert conn.average_latency != float('inf')
+        assert conn.seq_ack >= 0
+    finally:
+        await conn.close()
+
+
+async def test_resume_handshake(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+    try:
+        await conn.close()
+    finally:
+        pass
+
+    gateway2 = await gateway_factory()
+    conn2 = _native.VoiceConnection(GUILD_ID, USER_ID, CHANNEL_ID)
+    conn2.set_session_id('session-abc')
+    conn2.set_server_info(GUILD_ID, 'voice-token', gateway2.endpoint)
+    conn2.set_phase(3)  # got_voice_server_update: resume skips the UDP negotiation
+    await conn2.handshake(resume=True, timeout=10.0)
+    try:
+        assert conn2.is_connected()
+        resume = await gateway2.wait_for_op(7)
+        assert resume['d']['token'] == 'voice-token'
+        assert 'seq_ack' in resume['d']
+    finally:
+        await conn2.close()
+
+
+async def test_close_code_is_reported(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+    try:
+        await gateway.close(4015, 'voice server crashed')
+        code, reason = await asyncio.wait_for(conn.wait_closed(), timeout=10.0)
+        assert code == 4015
+        assert 'crashed' in reason
+        assert conn.is_connected() is False
+    finally:
+        await conn.close()
+
+
+async def test_send_audio_packet_before_connect_raises():
+    conn = _native.VoiceConnection(GUILD_ID, USER_ID, CHANNEL_ID)
+    with pytest.raises(dev.NotConnected):
+        conn.send_audio_packet(b'\x00' * 3840, encode=True)
+
+
+async def test_second_handshake_while_connected_is_rejected(gateway_factory):
+    gateway = await gateway_factory()
+    conn = await connect(gateway)
+    try:
+        with pytest.raises(dev.AlreadyConnected):
+            await conn.handshake(resume=False, timeout=5.0)
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------- DAVE
+
+
+async def test_dave_session_is_created_and_key_package_sent(gateway_factory):
+    gateway = await gateway_factory(dave_protocol_version=1)
+    conn = await connect(gateway)
+
+    try:
+        assert conn.dave_protocol_version == 1
+        assert conn.has_dave_session() is True
+
+        # The MLS key package is opcode 26 on a binary frame.
+        frame = await gateway.wait_for_binary_op(26, timeout=10.0)
+        assert frame[0] == 26
+        assert len(frame) > 32, 'the serialized MLS KeyPackage looks too small'
+    finally:
+        await conn.close()
+
+
+async def test_dave_transition_ready_is_sent(gateway_factory):
+    gateway = await gateway_factory(dave_protocol_version=1)
+    conn = await connect(gateway)
+
+    try:
+        await gateway.wait_for_binary_op(26, timeout=10.0)
+        await gateway.send_json({'op': 21, 'd': {'transition_id': 7, 'protocol_version': 1}})
+        ready = await gateway.wait_for_op(23, timeout=10.0)
+        assert ready['d']['transition_id'] == 7
+
+        await gateway.send_json({'op': 22, 'd': {'transition_id': 7}})
+        await asyncio.sleep(0.1)
+        assert conn.dave_protocol_version == 1
+    finally:
+        await conn.close()
+
+
+async def test_dave_epoch_prepare_reissues_a_key_package(gateway_factory):
+    gateway = await gateway_factory(dave_protocol_version=1)
+    conn = await connect(gateway)
+
+    try:
+        await gateway.wait_for_binary_op(26, timeout=10.0)
+        before = len([frame for frame in gateway.received_binary if frame[:1] == b'\x1a'])
+
+        await gateway.send_json({'op': 24, 'd': {'epoch': 1, 'protocol_version': 1}})
+
+        for _ in range(100):
+            after = len([frame for frame in gateway.received_binary if frame[:1] == b'\x1a'])
+            if after > before:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail('no new key package was sent after dave_prepare_epoch')
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------- crypto
+
+
+def _pynacl_decrypt(mode: str, key: bytes, header: bytes, body: bytes) -> bytes:
+    if mode == 'aead_xchacha20_poly1305_rtpsize':
+        nonce = body[-4:] + b'\x00' * 20
+        return nacl.secret.Aead(key).decrypt(body[:-4], header, nonce)
+    if mode == 'xsalsa20_poly1305_lite':
+        nonce = body[-4:] + b'\x00' * 20
+        return nacl.secret.SecretBox(key).decrypt(body[:-4], nonce)
+    if mode == 'xsalsa20_poly1305_suffix':
+        return nacl.secret.SecretBox(key).decrypt(body[:-24], body[-24:])
+    if mode == 'xsalsa20_poly1305':
+        return nacl.secret.SecretBox(key).decrypt(body, header + b'\x00' * 12)
+    raise AssertionError(f'unknown mode {mode}')
+
+
+def _pynacl_encrypt(mode: str, key: bytes, header: bytes, plaintext: bytes, counter: int) -> bytes:
+    prefix = struct.pack('>I', counter)
+    if mode == 'aead_xchacha20_poly1305_rtpsize':
+        nonce = prefix + b'\x00' * 20
+        encrypted = nacl.secret.Aead(key).encrypt(plaintext, header, nonce)
+        # `Aead.encrypt` returns nonce + ciphertext + tag; Discord wants the latter only.
+        return bytes(encrypted.ciphertext) + prefix
+    if mode == 'xsalsa20_poly1305_lite':
+        nonce = prefix + b'\x00' * 20
+        return bytes(nacl.secret.SecretBox(key).encrypt(plaintext, nonce).ciphertext) + prefix
+    if mode == 'xsalsa20_poly1305_suffix':
+        nonce = nacl.utils.random(24)
+        return bytes(nacl.secret.SecretBox(key).encrypt(plaintext, nonce).ciphertext) + nonce
+    if mode == 'xsalsa20_poly1305':
+        return bytes(nacl.secret.SecretBox(key).encrypt(plaintext, header + b'\x00' * 12).ciphertext)
+    raise AssertionError(f'unknown mode {mode}')
+
+
+@pytest.mark.parametrize('mode', list(dev.SUPPORTED_MODES))
+async def test_rtp_packets_are_decryptable_by_pynacl(gateway_factory, mode):
+    gateway = await gateway_factory(modes=[mode])
+    conn = await connect(gateway)
+
+    try:
+        assert conn.mode == mode
+        conn.send_audio_packet(b'\x00' * dev.FRAME_SIZE, encode=True)
+        packets = await gateway.wait_for_rtp(count=1, timeout=10.0)
+
+        header, body = packets[0][:12], packets[0][12:]
+        assert header[0] == 0x80
+        assert header[1] == 0x78
+        assert struct.unpack('>H', header[2:4])[0] == 1  # first sequence number
+        assert struct.unpack('>I', header[4:8])[0] == 0  # first timestamp
+        assert struct.unpack('>I', header[8:12])[0] == SSRC
+
+        plaintext = _pynacl_decrypt(mode, bytes(gateway.secret_key), header, body)
+        # The payload must be a real Opus frame that decodes to one 20ms frame.
+        decoder = dev.opus.Decoder()
+        assert len(decoder.decode(plaintext)) == dev.FRAME_SIZE
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize('mode', list(dev.SUPPORTED_MODES))
+async def test_rtp_packets_encrypted_by_pynacl_are_accepted(gateway_factory, mode):
+    gateway = await gateway_factory(modes=[mode])
+    conn = await connect(gateway)
+
+    try:
+        header = bytearray(12)
+        header[0] = 0x80
+        header[1] = 0x78
+        struct.pack_into('>H', header, 2, 42)
+        struct.pack_into('>I', header, 4, 960)
+        struct.pack_into('>I', header, 8, SSRC)
+
+        plaintext = dev.opus.Encoder().encode(b'\x00' * dev.FRAME_SIZE)
+        body = _pynacl_encrypt(mode, bytes(gateway.secret_key), bytes(header), plaintext, counter=99)
+        assert bytes(conn.decrypt_rtp(bytes(header), body)) == plaintext
+    finally:
+        await conn.close()
+
+
+async def test_reference_packet_bytes_match_discord_py_layout(gateway_factory):
+    """The `rtpsize` layout is header + ciphertext + tag + 4 byte nonce."""
+    gateway = await gateway_factory(modes=['aead_xchacha20_poly1305_rtpsize'])
+    conn = await connect(gateway)
+
+    try:
+        conn.send_audio_packet(b'\x00' * dev.FRAME_SIZE, encode=True)
+        packets = await gateway.wait_for_rtp(count=1, timeout=10.0)
+        packet = packets[0]
+        # 12 byte header + opus payload + 16 byte tag + 4 byte nonce
+        assert len(packet) > 12 + 16 + 4
+        assert packet[12:-20] != b''
+    finally:
+        await conn.close()

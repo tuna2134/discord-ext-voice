@@ -186,6 +186,11 @@ class FakeVoiceGateway:
         assert self._connection is not None, 'no client is connected'
         await self._send(payload)
 
+    async def send_binary(self, opcode: int, payload: bytes = b'') -> None:
+        """Send a DAVE binary frame as ``[opcode][payload]`` (no sequence number)."""
+        assert self._connection is not None, 'no client is connected'
+        await self._connection.send(bytes([opcode]) + payload)
+
     async def _send(self, payload: dict[str, Any]) -> None:
         """Send a JSON frame with a monotonic `seq`, like the real voice gateway."""
         assert self._connection is not None

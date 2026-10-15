@@ -351,6 +351,52 @@ async def test_source_setter_swaps_the_stream(gateway_factory):
         await voice.disconnect()
 
 
+async def test_disconnect_while_playing(gateway_factory):
+    """`!leave` during playback must not wait for the source to end."""
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    # 10 seconds of audio: playback is definitely still running.
+    voice.play(dev.PCMAudio(io.BytesIO(b'\x00' * (dev.FRAME_SIZE * 500))))
+    assert voice.is_playing() is True
+
+    await asyncio.wait_for(voice.disconnect(), timeout=10.0)
+    assert voice.is_connected() is False
+    assert client._connection._get_voice_client(KEY) is None
+
+    await asyncio.sleep(0.2)  # let the player thread notice the stop
+    assert voice.is_playing() is False
+
+
+async def test_playback_survives_dave_traffic(gateway_factory):
+    """Audio and DAVE frames at the same time must not wedge the connection.
+
+    The native side buffers log records until it has released the connection lock. Emitting one
+    while the lock is held needs the GIL, which the audio thread holds while it waits for that
+    lock, so the two threads would deadlock and the whole client would stop responding.
+    """
+    gateway = await gateway_factory(dave_protocol_version=1)
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    voice.play(dev.PCMAudio(io.BytesIO(b'\x00' * (dev.FRAME_SIZE * 400))))
+    try:
+        for _ in range(50):
+            # An unparseable frame: the native reader logs and carries on, which is exactly the
+            # path that used to log with the connection lock held.
+            await gateway.send_binary(31, b'\x00\x01\x02\x03')
+            await asyncio.sleep(0.005)
+
+        assert voice.is_playing() is True
+        # The event loop has to still be responsive.
+        await asyncio.wait_for(voice.disconnect(), timeout=10.0)
+        assert voice.is_connected() is False
+    finally:
+        if voice.is_connected():
+            await voice.disconnect()
+
+
 # ---------------------------------------------------------------------------- disconnect
 
 

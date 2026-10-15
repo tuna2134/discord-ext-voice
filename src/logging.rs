@@ -1,8 +1,14 @@
 //! Bridges Rust-side diagnostics into Python's `logging` module so that a bot owner can see
 //! voice handshake progress by configuring a handler for `discord_ext_voice`.
 //!
-//! Every call acquires the GIL, so these macros are only used on connection lifecycle events
-//! and not on the per-frame audio path.
+//! Every call hands the record to Python and therefore needs the GIL — `try_attach` is not a
+//! non-blocking acquire, it only skips a shut-down interpreter.
+//!
+//! **Never log while holding a native lock.** A Python thread can hold the GIL and wait for that
+//! same lock — the audio path does exactly that (`send_audio_packet` runs with the GIL held and
+//! takes the connection lock) — so a lock-holding task that waits for the GIL deadlocks the
+//! connection. Records produced under a lock are buffered instead (`DaveState::take_logs`, and
+//! `transport::with_state` which flushes them once the guard is dropped).
 
 use std::sync::OnceLock;
 

@@ -466,43 +466,54 @@ pub fn spawn_session(
 }
 
 fn identify_payload(hub: &Arc<Hub>) -> Value {
-    let state = hub.state.lock();
-    let session_id = state.session_id.clone().unwrap_or_default();
-    let token = state.token.clone().unwrap_or_default();
+    let (value, warning) = {
+        let state = hub.state.lock();
+        let session_id = state.session_id.clone().unwrap_or_default();
+        let token = state.token.clone().unwrap_or_default();
 
-    // `server_id`, `session_id` and `token` come from two different gateway events. An
-    // IDENTIFY that is missing any of them is answered with a close (4006 "Session is no
-    // longer valid"), which reads like a protocol error but is really a missing
-    // VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE, so say that instead of letting the caller
-    // guess from the close code.
-    let missing: Vec<&str> = [
-        state.server_id.is_none().then_some("server_id"),
-        session_id.is_empty().then_some("session_id"),
-        token.is_empty().then_some("token"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if !missing.is_empty() {
-        log_warning!(
-            "voice IDENTIFY is missing {}; Discord closes such a session with 4006. Both \
-             VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE have to be handled before connecting.",
-            missing.join(", ")
-        );
+        // `server_id`, `session_id` and `token` come from two different gateway events. An
+        // IDENTIFY that is missing any of them is answered with a close (4006 "Session is no
+        // longer valid"), which reads like a protocol error but is really a missing
+        // VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE, so say that instead of letting the caller
+        // guess from the close code.
+        let missing: Vec<&str> = [
+            state.server_id.is_none().then_some("server_id"),
+            session_id.is_empty().then_some("session_id"),
+            token.is_empty().then_some("token"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let warning = (!missing.is_empty()).then(|| {
+            format!(
+                "voice IDENTIFY is missing {}; Discord closes such a session with 4006. Both \
+                 VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE have to be handled before connecting.",
+                missing.join(", ")
+            )
+        });
+
+        let event = vm::Event::Identify(vp::Identify {
+            server_id: GuildId(state.server_id.unwrap_or(0)),
+            session_id,
+            token,
+            user_id: UserId(state.user_id),
+            max_dave_protocol_version: max_dave_protocol_version(&state, dave_version_override()),
+        });
+        let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
+        // The voice gateway rejects an unknown `d` shape silently, so keep this defensive.
+        if value.get("d").is_none() {
+            value = serde_json::json!({ "op": 0, "d": {} });
+        }
+
+        (value, warning)
+    };
+
+    // Emitted after the guard is gone: logging needs the GIL, and a Python thread may be holding
+    // it while it waits for this lock.
+    if let Some(warning) = warning {
+        log_warning!("{warning}");
     }
 
-    let event = vm::Event::Identify(vp::Identify {
-        server_id: GuildId(state.server_id.unwrap_or(0)),
-        session_id,
-        token,
-        user_id: UserId(state.user_id),
-        max_dave_protocol_version: max_dave_protocol_version(&state, dave_version_override()),
-    });
-    let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
-    // The voice gateway rejects an unknown `d` shape silently, so keep this defensive.
-    if value.get("d").is_none() {
-        value = serde_json::json!({ "op": 0, "d": {} });
-    }
     value
 }
 

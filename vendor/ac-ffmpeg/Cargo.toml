@@ -1,7 +1,0 @@
-[workspace]
-members = [
-    "ac-ffmpeg",
-    "ac-ffmpeg-build",
-    "ac-ffmpeg-features",
-]
-resolver = "2"

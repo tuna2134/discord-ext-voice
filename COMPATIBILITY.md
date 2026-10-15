@@ -1,9 +1,10 @@
 # How this library relates to `discord.py`
 
-This package is not a re-implementation of `discord.py`'s voice stack — it is a **subclass
-layer** that replaces the transport, codec and encryption with Rust while inheriting everything
-else. This document lists exactly what comes from where, and the handful of intentional
-behaviour differences.
+This package is not a re-implementation of `discord.py`'s voice stack, and it is not a subclass
+of it either: the voice implementation — transport, codec, encryption, connection flow and audio
+sources — is this package's own, and only the *host framework* comes from `discord.py`. This
+document lists exactly what comes from where, and the handful of intentional behaviour
+differences.
 
 It reflects `discord.py` **2.7.1** (`discord/voice_client.py`, `discord/voice_state.py`,
 `discord/gateway.py`, `discord/player.py`, `discord/opus.py`, `discord/errors.py`).
@@ -11,20 +12,27 @@ It reflects `discord.py` **2.7.1** (`discord/voice_client.py`, `discord/voice_st
 ## Layering
 
 ```python
-class VoiceClient(discord.voice_client.VoiceProtocol): ...                   # implements the protocol
-class VoiceConnectionState(discord.voice_state.VoiceConnectionState): ...    # 12 overrides
-class DiscordVoiceWebSocket(discord.gateway.DiscordVoiceWebSocket): ...      # read side only
-class AudioSource(discord.player.AudioSource): ...                           # our own base class
-class FFmpegPCMAudio(AudioSource): ...                                       # native reader
-class FFmpegOpusAudio(AudioSource): ...                                      # native reader
-class PCMVolumeTransformer(AudioSource): ...                                 # native scaling
+class VoiceClient(discord.voice_client.VoiceProtocol): ...    # the only discord.py inheritance
+class VoiceConnectionState: ...                               # our own connection flow
+class DiscordVoiceWebSocket: ...                              # our own websocket facade
+class AudioSource: ...                                        # our own source base class
+class PCMAudio(AudioSource): ...
+class FFmpegPCMAudio(AudioSource): ...
+class FFmpegOpusAudio(AudioSource): ...
+class PCMVolumeTransformer(AudioSource): ...
 ```
 
 `discord.VoiceProtocol` is discord.py's documented extension point for third-party backends
-("such as Lavalink or a native library implementation"), which is exactly what this is.
-discord.py's own `VoiceClient` is deliberately **not** inherited: it is built on PyNaCl and the
-Python `davey` bindings, so inheriting it would mean bypassing its constructor and carrying
-code paths that can never run here.
+("such as Lavalink or a native library implementation"), which is exactly what this is — and the
+only class of ours that inherits from `discord.py`. discord.py's own `VoiceClient` is
+deliberately **not** inherited: it is built on PyNaCl and the Python `davey` bindings, so
+inheriting it would mean bypassing its constructor and carrying code paths that can never run
+here.
+
+Everything else `discord.py` still provides is *used*, not inherited: `discord.Client` (the main
+gateway that delivers `VOICE_STATE_UPDATE`/`VOICE_SERVER_UPDATE`), `discord.player.AudioPlayer`
+(the playback clock), `Guild.change_voice_state`, `discord.utils.MISSING`, the `SpeakingState`
+enum and discord.py's exception classes, which the public API raises.
 
 The Rust core is reached through a single object, `discord_ext_voice._native.VoiceConnection`,
 exposed as `voice.native` (`voice._connection.native`).
@@ -38,7 +46,7 @@ implementation, so its members are written here rather than inherited:
 | --- | --- |
 | `__init__(client, channel)`, `create_connection_state()` | build the native-backed `VoiceConnectionState` |
 | `on_voice_state_update`, `on_voice_server_update` | forwarded to the connection state |
-| `connect`, `disconnect`, `move_to`, `is_connected`, `wait_until_connected` | thin delegations to the connection state (which is discord.py's) |
+| `connect`, `disconnect`, `move_to`, `is_connected`, `wait_until_connected` | thin delegations to the connection state |
 | `guild`, `user`, `session_id`, `token`, `endpoint`, `ssrc`, `mode`, `secret_key`, `ws`, `timeout` | read from the connection state |
 | `latency`, `average_latency`, `voice_privacy_code` | read from the native transport |
 | `play`, `is_playing`, `is_paused`, `stop`, `pause`, `resume`, `source` | discord.py's semantics; `play` installs the native Opus encoder and then uses `discord.player.AudioPlayer` |
@@ -56,44 +64,51 @@ and the `_encrypt_*` helpers (the PyNaCl-based packet builder).
 
 ## `VoiceConnectionState`
 
-| Member | Source |
+The connection flow is implemented in `discord_ext_voice/voice_state.py`, following the flow
+`discord.py` encodes (op 4 over the main gateway, wait for both voice updates, handshake, then
+the close-code policy) without inheriting it. The differences from a pure port are listed below;
+everything else — the state names, the order of the transitions, the 5 connection attempts, the
+`1 + i * 2` retry spacing and the close-code handling — is the same on purpose.
+
+| Member | Behaviour |
 | --- | --- |
-| `voice_state_update`, `voice_server_update` | inherited; both sync the payload into the native core first |
-| `connect`, `_connect`, `_inner_connect`, `_wrap_connect` | inherited (5 attempts, backoff) |
-| `disconnect`, `soft_disconnect`, `move_to`, `wait`, `wait_async`, `_wait_for_state`, `is_connected` | inherited |
-| `_poll_voice_ws` (close codes 1000/4014/4015/4021/4022), `_potential_reconnect` | inherited |
-| `ConnectionFlowState` | inherited from `discord.voice_state` |
-| `timeout`, `reconnect`, `self_deaf`, `self_mute`, `token`, `session_id`, `endpoint`, `server_id` | inherited |
+| `connect`, `_connect`, `_inner_connect`, `_wrap_connect` | our flow: 5 attempts, `asyncio.wait_for(timeout)` around each |
+| `disconnect`, `soft_disconnect`, `move_to`, `wait`, `wait_async`, `_wait_for_state`, `is_connected` | ours |
+| `_poll_voice_ws` (close codes 1000/4014/4015/4021/4022), `_potential_reconnect` | ours, with a jittered exponential backoff like discord.py's poller |
+| `ConnectionFlowState` | **ours**, with discord.py's names and values (`disconnected` = 0 … `connected` = 8) |
+| `timeout`, `reconnect`, `self_deaf`, `self_mute`, `token`, `session_id`, `endpoint`, `server_id` | plain attributes, as in discord.py |
 | `ip`, `port`, `voice_port`, `endpoint_ip`, `ssrc`, `mode`, `secret_key` | populated from the native handshake |
-| `state` (getter/setter) | **overridden** → also pushes the phase into the native state machine |
-| `dave_protocol_version` | **overridden** → live value from the native session (writes ignored) |
-| `max_dave_protocol_version`, `can_encrypt`, `dave_session` | **overridden** → native session |
-| `_create_socket` | **overridden** → no-op, Rust owns the UDP socket |
-| `_connect_websocket`, `_handshake_websocket` | **overridden** → native handshake, errors translated |
-| `send_packet` | **overridden** → native UDP send |
-| `reinit_dave_session`, `_recover_from_invalid_commit`, `_execute_transition` | **overridden** → native DAVE |
-| `add_socket_listener`, `remove_socket_listener` | **overridden** → `NotImplementedError` (receive side) |
-| `socket` | stays `discord.utils.MISSING`; use `state.native` |
+| `state` (getter/setter) | also pushes the phase into the native state machine |
+| `dave_protocol_version`, `dave_session`, `can_encrypt`, `max_dave_protocol_version` | live values from the native session (writes ignored) |
+| `_connect_websocket`, `_handshake_websocket` | the native handshake, with errors translated |
+| `send_packet` | native UDP send |
+| `reinit_dave_session` | native DAVE: recreates the MLS session and sends a fresh key package |
+| `add_socket_listener`, `remove_socket_listener` | `NotImplementedError` (receive side) |
+| `socket`, `ws` | `socket` stays `discord.utils.MISSING` (Rust owns it, use `state.native`); `ws` is this package's websocket facade |
 | `native` | **added** |
+| `_create_socket`, `_execute_transition`, `_recover_from_invalid_commit`, `dave_pending_transitions`, `dave_downgraded` | **not present**: the native side owns the socket and answers the DAVE transitions itself |
 
 The error translation in `_handshake_websocket` matters: the native handshake raises
 `HandshakeError`/`ConnectionClosedError`, which are converted to `asyncio.TimeoutError` and
-`discord.ConnectionClosed` so that discord.py's inherited retry and resume logic runs
-unchanged.
+`discord.ConnectionClosed` so the flow retries and resumes exactly like discord.py's.
 
 ## `DiscordVoiceWebSocket`
 
-| Member | Source |
-| --- | --- |
-| Opcode constants (`IDENTIFY` … `MLS_INVALID_COMMIT_WELCOME`) | inherited |
-| `send_as_json`, `send_binary`, `send_heartbeat`, `speak`, `identify`, `resume`, `select_protocol`, `client_connect`, `send_transition_ready`, `close` | inherited |
-| `close_code` | **added** (used by `discord.ConnectionClosed`) |
-| `seq_ack`, `secret_key`, `latency`, `average_latency` | **overridden** → native values; writes ignored |
-| `poll_event` | **overridden** → waits for the native socket to end and raises `discord.ConnectionClosed` |
-| `received_message`, `received_binary_message`, `initial_connection`, `discover_ip`, `load_secret_key` | **not used** — the native reader handles those frames, so these inherited methods are never called |
+This is this package's own class (`discord_ext_voice/gateway.py`), named after discord.py's
+because it plays the same role. It is small on purpose: Rust owns the socket, the heartbeat and
+every incoming frame, so there is no aiohttp connection, no keep-alive thread and no frame
+reader left to wrap.
 
-Outgoing frames therefore go through discord.py's own payload builders, into a
-`_NativeSocket` shim (`send_str` / `send_bytes` / `close`) that maps onto the Rust writer.
+| Member | Behaviour |
+| --- | --- |
+| Opcode constants (`IDENTIFY` … `MLS_INVALID_COMMIT_WELCOME`) | **ours**, with Discord's values, so the numbers match `discord.gateway.DiscordVoiceWebSocket` |
+| `speak` | sends `SPEAKING` with the native SSRC; this is what `discord.py`'s player calls before it sends audio |
+| `close`, `wait_closed` | close the native socket / wait for it to end and return `(code, reason)` |
+| `poll_event` | waits for the native socket to end and raises `discord.ConnectionClosed` |
+| `send_as_json`, `send_binary`, `send_heartbeat` | raw frame writers, for anything not covered above |
+| `close_code` | the native close code, falling back to the last code we closed with |
+| `seq_ack`, `secret_key`, `latency`, `average_latency` | native values; writes ignored |
+| `identify`, `resume`, `select_protocol`, `client_connect`, `send_transition_ready` | **not present**: the native handshake and DAVE session send those frames themselves |
 
 ## Audio sources
 

@@ -56,6 +56,7 @@ from .sources import (
     FFmpegPCMAudio,
     PCMAudio,
     PCMVolumeTransformer,
+    is_audio_source,
 )
 from .voice_client import VoiceClient, VoiceProtocol, has_dave, has_nacl
 from .voice_state import ConnectionFlowState, VoiceConnectionState
@@ -83,6 +84,7 @@ __all__ = (
     'FFmpegPCMAudio',
     'FFmpegOpusAudio',
     'PCMVolumeTransformer',
+    'is_audio_source',
     'probe',
     # codec
     'opus',

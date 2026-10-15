@@ -7,7 +7,8 @@ Every source here is implemented in this package and decodes in process:
 
 The ``ffmpeg`` binary is never spawned, which is why discord.py's FFmpeg-CLI arguments
 (``executable``, ``pipe``, ``stderr``, ``before_options``, ``options``, ``force_cli``) do not
-exist here — pass the media itself, and use ``seek`` where ``-ss`` used to go.
+exist here — pass the media itself (a path, a file object or an ``http(s)`` URL, which is
+streamed with ``reqwest``), and use ``seek`` where ``-ss`` used to go.
 
 ":class:`AudioSource` is this package's own base class; nothing here inherits from discord.py.
 A source only has to provide ``read``/``is_opus``/``cleanup``, which is also the contract
@@ -82,20 +83,23 @@ def _validate_seek(seek: Optional[float]) -> None:
         raise ValueError('the seek position must be a finite, non-negative number of seconds')
 
 
-def _local_path(source: Any) -> Optional[str]:
-    """The filesystem path ``source`` names, or ``None`` for file objects."""
-    if isinstance(source, (str, os.PathLike)):
-        text = os.fspath(source)
-        if '://' not in text:
-            return text
-    return None
+def _is_url(source: Any) -> bool:
+    """Whether ``source`` is an ``http(s)`` URL, which the native reader streams itself."""
+    return isinstance(source, str) and source.startswith(('http://', 'https://'))
+
+
+def _is_path(source: Any) -> bool:
+    """Whether ``source`` names a file on disk (a URL is not one)."""
+    return isinstance(source, (str, os.PathLike)) and not _is_url(source)
 
 
 def _open_reader(source: Any, seek: Optional[float], *, opus_first: bool) -> Any:
     """Create and (optionally) seek the native reader, reporting failures as our own error."""
     reader: Any = None
     try:
-        if opus_first and _local_path(source) is not None:
+        # An Opus stream is passed through untouched; a URL is worth the extra request, because
+        # it is as likely to be an Ogg/WebM as a plain file is.
+        if opus_first and (_is_path(source) or _is_url(source)):
             try:
                 reader = _native.OpusSource(source)
             except _native.FFmpegError:
@@ -180,7 +184,9 @@ class FFmpegPCMAudio(AudioSource):
     Parameters
     ----------
     source: :class:`str` | :term:`py:file object`
-        A path to a media file, or a file-like object.
+        A path to a media file, an ``http(s)`` URL, or a file-like object. A URL is fetched with
+        ``reqwest`` and handed to libav as a stream, so playback starts before the download
+        finishes; ranged requests are used for seeking when the server supports them.
     seek: Optional[:class:`float`]
         Start this many seconds into the stream — the native form of ``-ss``. The input has to
         be seekable, otherwise creating the source raises
@@ -213,8 +219,8 @@ class FFmpegOpusAudio(AudioSource):
     Parameters
     ----------
     source: :class:`str` | :term:`py:file object`
-        A path to a media file, or a file-like object. (A file object always takes the decoding
-        path: probing it for Opus would consume it.)
+        A path to a media file, an ``http(s)`` URL, or a file-like object. (A file object always
+        takes the decoding path: probing it for Opus would consume it.)
     seek: Optional[:class:`float`]
         Start this many seconds into the stream, see :class:`FFmpegPCMAudio`.
     """

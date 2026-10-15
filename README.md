@@ -36,6 +36,7 @@ Everything that must be native is native — and that is the whole voice protoco
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
 | Connection flow, reconnect policy | This package: `discord_ext_voice.voice_state` |
 | Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `ac-ffmpeg` / `libopus` |
+| `http(s)` inputs | `reqwest` (rustls, no OpenSSL), streamed straight into libav |
 | Playback clock (the player thread) | `discord.player.AudioPlayer` |
 | Voice gateway opcodes and frame surface | This package: `discord_ext_voice.gateway` (Discord's opcode values) |
 | `ffmpeg` subprocess | **not used** — no binary, no pipe, no process to reap |
@@ -61,6 +62,10 @@ Everything that must be native is native — and that is the whole voice protoco
   already drives.
 
 ## Requirements
+
+Runtime:
+
+* Python 3.11 or newer (no `abi3`: a wheel per CPython version)
 
 Build time:
 
@@ -159,9 +164,14 @@ and decodes in process with libav — the `ffmpeg` binary is never started:
 dev.FFmpegPCMAudio('song.mp3')                 # decode in process with libav
 dev.FFmpegPCMAudio('song.mp3', seek=30.0)      # start 30s in (what `-ss 30` used to do)
 dev.FFmpegPCMAudio(open('song.mp3', 'rb'))     # a seekable file object works too
+dev.FFmpegPCMAudio('https://example.com/a.mp3')  # streamed with reqwest, no download step
 dev.FFmpegOpusAudio('voice.ogg')               # Opus packets passed through untouched
 dev.PCMVolumeTransformer(dev.FFmpegPCMAudio('song.mp3'), 0.5)
 ```
+
+An `http(s)` URL is fetched by `reqwest` (rustls, so no OpenSSL is needed) and handed to libav as
+a stream: playback starts before the download finishes, and seeking uses `Range` requests when the
+server supports them (otherwise the request is restarted and the offset skipped).
 
 `dev.AudioSource` is this package's own base class, and nothing here inherits from discord.py: a
 source only has to provide `read`/`is_opus`/`cleanup`, which is also what makes a user's own
@@ -213,7 +223,7 @@ src/                             # the core
 ├── crypto.rs                    # the four RTP encryption modes
 ├── dave.rs                      # DAVE/MLS session and transition state machine
 ├── opus.rs                      # libopus encode/decode
-└── source.rs                    # FFmpeg-backed audio sources
+└── source.rs                    # audio sources: libav decoding, files, file objects, http(s)
 ```
 
 ### Design notes
@@ -273,9 +283,10 @@ The Python suite includes:
 * **`before_options`/`options` are gone** (they raise `TypeError`): FFmpeg CLI grammar cannot
   be mapped onto the in-process decoder. `seek=` covers `-ss`, and everything else belongs in
   the media file.
-* **Network URLs are not supported.** Fetch the URL with your own HTTP client and hand the
-  response (or a temporary file) to `FFmpegPCMAudio`; decoding a URL directly would mean
-  bundling an HTTP client and pulling network I/O into the player thread.
+* **`http(s)` URLs need a server that behaves.** Seeking backwards on a server without `Range`
+  support restarts the request and skips forward, which is slower; a stalled response blocks the
+  reader thread until the connection fails (there is a 10s connect timeout, but no read timeout
+  while streaming). Redirects are followed.
 * **A missing local file fails at construction**, not on the first `read()`, so a typo is
   reported immediately.
 * **Wheels are dynamically linked** against the system FFmpeg and Opus.

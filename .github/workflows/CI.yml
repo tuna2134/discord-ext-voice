@@ -4,6 +4,10 @@
 # libavcodec, libavutil, libswresample, libopus), so every job installs the matching
 # development packages first. Wheels built here are dynamically linked on purpose: see the
 # "Requirements at runtime" section of the README.
+#
+# The extension is not `abi3`, so a wheel is built for every supported CPython version. The
+# manylinux containers ship the interpreters under /opt/python and the action puts them on PATH,
+# which is what `-i pythonX.Y` selects.
 name: CI
 
 on:
@@ -67,8 +71,13 @@ jobs:
         run: pytest -q
 
   build-wheel:
-    name: Build a manylinux wheel
+    name: Build a manylinux wheel (CPython ${{ matrix.python-version }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The whole supported range: 3.11 is the floor, so it has to keep building.
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +86,7 @@ jobs:
         with:
           target: x86_64
           manylinux: auto
-          args: --release --out dist
+          args: --release --out dist -i python${{ matrix.python-version }}
           # The build container does not ship FFmpeg, so install it before compiling.
           before-script-linux: |
             if command -v dnf > /dev/null; then
@@ -96,7 +105,7 @@ jobs:
       - name: Upload the wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-x86_64
+          name: wheels-linux-x86_64-cp${{ matrix.python-version }}
           path: dist
 
   sdist:

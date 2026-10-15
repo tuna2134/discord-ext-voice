@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ac_ffmpeg::codec::Decoder;
 use ac_ffmpeg::codec::audio::AudioDecoder;
@@ -39,14 +40,22 @@ pub const FRAME_CHANNELS: usize = 2;
 pub const FRAME_BYTES: usize = FRAME_SAMPLES * FRAME_CHANNELS * 2;
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 
+/// Build the Python exception for an internal error message.
+///
+/// The decoding entry points run with the GIL released, so everything below them reports
+/// failures as strings and only the Python-facing boundary turns them into an exception.
 fn ffmpeg_err(message: impl Into<String>) -> PyErr {
     FFmpegError::new_err(message.into())
 }
 
-/// A byte source for libav: either a real file or a Python file-like object.
+/// How much of a forward seek to do by reading instead of asking the server again.
+const SEEK_SKIP_LIMIT: u64 = 1 << 20;
+
+/// A byte source for libav: a real file, a Python file-like object, or an HTTP(S) URL.
 pub enum Input {
     File(File),
     PyFile(PyFile),
+    Http(Box<HttpStream>),
 }
 
 impl Input {
@@ -54,6 +63,9 @@ impl Input {
         match self {
             Input::File(file) => file.metadata().map(|meta| meta.is_file()).unwrap_or(false),
             Input::PyFile(file) => file.seekable,
+            // Ranges are used when the server supports them, and a restart-and-skip when it does
+            // not, so an HTTP input can always answer a seek.
+            Input::Http(_) => true,
         }
     }
 }
@@ -63,6 +75,7 @@ impl Read for Input {
         match self {
             Input::File(file) => file.read(buf),
             Input::PyFile(file) => file.read(buf),
+            Input::Http(stream) => stream.read(buf),
         }
     }
 }
@@ -72,7 +85,161 @@ impl Seek for Input {
         match self {
             Input::File(file) => file.seek(position),
             Input::PyFile(file) => file.seek(position),
+            Input::Http(stream) => stream.seek(position),
         }
+    }
+}
+
+/// An HTTP(S) response as a seekable byte stream for libav.
+///
+/// `read` hands libav what the server has sent so far, so playback starts before the file has
+/// been downloaded. `seek` reads forward when the target is close, and otherwise asks the server
+/// for the rest of the file with a `Range` header — falling back to restarting and skipping when
+/// the server ignores ranges. libav needs that for containers whose index sits at the end (MP4).
+///
+/// The connection is opened on the first read, so constructing a source never blocks on the
+/// network.
+pub struct HttpStream {
+    url: String,
+    client: reqwest::blocking::Client,
+    response: Option<reqwest::blocking::Response>,
+    /// The offset of the next byte the response will hand out.
+    position: u64,
+    /// `Content-Length` of the whole stream, when the server reports one.
+    length: Option<u64>,
+}
+
+impl HttpStream {
+    fn open(url: &str) -> io::Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(concat!("discord-ext-voice/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|err| io::Error::other(format!("unable to create the HTTP client: {err}")))?;
+
+        Ok(Self {
+            url: url.to_owned(),
+            client,
+            response: None,
+            position: 0,
+            length: None,
+        })
+    }
+
+    fn response(&mut self) -> io::Result<&mut reqwest::blocking::Response> {
+        if self.response.is_none() {
+            let response = self
+                .client
+                .get(&self.url)
+                .send()
+                .map_err(|err| http_error(&self.url, &err))?
+                .error_for_status()
+                .map_err(|err| http_error(&self.url, &err))?;
+            self.length = response.content_length();
+            self.response = Some(response);
+        }
+        Ok(self.response.as_mut().expect("just connected"))
+    }
+
+    /// Request `offset` onwards, returning whether the server honoured the range.
+    fn request_from(&mut self, offset: u64) -> io::Result<bool> {
+        let mut request = self.client.get(&self.url);
+        if offset > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+        }
+
+        let response = request
+            .send()
+            .map_err(|err| http_error(&self.url, &err))?
+            .error_for_status()
+            .map_err(|err| http_error(&self.url, &err))?;
+        let ranged = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+
+        if let Some(remaining) = response.content_length() {
+            self.length = Some(if ranged {
+                offset + remaining
+            } else {
+                remaining
+            });
+        }
+        self.response = Some(response);
+        self.position = if ranged { offset } else { 0 };
+        Ok(ranged)
+    }
+
+    /// Consume `remaining` bytes from the current response.
+    fn skip(&mut self, remaining: u64) -> io::Result<()> {
+        let mut scratch = [0u8; 16 * 1024];
+        let mut left = remaining;
+        while left > 0 {
+            let want = left.min(scratch.len() as u64) as usize;
+            let read = self.response()?.read(&mut scratch[..want])?;
+            if read == 0 {
+                return Err(io::Error::other(format!(
+                    "{} ended before the requested position",
+                    self.url
+                )));
+            }
+            left -= read as u64;
+            self.position += read as u64;
+        }
+        Ok(())
+    }
+}
+
+fn http_error(url: &str, err: &reqwest::Error) -> io::Error {
+    io::Error::other(format!("unable to fetch {url}: {err}"))
+}
+
+fn shift(base: u64, delta: i64) -> io::Result<u64> {
+    u64::try_from(i128::from(base) + i128::from(delta))
+        .map_err(|_| io::Error::other("a seek before the start of the stream"))
+}
+
+impl Read for HttpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.response()?.read(buf)?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for HttpStream {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(delta) => shift(self.position, delta)?,
+            SeekFrom::End(delta) => {
+                let length = match self.length {
+                    Some(length) => length,
+                    None => {
+                        self.response()?; // the length arrives with the first response
+                        self.length.ok_or_else(|| {
+                            io::Error::other("the server did not report a content length")
+                        })?
+                    }
+                };
+                shift(length, delta)?
+            }
+        };
+
+        if target == self.position {
+            return Ok(target);
+        }
+
+        // Reading forward within what is already in flight is cheaper than a new request.
+        if target > self.position && target - self.position <= SEEK_SKIP_LIMIT {
+            self.skip(target - self.position)?;
+            return Ok(target);
+        }
+
+        if self.request_from(target)? {
+            return Ok(target);
+        }
+
+        // The server ignored the range, so the response starts at zero again.
+        self.skip(target)?;
+        Ok(target)
     }
 }
 
@@ -138,10 +305,22 @@ impl Seek for PyFile {
 }
 
 /// Turn a Python object into libav input.
-fn open_input(source: &Bound<'_, PyAny>) -> PyResult<Input> {
+///
+/// Only the Python object is touched here: opening an HTTP(S) URL is left to the first read, and
+/// the libav part of the handshake happens in [`demux`], which the callers run without the GIL.
+fn open_input(source: &Bound<'_, PyAny>) -> Result<Input, String> {
+    if let Ok(text) = source.extract::<String>() {
+        if text.starts_with("http://") || text.starts_with("https://") {
+            log_info!("streaming {text} over HTTP");
+            return HttpStream::open(&text)
+                .map(|stream| Input::Http(Box::new(stream)))
+                .map_err(|err| format!("unable to open {text}: {err}"));
+        }
+    }
+
     if let Ok(path) = source.extract::<PathBuf>() {
-        let file = File::open(&path)
-            .map_err(|err| ffmpeg_err(format!("unable to open {}: {err}", path.display())))?;
+        let file =
+            File::open(&path).map_err(|err| format!("unable to open {}: {err}", path.display()))?;
         return Ok(Input::File(file));
     }
 
@@ -157,9 +336,11 @@ fn open_input(source: &Bound<'_, PyAny>) -> PyResult<Input> {
         )));
     }
 
-    Err(ffmpeg_err(
-        "the audio source must be a file path or a file-like object with a read() method",
-    ))
+    Err(
+        "the audio source must be a file path, an http(s) URL or a file-like object with a \
+         read() method"
+            .to_owned(),
+    )
 }
 
 struct DemuxedInput {
@@ -173,8 +354,7 @@ impl DemuxedInput {
     }
 }
 
-fn demux(source: &Bound<'_, PyAny>) -> PyResult<DemuxedInput> {
-    let input = open_input(source)?;
+fn demux(input: Input) -> Result<DemuxedInput, String> {
     let seekable = input.seekable();
 
     let io = if seekable {
@@ -185,16 +365,16 @@ fn demux(source: &Bound<'_, PyAny>) -> PyResult<DemuxedInput> {
 
     let demuxer = Demuxer::builder()
         .build(io)
-        .map_err(|err| ffmpeg_err(format!("FFmpeg could not open the input: {err}")))?;
-    let demuxer = demuxer.find_stream_info(None).map_err(|(_, err)| {
-        ffmpeg_err(format!("FFmpeg could not read stream information: {err}"))
-    })?;
+        .map_err(|err| format!("FFmpeg could not open the input: {err}"))?;
+    let demuxer = demuxer
+        .find_stream_info(None)
+        .map_err(|(_, err)| format!("FFmpeg could not read stream information: {err}"))?;
 
     let stream_index = demuxer
         .streams()
         .iter()
         .position(|candidate| candidate.codec_parameters().is_audio_codec())
-        .ok_or_else(|| ffmpeg_err("the input contains no audio stream"))?;
+        .ok_or("the input contains no audio stream".to_owned())?;
 
     log_debug!("demuxed input with audio stream at index {stream_index}");
 
@@ -226,13 +406,13 @@ pub struct DecodeSource {
 unsafe impl Send for DecodeSource {}
 
 impl DecodeSource {
-    fn open(source: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let demuxed = demux(source)?;
+    fn open(input: Input) -> Result<Self, String> {
+        let demuxed = demux(input)?;
         let stream_index = demuxed.stream_index;
 
         let decoder = AudioDecoder::from_stream(demuxed.stream())
             .and_then(|builder| builder.build())
-            .map_err(|err| ffmpeg_err(format!("FFmpeg could not open the audio decoder: {err}")))?;
+            .map_err(|err| format!("FFmpeg could not open the audio decoder: {err}"))?;
 
         Ok(Self {
             demuxer: demuxed.demuxer,
@@ -249,7 +429,7 @@ impl DecodeSource {
 
     /// Feed one decoded frame through the resampler and buffer the resulting stereo PCM.
     /// Feed one decoded frame through the resampler and buffer the resulting stereo PCM.
-    fn push_decoded(&mut self, frame: AudioFrame) -> Result<(), PyErr> {
+    fn push_decoded(&mut self, frame: AudioFrame) -> Result<(), String> {
         let parameters = (
             frame.sample_format(),
             frame.sample_rate(),
@@ -272,9 +452,7 @@ impl DecodeSource {
                 .target_sample_rate(TARGET_SAMPLE_RATE)
                 .target_frame_samples(Some(FRAME_SAMPLES))
                 .build()
-                .map_err(|err| {
-                    ffmpeg_err(format!("FFmpeg could not build the resampler: {err}"))
-                })?;
+                .map_err(|err| format!("FFmpeg could not build the resampler: {err}"))?;
             self.resampler = Some(resampler);
             self.resampler_source = Some(parameters);
         }
@@ -282,16 +460,16 @@ impl DecodeSource {
         let resampler = self.resampler.as_mut().expect("resampler just built");
         resampler
             .push(frame)
-            .map_err(|err| ffmpeg_err(format!("FFmpeg resampler error: {err}")))
+            .map_err(|err| format!("FFmpeg resampler error: {err}"))
     }
 
     /// Move every resampled frame the resampler has ready into `pending`.
-    fn drain_resampler(&mut self) -> Result<(), PyErr> {
+    fn drain_resampler(&mut self) -> Result<(), String> {
         loop {
             let frame = match self.resampler.as_mut() {
                 Some(resampler) => resampler
                     .take()
-                    .map_err(|err| ffmpeg_err(format!("FFmpeg resampler error: {err}")))?,
+                    .map_err(|err| format!("FFmpeg resampler error: {err}"))?,
                 None => return Ok(()),
             };
 
@@ -307,7 +485,7 @@ impl DecodeSource {
     }
 
     /// Advance the pipeline until at least one 20ms frame is buffered or the input ends.
-    fn pump(&mut self) -> Result<(), PyErr> {
+    fn pump(&mut self) -> Result<(), String> {
         loop {
             self.drain_resampler()?;
 
@@ -318,7 +496,7 @@ impl DecodeSource {
             if let Some(frame) = self
                 .decoder
                 .take()
-                .map_err(|err| ffmpeg_err(format!("FFmpeg decoder error: {err}")))?
+                .map_err(|err| format!("FFmpeg decoder error: {err}"))?
             {
                 self.push_decoded(frame)?;
                 continue;
@@ -329,11 +507,11 @@ impl DecodeSource {
                     self.flushed = true;
                     self.decoder
                         .flush()
-                        .map_err(|err| ffmpeg_err(format!("FFmpeg decoder flush failed: {err}")))?;
+                        .map_err(|err| format!("FFmpeg decoder flush failed: {err}"))?;
                     if let Some(resampler) = self.resampler.as_mut() {
-                        resampler.flush().map_err(|err| {
-                            ffmpeg_err(format!("FFmpeg resampler flush failed: {err}"))
-                        })?;
+                        resampler
+                            .flush()
+                            .map_err(|err| format!("FFmpeg resampler flush failed: {err}"))?;
                     }
                     continue;
                 }
@@ -345,17 +523,17 @@ impl DecodeSource {
                 Ok(Some(packet)) => {
                     if packet.stream_index() == self.stream_index {
                         self.decoder.try_push(packet).map_err(|err| {
-                            ffmpeg_err(format!(
+                            format!(
                                 "FFmpeg could not decode an audio packet: {}",
                                 err.into_inner()
                                     .map(|inner| inner.to_string())
                                     .unwrap_or_else(|| "the decoder needs to be drained".to_owned())
-                            ))
+                            )
                         })?;
                     }
                 }
                 Ok(None) => self.input_done = true,
-                Err(err) => return Err(ffmpeg_err(format!("FFmpeg demux error: {err}"))),
+                Err(err) => return Err(format!("FFmpeg demux error: {err}")),
             }
         }
     }
@@ -366,22 +544,18 @@ impl DecodeSource {
     /// seeks, and everything downstream is rebuilt because it holds samples from the old
     /// position. `ac-ffmpeg` only exposes draining a decoder (it pushes a null packet), not
     /// `avcodec_flush_buffers`, so the decoder is recreated from the same stream instead.
-    fn seek(&mut self, seconds: f64) -> Result<(), PyErr> {
+    fn seek(&mut self, seconds: f64) -> Result<(), String> {
         let micros = seek_micros(seconds)?;
         self.demuxer
             .seek_to_timestamp(Timestamp::from_micros(micros), SeekTarget::Precise)
             .map_err(|err| {
-                ffmpeg_err(format!(
-                    "FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}"
-                ))
+                format!("FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}")
             })?;
 
         let decoder = AudioDecoder::from_stream(&self.demuxer.streams()[self.stream_index])
             .and_then(|builder| builder.build())
             .map_err(|err| {
-                ffmpeg_err(format!(
-                    "FFmpeg could not reopen the audio decoder after seeking: {err}"
-                ))
+                format!("FFmpeg could not reopen the audio decoder after seeking: {err}")
             })?;
 
         self.decoder = decoder;
@@ -395,7 +569,7 @@ impl DecodeSource {
         Ok(())
     }
 
-    fn read_frame(&mut self) -> Result<Vec<u8>, PyErr> {
+    fn read_frame(&mut self) -> Result<Vec<u8>, String> {
         if self.finished && self.pending.is_empty() {
             return Ok(Vec::new());
         }
@@ -425,8 +599,8 @@ pub struct OpusSource {
 unsafe impl Send for OpusSource {}
 
 impl OpusSource {
-    fn open(source: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let demuxed = demux(source)?;
+    fn open(input: Input) -> Result<Self, String> {
+        let demuxed = demux(input)?;
         let stream_index = demuxed.stream_index;
 
         let codec = demuxed
@@ -436,9 +610,9 @@ impl OpusSource {
             .unwrap_or("unknown")
             .to_owned();
         if !codec.starts_with("opus") && codec != "libopus" {
-            return Err(ffmpeg_err(format!(
+            return Err(format!(
                 "the audio codec is {codec}, not opus; an Opus pass-through source requires an Opus stream"
-            )));
+            ));
         }
         log_info!("using the Opus packet pass-through source (codec {codec})");
 
@@ -450,21 +624,19 @@ impl OpusSource {
     }
 
     /// Restart the stream `seconds` from its beginning, keeping the packets as they are.
-    fn seek(&mut self, seconds: f64) -> Result<(), PyErr> {
+    fn seek(&mut self, seconds: f64) -> Result<(), String> {
         let micros = seek_micros(seconds)?;
         self.demuxer
             .seek_to_timestamp(Timestamp::from_micros(micros), SeekTarget::Precise)
             .map_err(|err| {
-                ffmpeg_err(format!(
-                    "FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}"
-                ))
+                format!("FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}")
             })?;
         self.finished = false;
         log_debug!("seeked the Opus source to {seconds}s");
         Ok(())
     }
 
-    fn read_packet(&mut self) -> Result<Vec<u8>, PyErr> {
+    fn read_packet(&mut self) -> Result<Vec<u8>, String> {
         if self.finished {
             return Ok(Vec::new());
         }
@@ -479,18 +651,18 @@ impl OpusSource {
                     self.finished = true;
                     return Ok(Vec::new());
                 }
-                Err(err) => return Err(ffmpeg_err(format!("FFmpeg demux error: {err}"))),
+                Err(err) => return Err(format!("FFmpeg demux error: {err}")),
             }
         }
     }
 }
 
 /// Translate a position in seconds into the microseconds a seek expects.
-fn seek_micros(seconds: f64) -> Result<i64, PyErr> {
+fn seek_micros(seconds: f64) -> Result<i64, String> {
     if !seconds.is_finite() || seconds < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "the seek position must be a finite, non-negative number of seconds",
-        ));
+        return Err(
+            "the seek position must be a finite, non-negative number of seconds".to_owned(),
+        );
     }
     Ok((seconds * 1_000_000.0).round().min(i64::MAX as f64) as i64)
 }
@@ -524,8 +696,8 @@ pub type ProbeResult = Option<(String, u32, usize, Option<f64>)>;
 
 /// Probe a source and report `(codec, sample_rate, channels, duration_seconds)` without
 /// decoding anything.
-pub fn probe_source(source: &Bound<'_, PyAny>) -> PyResult<ProbeResult> {
-    let demuxed = demux(source)?;
+pub fn probe_source(input: Input) -> Result<ProbeResult, String> {
+    let demuxed = demux(input)?;
     let stream = demuxed.stream();
 
     let parameters = stream.codec_parameters();
@@ -559,8 +731,13 @@ pub struct PyDecodeSource {
 #[pymethods]
 impl PyDecodeSource {
     #[new]
-    fn new(source: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let inner = DecodeSource::open(source)?;
+    fn new(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let input = open_input(source).map_err(ffmpeg_err)?;
+        // Probing reads from the input, which for a URL means the network: do it without the GIL
+        // so the rest of the interpreter keeps running.
+        let inner = py
+            .detach(|| DecodeSource::open(input))
+            .map_err(ffmpeg_err)?;
         Ok(Self {
             inner: Mutex::new(inner),
         })
@@ -568,13 +745,16 @@ impl PyDecodeSource {
 
     /// Read the next 20ms frame of 48kHz stereo signed 16 bit PCM.
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let data = self.inner.lock().read_frame()?;
+        let data = py
+            .detach(|| self.inner.lock().read_frame())
+            .map_err(ffmpeg_err)?;
         Ok(PyBytes::new(py, &data))
     }
 
     /// Restart the stream `seconds` from the beginning (the native `-ss` of `ffmpeg`).
-    fn seek(&self, seconds: f64) -> PyResult<()> {
-        self.inner.lock().seek(seconds)
+    fn seek<'py>(&self, py: Python<'py>, seconds: f64) -> PyResult<()> {
+        py.detach(|| self.inner.lock().seek(seconds))
+            .map_err(ffmpeg_err)
     }
 
     fn is_opus(&self) -> bool {
@@ -605,8 +785,9 @@ pub struct PyOpusSource {
 #[pymethods]
 impl PyOpusSource {
     #[new]
-    fn new(source: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let inner = OpusSource::open(source)?;
+    fn new(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let input = open_input(source).map_err(ffmpeg_err)?;
+        let inner = py.detach(|| OpusSource::open(input)).map_err(ffmpeg_err)?;
         Ok(Self {
             inner: Mutex::new(inner),
         })
@@ -614,13 +795,16 @@ impl PyOpusSource {
 
     /// Read one raw Opus packet.
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let data = self.inner.lock().read_packet()?;
+        let data = py
+            .detach(|| self.inner.lock().read_packet())
+            .map_err(ffmpeg_err)?;
         Ok(PyBytes::new(py, &data))
     }
 
     /// Restart the stream `seconds` from the beginning (the native `-ss` of `ffmpeg`).
-    fn seek(&self, seconds: f64) -> PyResult<()> {
-        self.inner.lock().seek(seconds)
+    fn seek<'py>(&self, py: Python<'py>, seconds: f64) -> PyResult<()> {
+        py.detach(|| self.inner.lock().seek(seconds))
+            .map_err(ffmpeg_err)
     }
 
     fn is_opus(&self) -> bool {
@@ -640,8 +824,9 @@ impl PyOpusSource {
 
 /// Probe a media source without decoding it.
 #[pyfunction]
-pub fn probe(source: &Bound<'_, PyAny>) -> PyResult<ProbeResult> {
-    probe_source(source)
+pub fn probe(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<ProbeResult> {
+    let input = open_input(source).map_err(ffmpeg_err)?;
+    py.detach(|| probe_source(input)).map_err(ffmpeg_err)
 }
 
 #[cfg(test)]

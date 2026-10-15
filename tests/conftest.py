@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import http.server
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import wave
 from pathlib import Path
 
@@ -36,6 +39,95 @@ async def gateway_factory():
     finally:
         for server in created:
             await server.stop()
+
+
+class _LimitedReader:
+    """Serve only the requested slice of a file (what a `Range` response means)."""
+
+    def __init__(self, handle, remaining: int) -> None:
+        self._handle = handle
+        self._remaining = remaining
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b''
+        want = self._remaining if size is None or size < 0 else min(size, self._remaining)
+        data = self._handle.read(want)
+        self._remaining -= len(data)
+        return data
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+class _RangeHandler(http.server.SimpleHTTPRequestHandler):
+    """A file server that honours `Range` requests, which is what seeking over HTTP uses."""
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+    def send_head(self):  # type: ignore[override]
+        path = Path(self.translate_path(self.path))
+        if not path.is_file():
+            self.send_error(404, 'not found')
+            return None
+
+        assert path.stat
+        size = path.stat().st_size
+        start, end = 0, max(size - 1, 0)
+        header = self.headers.get('Range')
+        if header and header.startswith('bytes='):
+            first = header[len('bytes=') :].split('-', 1)[0]
+            if first.isdigit():
+                start = min(int(first), end)
+            self.send_response(206)
+            self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+        else:
+            self.send_response(200)
+
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Length', str(end - start + 1))
+        self.end_headers()
+
+        handle = path.open('rb')
+        handle.seek(start)
+        return _LimitedReader(handle, end - start + 1)
+
+
+@pytest.fixture
+def http_server():
+    """Serve a directory over HTTP, returning a factory for its base URL."""
+
+    servers: list[http.server.ThreadingHTTPServer] = []
+
+    def start(directory: Path) -> str:
+        handler = functools.partial(_RangeHandler, directory=str(directory))
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f'http://127.0.0.1:{server.server_port}'
+
+    try:
+        yield start
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+
+
+@pytest.fixture
+def opus_file(tmp_path: Path, sine_wav: Path) -> Path:
+    """An Ogg Opus copy of :func:`sine_wav`, for the pass-through source."""
+    if FFMPEG is None:
+        pytest.skip('the ffmpeg binary is required to create an Opus file')
+
+    path = tmp_path / 'sine.opus'
+    subprocess.run(
+        [FFMPEG, '-y', '-loglevel', 'error', '-i', str(sine_wav), '-c:a', 'libopus', str(path)],
+        check=True,
+    )
+    return path
 
 
 @pytest.fixture

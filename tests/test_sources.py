@@ -215,18 +215,6 @@ def test_ffmpeg_pcm_audio_rejects_a_bad_seek_position(sine_wav: Path, seek: obje
 # ---------------------------------------------------------------------------- FFmpegOpusAudio
 
 
-@pytest.fixture
-def opus_file(tmp_path: Path, sine_wav: Path) -> Path:
-    if FFMPEG is None:
-        pytest.skip('ffmpeg is required')
-    path = tmp_path / 'sine.opus'
-    subprocess.run(
-        [FFMPEG, '-y', '-loglevel', 'error', '-i', str(sine_wav), '-c:a', 'libopus', str(path)],
-        check=True,
-    )
-    return path
-
-
 def test_ffmpeg_opus_audio_passes_opus_packets_through(opus_file: Path):
     source = dev.FFmpegOpusAudio(str(opus_file))
     try:

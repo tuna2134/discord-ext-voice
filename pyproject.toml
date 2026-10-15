@@ -7,12 +7,15 @@ name = "discord-ext-voice"
 description = "A discord.py VoiceClient-compatible Discord voice library powered by Rust (pyo3, tokio-tungstenite, rustls, ac-ffmpeg, davey, audiopus)"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 keywords = ["discord", "voice", "discord.py", "opus", "dave", "e2ee", "pyo3"]
 classifiers = [
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
     "Topic :: Communications :: Conferencing",
 ]
 dynamic = ["version"]
@@ -32,7 +35,8 @@ dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5"]
 [tool.maturin]
 module-name = "discord_ext_voice._native"
 python-source = "python"
-features = ["extension-module", "abi3"]
+# No `abi3`: one wheel per CPython version (3.11 and newer), built in CI for each of them.
+features = ["extension-module"]
 # Patching `ac-ffmpeg` with a git dependency (see patches/README.md) keeps the sdist small:
 # `pip install <sdist>` fetches the fork rather than shipping a copy of it, at the cost of
 # needing `git` and network access — exactly like building from a source checkout.

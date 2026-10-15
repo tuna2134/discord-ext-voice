@@ -116,7 +116,7 @@ reader left to wrap.
 | --- | --- |
 | `AudioSource` | **ours**, a standalone base class (nothing in this package inherits from `discord.py`); `is_audio_source(x)` accepts it, or any object with the same `read`/`is_opus`/`cleanup` methods |
 | `PCMAudio` | **ours**: raw PCM from a file object |
-| `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`) |
+| `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`), which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
 | `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
 | `AudioPlayer` | `discord.player.AudioPlayer`, reused unchanged as the playback clock |
 
@@ -168,8 +168,10 @@ else is reachable through the native `VoiceError` hierarchy.
 3. **`before_options`/`options` raise `TypeError`.** They are FFmpeg CLI grammar, which the
    in-process decoder cannot express; `seek=` replaces the common `-ss` case, and there is no
    subprocess to hand the rest to. `force_cli`, `pipe`, `stderr` and `executable` go with them.
-4. **Network URLs are not supported.** The native reader takes a path or a file object; fetch
-   the URL with your own HTTP client first.
+4. **Network URLs go through the native reader.** `FFmpegPCMAudio('https://…')` streams the
+   response with `reqwest` (rustls) instead of spawning the `ffmpeg` binary with a URL, which is
+   what discord.py does; `seek=` and mid-stream seeks issue `Range` requests where the server
+   supports them.
 5. **Reconnect event ordering.** `_inner_connect` reaches
    `got_both_voice_updates` after a `4015` resume only if the server update arrives before the
    state update, because `voice_state_update` does not transition away from `connected`. This

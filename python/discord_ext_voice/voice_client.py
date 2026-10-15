@@ -192,8 +192,10 @@ class VoiceClient(VoiceProtocol):
         Disconnects this voice client from voice.
         """
         self.stop()
+        _log.info('Disconnecting from voice (force=%s)', force)
         await self._connection.disconnect(force=force, wait=True)
         self.cleanup()
+        _log.info('Disconnected from voice')
 
     async def move_to(self, channel: Optional[Any], *, timeout: Optional[float] = 30.0) -> None:
         """|coro|
@@ -253,6 +255,12 @@ class VoiceClient(VoiceProtocol):
                 signal_type=signal_type,
             )
 
+        _log.info(
+            'Playing %r (opus passthrough=%s, encoder=%s)',
+            source,
+            source.is_opus(),
+            'native' if self.encoder is not None else 'none',
+        )
         self._player = AudioPlayer(source, self, after=after)
         self._player.start()
 

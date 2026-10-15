@@ -120,6 +120,10 @@ class VoiceConnectionState:
 
         self._state = ConnectionFlowState.disconnected
         self._expecting_disconnect = False
+        #: Whether the gateway has been asked to put us in a channel and has not been asked to
+        #: take us out again. The flow state alone cannot answer that: while the poller is
+        #: reconnecting, the state is not `connected` but we are still in the channel.
+        self._joined = False
         #: Whether the next websocket connection must send RESUME instead of IDENTIFY.
         self._resume = False
         self._connected = ThreadEvent()
@@ -251,6 +255,7 @@ class VoiceConnectionState:
         channel_id = data.get('channel_id')
 
         if channel_id is None:
+            self._joined = False
             self._disconnected.set()
 
             # A `channel_id` of None is expected while disconnecting; anything else means
@@ -263,6 +268,7 @@ class VoiceConnectionState:
             return
 
         channel_id = int(channel_id)
+        self._joined = True
         self.session_id = data.get('session_id')
         self._native.set_session_id(self.session_id)
 
@@ -416,6 +422,7 @@ class VoiceConnectionState:
             _log.info('Starting voice handshake... (connection attempt %d)', i + 1)
 
             await self._voice_connect(self_deaf=self_deaf, self_mute=self_mute)
+            self._joined = True
             # Setting this unnecessarily will break reconnecting.
             if self.state is ConnectionFlowState.disconnected:
                 self.state = ConnectionFlowState.set_guild_voice_state
@@ -460,15 +467,16 @@ class VoiceConnectionState:
         self, *, force: bool = True, cleanup: bool = True, wait: bool = False
     ) -> None:
         """|coro| Leave the channel and tear the native session down."""
-        if not force and not self.is_connected():
+        if not force and not self.is_connected() and not self._joined:
             return
 
+        requested = False
         try:
-            await self._voice_disconnect()
+            requested = await self._voice_disconnect()
             if self.ws is not MISSING and self.ws is not None:
                 await self.ws.close()
         except Exception:
-            _log.debug('Ignoring exception disconnecting from voice', exc_info=True)
+            _log.warning('Ignoring exception disconnecting from voice', exc_info=True)
         finally:
             self.state = ConnectionFlowState.disconnected
 
@@ -482,12 +490,17 @@ class VoiceConnectionState:
             self.ip = None
             self.port = None
 
-            # Skip this part if disconnect was called from the poll loop task.
-            if wait and not self._inside_runner():
+            # Skip this part if disconnect was called from the poll loop task, or if the
+            # gateway was never told to remove us (there would be nothing to confirm).
+            if wait and requested and not self._inside_runner():
                 try:
                     await asyncio.wait_for(self._disconnected.wait(), timeout=self.timeout)
                 except asyncio.TimeoutError:
-                    _log.debug('Timed out waiting for voice disconnection confirmation')
+                    _log.warning(
+                        'Timed out after %ss waiting for the voice disconnection confirmation; '
+                        'carrying on',
+                        self.timeout,
+                    )
                 except asyncio.CancelledError:
                     pass
 
@@ -624,16 +637,26 @@ class VoiceConnectionState:
             channel=channel, self_deaf=self_deaf, self_mute=self_mute
         )
 
-    async def _voice_disconnect(self) -> None:
+    async def _voice_disconnect(self) -> bool:
+        """Ask the main gateway to remove us. Returns whether the request went out."""
+        channel = self.voice_client.channel
         _log.info(
             'The voice handshake is being terminated for Channel ID %s (Guild ID %s)',
-            self.voice_client.channel.id,
-            self.guild.id,
+            getattr(channel, 'id', None),
+            getattr(self.guild, 'id', None),
         )
         self.state = ConnectionFlowState.disconnected
-        await self.voice_client.channel.guild.change_voice_state(channel=None)
+        try:
+            await channel.guild.change_voice_state(channel=None)
+        except Exception as exc:
+            # A gateway that is reconnecting cannot take the request; there is nothing to wait
+            # for, so let the caller carry on instead of blocking for the whole timeout.
+            _log.warning('Could not tell the gateway to leave voice: %r', exc)
+            return False
+        self._joined = False
         self._expecting_disconnect = True
         self._disconnected.clear()
+        return True
 
     def send_packet(self, packet: bytes) -> None:
         """Send a raw UDP packet. Mostly useful for tests and future receive-side work."""

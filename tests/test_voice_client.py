@@ -234,6 +234,11 @@ async def test_play_streams_pcm_over_rtp(gateway_factory):
         assert len(packets) >= 3
         assert packets[0][0] == 0x80  # RTP version 2
 
+        # Discord drops audio from an SSRC it has not been told is speaking, so the player's
+        # `speaking: 1` has to arrive as well as the transport's initial `speaking: 0`.
+        speaks = [frame for frame in gateway.received_json if frame.get('op') == 5]
+        assert [frame['d']['speaking'] for frame in speaks] == [0, 1], speaks
+
         await asyncio.wait_for(finished.wait(), timeout=10.0)
         assert errors == [None]
         assert voice.is_playing() is False
@@ -358,6 +363,28 @@ async def test_disconnect_cleans_up(gateway_factory):
     assert voice.is_connected() is False
     assert client._connection._get_voice_client(KEY) is None
     assert channel.guild.voice_state_calls[-1][0] is None
+
+
+async def test_disconnect_leaves_while_the_flow_is_reconnecting(gateway_factory):
+    """The poller sets the state to `disconnected` while it reconnects, but we are still in the
+    channel: a plain `disconnect()` has to tell the gateway to remove us anyway."""
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    calls = len(channel.guild.voice_state_calls)
+    # Simulate the reconnect window of `_poll_voice_ws`.
+    voice._connection.state = dev.ConnectionFlowState.disconnected
+
+    try:
+        await voice.disconnect()
+        assert any(call[0] is None for call in channel.guild.voice_state_calls[calls:]), (
+            'the gateway was never told to remove us'
+        )
+        assert client._connection._get_voice_client(KEY) is None
+    finally:
+        if voice.is_connected():
+            await voice.disconnect()
 
 
 async def test_move_to_none_disconnects(gateway_factory):

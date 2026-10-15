@@ -45,20 +45,33 @@ async def on_message(message: discord.Message) -> None:
             return
         voice = await message.author.voice.channel.connect(cls=dev.VoiceClient)
         print(
-            f'connected to {voice.channel} '
-            f'(mode={voice.mode}, dave={voice.native.dave_protocol_version})'
+            f'!join: connected to {voice.channel} (mode={voice.mode}, '
+            f'dave={voice.native.dave_protocol_version}) '
+            f'registered={message.guild.voice_client is voice} '
+            f'all={client.voice_clients}'
         )
 
     elif message.content == '!play':
         voice = message.guild.voice_client
+        print(f'!play: file={FILE!r} guild.voice_client={voice!r} all={client.voice_clients}')
         if voice is None:
             await message.reply('not connected')
             return
+
+        try:
+            source = dev.FFmpegPCMAudio(FILE)
+        except Exception as exc:
+            print(f'!play: could not open {FILE!r}: {exc!r}')
+            await message.reply(f'could not open {FILE}: {exc}')
+            return
+
+        print(f'!play: source={source!r} opus={source.is_opus()}')
         voice.play(
-            dev.FFmpegPCMAudio(FILE),
+            source,
             after=lambda error: print(f'finished, error={error!r}'),
             bitrate=128,
         )
+        print(f'!play: playing={voice.is_playing()} source={voice.source!r}')
 
     elif message.content == '!status':
         # Handy when audio does not arrive: it separates "the player is running" from "the
@@ -70,7 +83,7 @@ async def on_message(message: discord.Message) -> None:
         native = voice.native
         await message.reply(
             f'connected={voice.is_connected()} playing={voice.is_playing()} '
-            f'source={voice.source!r}\n'
+            f'phase={native.phase} source={voice.source!r}\n'
             f'mode={native.mode} ssrc={native.ssrc} latency={native.latency:.3f}s\n'
             f'dave: version={native.dave_protocol_version} '
             f'session={native.has_dave_session()} can_encrypt={native.can_encrypt()}'
@@ -78,8 +91,21 @@ async def on_message(message: discord.Message) -> None:
 
     elif message.content == '!leave':
         voice = message.guild.voice_client
-        if voice is not None:
+        print(f'!leave: guild.voice_client={voice!r} all={client.voice_clients}')
+        if voice is None:
+            await message.reply('not connected')
+            return
+
+        try:
             await voice.disconnect()
+        except Exception as exc:
+            print(f'!leave: disconnect failed: {exc!r}')
+            await message.reply(f'disconnect failed: {exc}')
+            return
+
+        print(
+            f'!leave: done connected={voice.is_connected()} all={client.voice_clients}'
+        )
 
 
 if __name__ == '__main__':

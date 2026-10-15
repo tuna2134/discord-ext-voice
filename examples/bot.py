@@ -18,7 +18,7 @@ import discord
 
 import discord_ext_voice as dev
 
-logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
 TOKEN = os.environ.get('DISCORD_TOKEN')
 FILE = sys.argv[1] if len(sys.argv) > 1 else 'song.mp3'
 

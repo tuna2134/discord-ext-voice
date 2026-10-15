@@ -1,7 +1,7 @@
 # discord-ext-voice
 
-A drop-in, `discord.py`-compatible Discord voice library whose audio and networking stack is
-implemented in Rust.
+A Rust voice backend for [`discord.py`](https://github.com/Rapptz/discord.py). The public
+`VoiceClient` is discord.py's own, so the API is not *compatible* with it — it **is** it.
 
 ```python
 import discord
@@ -11,38 +11,47 @@ voice = await channel.connect(cls=dev.VoiceClient)
 voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished', error))
 ```
 
-The public API mirrors `discord.voice_client.VoiceClient`, `discord.player` and
-`discord.opus`, so existing bot code keeps working — but underneath:
+`dev.VoiceClient` subclasses `discord.VoiceClient`, `dev.VoiceConnectionState` subclasses
+`discord.voice_state.VoiceConnectionState`, `dev.DiscordVoiceWebSocket` subclasses
+`discord.gateway.DiscordVoiceWebSocket`, and the audio player, audio sources and volume
+transformer are discord.py's own classes re-exported unchanged. Only the parts that must be
+native are overridden — and those parts are the whole voice protocol:
 
-| Concern | Implementation |
+| Concern | Where it lives |
 | --- | --- |
-| Voice websocket | `tokio` + `tokio-rustls` + `tokio-tungstenite` |
-| Voice gateway payloads | `voice-model` (published on crates.io as `serenity-voice-model`) |
-| RTP encryption | `xsalsa20poly1305` / `chacha20poly1305` (RustCrypto) |
-| End-to-end encryption | `davey` (DAVE / MLS, RFC 9420) |
-| Opus codec | `audiopus` (libopus) |
-| Audio decode + resample | `ac-ffmpeg` (libavformat / libavcodec) + `libswresample` |
-| Python bindings | `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
+| Voice websocket (TCP → TLS → websocket) | Rust: `tokio` + `tokio-rustls` + `tokio-tungstenite` |
+| Voice gateway payloads | Rust: `voice-model` (crates.io: `serenity-voice-model`) |
+| UDP socket, IP discovery, heartbeat, RTP | Rust |
+| RTP encryption (all four modes) | Rust: `xsalsa20poly1305` / `chacha20poly1305` |
+| DAVE end-to-end encryption (MLS) | Rust: `davey` |
+| Opus codec | Rust: `audiopus` (libopus) |
+| Audio decode + resample | Rust: `ac-ffmpeg` + `libswresample` |
+| Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
+| Connection flow state machine, reconnect policy | `discord.voice_state.VoiceConnectionState` |
+| Audio player thread, `PCMAudio`, `PCMVolumeTransformer` | `discord.player` |
+| Gateway opcodes and outgoing frame builders | `discord.gateway.DiscordVoiceWebSocket` |
+| `ffmpeg` subprocess fallback | `discord.player.FFmpegPCMAudio` |
 
 ## Why
 
-* **No PyNaCl requirement.** `xsalsa20poly1305*` and `aead_xchacha20_poly1305_rtpsize` are
-  implemented natively, including the incrementing nonce behaviour `discord.py` relies on.
-  The test suite decrypts every mode with PyNaCl to prove byte-level compatibility.
+* **No PyNaCl on the audio path.** `xsalsa20poly1305*` and
+  `aead_xchacha20_poly1305_rtpsize` are implemented natively, including the incrementing nonce
+  behaviour discord.py relies on. The test suite decrypts every mode with PyNaCl to prove
+  byte-level compatibility.
 * **No `ffmpeg` subprocess for local media.** `FFmpegPCMAudio` decodes and resamples in
-  process. The CLI is only used as a fallback (URLs, `pipe=True`, unsupported options).
+  process with libav; the binary is only used for URLs, pipes and explicit CLI options.
 * **Encoding, encryption and the UDP send happen in Rust**, so playback jitter does not
-  compete with Python work.
-* **DAVE end-to-end encryption.** The MLS session, key packages, commit/welcome handling and
-  the transition state machine are handled in Rust with `davey`.
-* **Real `discord.py` close-code semantics.** 1000 / 4014 / 4015 / 4021 / 4022 are handled
-  like `discord.py`, including `RESUME` and exponential-backoff reconnects.
+  compete with Python work — the Python player thread just hands Rust 20ms of PCM.
+* **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
+  commit/welcome processing, epoch transitions and the passthrough windows.
+* **No duplicated Python.** Roughly 860 lines of Python (mostly docstrings) instead of the
+  ~2400 it takes to re-implement discord.py's player, state machine and gateway handling.
 
 ## Requirements
 
 Build time:
 
-* Rust 1.85 or newer (the crate uses edition 2024)
+* Rust 1.85 or newer (edition 2024)
 * `pkg-config`
 * FFmpeg development libraries: `libavformat`, `libavcodec`, `libavutil`, `libswresample`
 * `libopus` development libraries
@@ -59,9 +68,9 @@ Arch:
 sudo pacman -S pkgconf ffmpeg opus
 ```
 
-At runtime the extension is **dynamically linked** against those FFmpeg and Opus libraries,
-so the target machine needs the matching shared objects. Building fully self-contained wheels
-would mean vendoring and statically linking FFmpeg, which is deliberately left out of scope.
+At runtime the extension is **dynamically linked** against those FFmpeg and Opus libraries.
+Building fully self-contained wheels would mean vendoring and statically linking FFmpeg, which
+is deliberately out of scope.
 
 ## Install
 
@@ -71,11 +80,9 @@ pip install maturin
 maturin develop --release
 ```
 
-To use it inside a `discord.py` bot, install the extra:
-
-```bash
-pip install 'discord-ext-voice[discord]'
-```
+`discord.py[voice]` is a runtime dependency: `discord.VoiceClient.__init__` refuses to build
+without PyNaCl and the Python `davey` bindings, even though this library's crypto and MLS
+session are native.
 
 ## Usage
 
@@ -91,10 +98,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 @client.event
-async def on_ready():
-    print('ready as', client.user)
-
-@client.event
 async def on_message(message):
     if message.content == '!join':
         voice = await message.author.voice.channel.connect(cls=dev.VoiceClient)
@@ -106,18 +109,28 @@ async def on_message(message):
         await message.guild.voice_client.disconnect()
 ```
 
-`discord_ext_voice.VoiceClient` subclasses `discord.voice_client.VoiceProtocol` whenever
-`discord.py` is importable, so `channel.connect(cls=...)` accepts it and its exception types
-are also `discord.ClientException` subclasses.
+Because `dev.VoiceClient` *is* a `discord.VoiceClient`, everything works the same way it does
+with discord.py: `is_playing()`, `pause()`, `resume()`, `stop()`, `source`, `move_to()`,
+`latency`, `average_latency`, `voice_privacy_code`, the `after` callback, and so on.
 
 ### Audio sources
 
 | Class | Behaviour |
 | --- | --- |
-| `PCMAudio(stream)` | Raw 48kHz stereo `s16` read from a file-like object |
-| `FFmpegPCMAudio(source)` | In-process decode + resample; CLI fallback when needed |
-| `FFmpegOpusAudio(source)` | Opus pass-through when the input is Opus, otherwise libopus encoding |
-| `PCMVolumeTransformer(source, volume)` | Volume scaling in Rust (no `audioop`) |
+| `PCMAudio(stream)` | `discord.player.PCMAudio`, reused unchanged |
+| `FFmpegPCMAudio(source)` | Subclass of discord.py's, decoding in process with libav when it can |
+| `FFmpegOpusAudio(source)` | Subclass of discord.py's: Opus pass-through, otherwise libopus |
+| `PCMVolumeTransformer(source, volume)` | `discord.player.PCMVolumeTransformer`, reused unchanged |
+| `AudioPlayer` | `discord.player.AudioPlayer`, reused unchanged |
+
+`FFmpegPCMAudio` takes discord.py's arguments plus `force_cli: bool = False`:
+
+```python
+dev.FFmpegPCMAudio('song.mp3')                        # in-process libav decode
+dev.FFmpegPCMAudio('stream.mp3', before_options='-ss 30')  # ffmpeg CLI (option grammar)
+dev.FFmpegPCMAudio('https://example.com/a.mp3')       # ffmpeg CLI (network protocol)
+dev.FFmpegPCMAudio('song.mp3', force_cli=True)        # ffmpeg CLI, explicitly
+```
 
 ### Opus
 
@@ -125,52 +138,59 @@ are also `discord.ClientException` subclasses.
 import discord_ext_voice as dev
 
 encoder = dev.opus.Encoder(application='voip', bitrate=96, fec=True)
-packet = encoder.encode(pcm_bytes)                 # 20ms of 48kHz stereo s16 -> one Opus frame
-samples = dev.opus.Decoder().decode(packet)        # -> 3840 bytes of PCM
+packet = encoder.encode(pcm_bytes)                  # 20ms of 48kHz stereo s16 -> one frame
+samples = dev.opus.Decoder().decode(packet)         # -> 3840 bytes of PCM
 ```
 
-`dev.opus.is_loaded()` is always `True` and `load_opus()` is a no-op: Opus is linked into the
-native extension.
+`dev.opus.Encoder`/`Decoder` are native, so unlike `discord.opus.Encoder` they need no
+`load_opus()` call. The constants (`OPUS_SILENCE`, `APPLICATION_AUDIO`, ...) come from
+`discord.opus`.
 
-### Standalone
+### The native handle
 
-Nothing in the library requires `discord.py`; only `Guild.change_voice_state` (used to move
-the bot in and out of channels) is expected to exist on the channel object.
+```python
+voice = await channel.connect(cls=dev.VoiceClient)
+voice.native.is_connected()          # transport state
+voice.native.latency                 # voice websocket latency
+voice.native.voice_privacy_code      # DAVE displayable code
+voice.native.decrypt_rtp(header, payload)
+voice.native.dave_protocol_version   # 0 when DAVE is not negotiated
+voice.native.mode                    # negotiated RTP encryption mode
+```
 
 ## Architecture
 
 ```
-python/discord_ext_voice/          # discord.py-shaped API layer
-├── voice_client.py                # VoiceClient / VoiceProtocol
-├── voice_state.py                 # connection flow state + reconnect policy
-├── gateway.py                     # DiscordVoiceWebSocket facade / opcodes
-├── player.py                      # AudioSource implementations + AudioPlayer thread
-├── opus.py                        # opus.Encoder / opus.Decoder
-├── oggparse.py                    # Ogg page reader (CLI fallback only)
-├── errors.py, enums.py, backoff.py, _compat.py
-src/                               # the native core
-├── lib.rs                         # module registration and constants
-├── connection.rs                  # the VoiceConnection pyclass
-├── transport.rs                   # websocket + UDP actor, heartbeat, IP discovery
-├── crypto.rs                      # the four RTP encryption modes
-├── dave.rs                        # DAVE/MLS session and transition state machine
-├── opus.rs                        # libopus encode/decode
-├── resample.rs                    # libswresample driver (48kHz stereo s16)
-└── source.rs                      # FFmpeg-backed AudioSources
+python/discord_ext_voice/        # thin discord.py extension
+├── voice_client.py              # VoiceClient: create_connection_state, play, send_audio_packet
+├── voice_state.py               # VoiceConnectionState: the native integration points
+├── gateway.py                   # DiscordVoiceWebSocket: native socket, inherited opcodes
+├── player.py                    # native-first FFmpegPCMAudio / FFmpegOpusAudio
+├── opus.py                      # native Encoder/Decoder + discord.opus constants
+└── errors.py                    # native errors + discord.py's, and FFmpegSourceError
+src/                             # the core
+├── lib.rs                       # module registration and constants
+├── connection.rs                # the VoiceConnection pyclass
+├── transport.rs                 # websocket + UDP actor, heartbeat, IP discovery
+├── crypto.rs                    # the four RTP encryption modes
+├── dave.rs                      # DAVE/MLS session and transition state machine
+├── opus.rs                      # libopus encode/decode
+├── resample.rs                  # libswresample driver (48kHz stereo s16)
+└── source.rs                    # FFmpeg-backed audio sources
 ```
 
 ### Design notes
 
-**TLS is layered by hand.** Rather than letting `tokio-tungstenite` own the transport, a
-`tokio::net::TcpStream` is upgraded with `tokio_rustls::TlsConnector` and only then handed to
-`tokio_tungstenite::client_async`. This keeps the trust store, ALPN and cipher configuration
-under our control, and lets an endpoint written as `ws://host:port` use a plaintext websocket
-(used by locally hosted gateways and the test suite).
+**TLS is layered by hand.** A `tokio::net::TcpStream` is upgraded with
+`tokio_rustls::TlsConnector` and only then handed to `tokio_tungstenite::client_async`, rather
+than using tokio-tungstenite's own connectors. That keeps the trust store and cipher
+configuration under our control and lets an endpoint written as `ws://host:port` use a
+plaintext websocket (used by locally hosted gateways and the test suite).
 
 **Gateway frames are normalised before parsing.** `voice_model::Event` ignores an unknown
-top-level member without consuming its value, and Discord's voice gateway sends a `seq`
-member alongside `op`/`d`. Every incoming frame is therefore filtered down to `op` + `d`
-(while `seq` is recorded for `RESUME`) and re-parsed from text.
+top-level member without consuming its value, and Discord's voice gateway sends a `seq` member
+alongside `op`/`d`. Every incoming frame is filtered down to `op` + `d` (recording `seq` for
+`RESUME`) and re-parsed from text.
 
 **Resampling talks to libswresample directly.** `ac-ffmpeg`'s `AudioResampler` wraps
 `swr_convert_frame`, whose per-frame parameter check rejects the *unspecified* channel layouts
@@ -178,40 +198,43 @@ that current FFmpeg decoders emit for plain mono/stereo streams. `src/resample.r
 buffer-based `swr_convert` API instead, which has no such check. Demuxing and decoding still
 go through `ac-ffmpeg`.
 
-**The playback thread stays in Python.** `AudioPlayer` is a `threading.Thread` exactly as in
-`discord.py`, so `is_playing`/`pause`/`resume`/`after` behave identically; each 20ms frame is
-handed to Rust for encoding, encryption and transmission.
+**The audio player thread stays in Python**, because it is discord.py's. Each 20ms frame goes
+from that thread into Rust for encoding, encryption and transmission, so the timing model is
+identical to discord.py's while the work is native.
 
 ## Testing
 
 ```bash
 cargo test          # 22 Rust unit tests
-pytest -q           # 125 Python tests
+pytest -q           # 128 Python tests
 ```
 
 The Python suite includes:
 
 * a fake voice gateway that speaks the real protocol (HELLO, IDENTIFY, READY, UDP IP
   discovery, SELECT_PROTOCOL, SESSION_DESCRIPTION, heartbeats, DAVE opcodes) and records RTP;
-* PyNaCl interoperability tests for **all four** encryption modes in both directions;
-* DAVE tests that assert a real MLS key package (opcode 26) is produced and that transitions
-  are acknowledged;
-* end-to-end `VoiceClient` tests including playback, pause/resume, `after` callbacks,
+* PyNaCl interoperability tests for **all four** encryption modes, in both directions;
+* DAVE tests asserting a real MLS key package (opcode 26) is produced and that transitions are
+  acknowledged;
+* end-to-end `VoiceClient` tests covering playback, pause/resume, `after` callbacks,
   `disconnect`, resume-after-4015 and `discord.py` subclass checks.
 
 ## Limitations
 
 * **Receiving audio is not implemented.** `VoiceConnectionState.add_socket_listener` raises
-  `NotImplementedError`; this library covers everything `discord.py`'s own voice support
-  covers (the sending side), not the `voice_recv` extension.
-* **`-ss`/`-t` are honoured by decoding and discarding.** The in-process decoder is not
-  seeked, which keeps pipes and streams working. Options other than `-ss`/`-t`/`-to`/`-f`
-  fall back to the `ffmpeg` CLI.
+  `NotImplementedError`, matching the scope of discord.py's own voice support (the sending
+  side); the `voice_recv` use case is not covered.
+* **`before_options`/`options` always use the `ffmpeg` binary.** They are FFmpeg CLI grammar,
+  so they cannot be mapped onto the in-process decoder; the binary is invoked exactly as
+  discord.py would.
+* **A missing local file fails at construction**, not on the first `read()`, so a typo is
+  reported immediately.
 * **Wheels are dynamically linked** against the system FFmpeg and Opus.
 
-See [COMPATIBILITY.md](COMPATIBILITY.md) for the detailed API-by-API mapping.
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact list of inherited and overridden
+members, and the handful of intentional behaviour differences.
 
 ## License
 
-MIT. Parts of the Python API surface are derived from `discord.py`
-(Copyright (c) 2015-present Rapptz, MIT), and the Ogg reader is ported from the same project.
+MIT. The Python API surface this package extends belongs to
+[`discord.py`](https://github.com/Rapptz/discord.py) (Copyright (c) 2015-present Rapptz, MIT).

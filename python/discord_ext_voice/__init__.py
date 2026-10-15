@@ -1,14 +1,17 @@
-"""``discord_ext_voice`` — a ``discord.py``-compatible voice library in Rust.
+"""``discord_ext_voice`` — a Rust voice backend for ``discord.py``.
 
 Quick start::
 
+    import discord
     import discord_ext_voice as dev
 
     voice = await channel.connect(cls=dev.VoiceClient)
-    voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda e: print('done', e))
+    voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('done', error))
 
-The public surface mirrors ``discord.voice_client.VoiceClient``, ``discord.player`` and
-``discord.opus``, but the implementations are native:
+The Python layer is a thin extension of ``discord.py``: :class:`VoiceClient` subclasses
+``discord.VoiceClient`` and reuses its audio player, connection flow state machine, gateway
+opcodes and ``ffmpeg`` subprocess fallback. Everything voice-specific actually happens in
+Rust:
 
 ======================  ==========================================================
 Concern                 Rust crate
@@ -18,33 +21,28 @@ Voice gateway payloads  ``voice-model``
 RTP encryption          ``xsalsa20poly1305`` / ``chacha20poly1305``
 End-to-end encryption   ``davey`` (DAVE / MLS)
 Opus codec              ``audiopus``
-Audio decode/resample   ``ac-ffmpeg``
+Audio decode/resample   ``ac-ffmpeg`` + ``libswresample``
 Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)
 ======================  ==========================================================
 """
 
 from __future__ import annotations
 
+from discord.opus import OPUS_SILENCE
+
 from . import opus
-from ._native import (
-    CHANNELS,
-    DAVE_PROTOCOL_VERSION,
-    FRAME_LENGTH,
-    OPUS_SILENCE,
-    SAMPLES_PER_FRAME,
-    SAMPLING_RATE,
-    SUPPORTED_MODES,
-    __version__,
-    probe,
-)
+from ._native import DAVE_PROTOCOL_VERSION, SUPPORTED_MODES, __version__, probe
 from .errors import (
     AlreadyConnected,
     ClientException,
+    ConnectionClosed,
     ConnectionClosedError,
     DaveError,
+    DiscordException,
     EncryptionError,
     FFmpegError,
     FFmpegProcessError,
+    FFmpegSourceError,
     HandshakeError,
     NotConnected,
     OpusError,
@@ -53,8 +51,6 @@ from .errors import (
     VoiceError,
 )
 from .gateway import DiscordVoiceWebSocket
-from .oggparse import OggError, OggPage, OggStream
-from .opus import FRAME_SIZE, SAMPLE_SIZE
 from .player import (
     AudioPlayer,
     AudioSource,
@@ -66,6 +62,15 @@ from .player import (
 )
 from .voice_client import VoiceClient, VoiceProtocol, has_dave, has_nacl
 from .voice_state import ConnectionFlowState, VoiceConnectionState
+
+#: The geometry of one Discord voice frame. Taken from the native encoder so the Python and
+#: Rust sides cannot drift; the test suite asserts they match ``discord.opus.Encoder``.
+SAMPLES_PER_FRAME: int = opus.Encoder.SAMPLES_PER_FRAME
+FRAME_LENGTH: int = opus.Encoder.FRAME_LENGTH
+SAMPLE_SIZE: int = opus.Encoder.SAMPLE_SIZE
+FRAME_SIZE: int = opus.Encoder.FRAME_SIZE
+SAMPLING_RATE: int = opus.Encoder.SAMPLING_RATE
+CHANNELS: int = opus.Encoder.CHANNELS
 
 __all__ = (
     # clients
@@ -82,9 +87,6 @@ __all__ = (
     'FFmpegPCMAudio',
     'FFmpegOpusAudio',
     'PCMVolumeTransformer',
-    'OggStream',
-    'OggPage',
-    'OggError',
     'probe',
     # codec
     'opus',
@@ -113,5 +115,8 @@ __all__ = (
     'OpusNotLoaded',
     'FFmpegError',
     'FFmpegProcessError',
+    'FFmpegSourceError',
+    'DiscordException',
+    'ConnectionClosed',
     '__version__',
 )

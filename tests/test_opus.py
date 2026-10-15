@@ -87,7 +87,15 @@ def test_all_signal_types_build(signal):
     assert dev.opus.Encoder(signal_type=signal).encode(b'\x00' * dev.FRAME_SIZE)
 
 
-def test_is_loaded_and_load_opus_are_compatible_shims():
-    assert dev.opus.is_loaded() is True
-    assert dev.opus.load_opus() is None
-    assert dev.opus.load_opus('libopus.so.0') is None
+def test_native_encoder_needs_no_load_opus():
+    """`discord.opus` needs `load_opus` before its ctypes encoder can be built; ours cannot."""
+    import discord.opus
+
+    assert dev.opus.Encoder is not discord.opus.Encoder
+    assert len(dev.opus.Encoder().encode(b'\x00' * dev.FRAME_SIZE)) > 0
+
+
+def test_silence_packet_matches_discord_py():
+    import discord.opus
+
+    assert dev.OPUS_SILENCE == discord.opus.OPUS_SILENCE

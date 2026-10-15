@@ -16,10 +16,15 @@ classifiers = [
     "Topic :: Communications :: Conferencing",
 ]
 dynamic = ["version"]
+dependencies = [
+    # `VoiceClient` subclasses `discord.VoiceClient`, which requires PyNaCl and the Python
+    # `davey` bindings at construction time; discord.py's inherited bookkeeping also refers to
+    # them. Our own crypto and DAVE session are native, so neither is actually used by us.
+    "discord.py[voice]>=2.7",
+]
 
 [project.optional-dependencies]
-discord = ["discord.py>=2.7"]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13"]
 
 [tool.maturin]
 module-name = "discord_ext_voice._native"

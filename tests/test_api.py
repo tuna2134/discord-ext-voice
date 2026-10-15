@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 
+import discord
 import pytest
 
 import discord_ext_voice as dev
@@ -22,14 +23,9 @@ def test_module_constants_match_discord_py():
     assert dev.has_dave is True
 
 
-def test_supported_modes_order_matches_discord_py():
-    assert dev.VoiceClient.supported_modes == (
-        'aead_xchacha20_poly1305_rtpsize',
-        'xsalsa20_poly1305_lite',
-        'xsalsa20_poly1305_suffix',
-        'xsalsa20_poly1305',
-    )
-    assert list(dev.SUPPORTED_MODES) == list(dev.VoiceClient.supported_modes)
+def test_supported_modes_match_discord_py():
+    assert dev.VoiceClient.supported_modes == discord.VoiceClient.supported_modes
+    assert list(dev.SUPPORTED_MODES) == list(discord.VoiceClient.supported_modes)
 
 
 @pytest.mark.parametrize(
@@ -93,8 +89,9 @@ def test_opus_encoder_surface():
     assert encoder.FRAME_LENGTH == 20
     assert encoder.FRAME_SIZE == 3840
     assert callable(encoder.encode)
-    assert dev.opus.is_loaded() is True
-    dev.opus.load_opus()  # must be a no-op
+    # The native encoder agrees with the geometry discord.py advertises.
+    assert encoder.SAMPLES_PER_FRAME == discord.opus.Encoder.SAMPLES_PER_FRAME
+    assert encoder.FRAME_SIZE == discord.opus.Encoder.FRAME_SIZE
 
 
 def test_opus_encoder_rejects_bad_parameters():
@@ -115,12 +112,18 @@ def test_gateway_opcode_constants():
     assert ws.MLS_INVALID_COMMIT_WELCOME == 31
 
 
-def test_client_exception_is_catchable_as_voice_error():
-    assert issubclass(dev.ClientException, dev.VoiceError)
-    assert issubclass(dev.OpusNotLoaded, dev.ClientException)
-    assert issubclass(dev.FFmpegProcessError, dev.ClientException)
+def test_exception_types_line_up_with_discord():
+    assert dev.ClientException is discord.ClientException
+    assert dev.FFmpegProcessError is discord.errors.FFmpegProcessError
+    assert dev.OpusNotLoaded is discord.opus.OpusNotLoaded
+
+    # A native FFmpeg failure is catchable as either flavour.
+    assert issubclass(dev.FFmpegSourceError, dev.FFmpegError)
+    assert issubclass(dev.FFmpegSourceError, discord.ClientException)
 
 
 def test_connection_flow_state_values():
-    assert [int(state) for state in dev.ConnectionFlowState] == list(range(9))
-    assert dev.ConnectionFlowState.connected == 8
+    # discord.py's `ConnectionFlowState` is a custom Enum, so compare `.value`.
+    assert [state.value for state in dev.ConnectionFlowState] == list(range(9))
+    assert dev.ConnectionFlowState.connected.value == 8
+    assert dev.ConnectionFlowState is discord.voice_state.ConnectionFlowState

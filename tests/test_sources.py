@@ -130,17 +130,26 @@ def test_ffmpeg_pcm_audio_rejects_a_bad_source(tmp_path: Path):
         dev.FFmpegPCMAudio(str(tmp_path / 'missing.wav'))
 
 
+def test_ffmpeg_pcm_audio_fails_fast_for_a_missing_file(tmp_path: Path):
+    """Unlike discord.py this raises at construction instead of on the first read."""
+    with pytest.raises(dev.FFmpegSourceError) as info:
+        dev.FFmpegPCMAudio(tmp_path / 'missing.wav')
+    assert isinstance(info.value, dev.ClientException)
+
+
 @requires_ffmpeg
-def test_ffmpeg_pcm_audio_rejects_a_non_media_file(tmp_path: Path):
+def test_ffmpeg_pcm_audio_reports_a_non_media_file(tmp_path: Path):
     bogus = tmp_path / 'file.txt'
     bogus.write_text('not audio at all')
-    # The in-process decoder fails first, then the ffmpeg CLI fallback fails too.
-    with pytest.raises((dev.FFmpegError, dev.FFmpegProcessError)):
-        source = dev.FFmpegPCMAudio(bogus)
-        try:
-            source.read()
-        finally:
-            source.cleanup()
+    # The in-process decoder fails, the ffmpeg CLI fallback fails too, and discord.py records
+    # that in `_current_error`, which `AudioPlayer` turns into the `after` callback's error.
+    source = dev.FFmpegPCMAudio(bogus)
+    try:
+        while source.read():
+            pass
+        assert isinstance(source._current_error, dev.ClientException)
+    finally:
+        source.cleanup()
 
 
 @requires_ffmpeg
@@ -251,7 +260,11 @@ def test_volume_transformer_scales_samples(sine_wav: Path):
         transformer.cleanup()
 
 
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
 def test_volume_transformer_rejects_opus_sources(opus_file: Path):
+    # `discord.PCMVolumeTransformer` raises before setting `self.original`, so its
+    # `AudioSource.__del__` -> `cleanup()` path raises again during garbage collection.
+    # That is discord.py's behaviour, reused verbatim.
     source = dev.FFmpegOpusAudio(str(opus_file))
     try:
         with pytest.raises(dev.ClientException):
@@ -260,8 +273,17 @@ def test_volume_transformer_rejects_opus_sources(opus_file: Path):
         source.cleanup()
 
 
-def test_volume_transformer_cleanup_is_forwarded(sine_wav: Path):
-    original = dev.FFmpegPCMAudio(str(sine_wav))
-    transformer = dev.PCMVolumeTransformer(original)
+def test_volume_transformer_forwards_cleanup():
+    """`discord.PCMVolumeTransformer` is reused as-is, so cleanup must still be forwarded."""
+    cleaned: list[bool] = []
+
+    class Source(dev.AudioSource):
+        def read(self) -> bytes:
+            return b'\x00' * dev.FRAME_SIZE
+
+        def cleanup(self) -> None:
+            cleaned.append(True)
+
+    transformer = dev.PCMVolumeTransformer(Source(), 0.5)
     transformer.cleanup()
-    assert original.read() == b''
+    assert cleaned == [True]

@@ -37,7 +37,6 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<source::PyOpusSource>()?;
     module.add_class::<opus::PyOpusEncoder>()?;
     module.add_class::<opus::PyOpusDecoder>()?;
-    module.add_class::<source::PyVolumeTransformer>()?;
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
 
     // Constants mirroring `discord.opus` and `discord.voice_client`.

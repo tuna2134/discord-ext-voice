@@ -18,14 +18,17 @@ import discord.voice_client as discord_voice_client  # noqa: E402
 import discord_ext_voice as dev  # noqa: E402
 
 
-def test_voice_client_is_a_discord_voice_protocol():
+def test_voice_client_is_a_discord_voice_client():
     assert issubclass(dev.VoiceClient, discord_voice_client.VoiceProtocol)
+    assert issubclass(dev.VoiceClient, discord_voice_client.VoiceClient)
     assert issubclass(dev.VoiceClient, discord.VoiceProtocol)
+    assert issubclass(dev.VoiceClient, discord.VoiceClient)
 
 
-def test_client_exception_is_also_a_discord_client_exception():
-    assert issubclass(dev.ClientException, discord.errors.ClientException)
-    assert issubclass(dev.ClientException, dev.VoiceError)
+def test_the_discord_exception_types_are_reused():
+    assert dev.ClientException is discord.errors.ClientException
+    assert dev.FFmpegProcessError is discord.errors.FFmpegProcessError
+    assert dev.OpusNotLoaded is discord.opus.OpusNotLoaded
 
 
 def test_voice_client_constructor_signature_matches_discord():
@@ -40,10 +43,35 @@ def test_connect_signature_is_accepted_by_discord():
     assert set(ours.parameters) == set(theirs.parameters)
 
 
-def test_discord_speaking_state_is_used():
-    assert dev.gateway.SpeakingState is discord.SpeakingState
-    assert int(dev.gateway.SpeakingState.voice) == 1
-    assert int(dev.gateway.SpeakingState.priority) == 4
+def test_voice_websocket_reuses_discord_gateway():
+    import discord.gateway
+
+    assert issubclass(dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket)
+    # The opcode constants and every outgoing frame builder are discord.py's.
+    assert dev.DiscordVoiceWebSocket.IDENTIFY == 0
+    assert dev.DiscordVoiceWebSocket.MLS_INVALID_COMMIT_WELCOME == 31
+    for name in ('send_as_json', 'send_binary', 'speak', 'identify', 'resume', 'select_protocol'):
+        assert (
+            getattr(dev.DiscordVoiceWebSocket, name)
+            is getattr(discord.gateway.DiscordVoiceWebSocket, name)
+        ), f'{name} should be inherited from discord.py'
+
+
+def test_discord_implementations_are_reused_verbatim():
+    """The point of the dependency: no re-implementation of discord.py's voice plumbing."""
+    import discord.gateway
+    import discord.player
+    import discord.voice_state
+
+    assert dev.AudioPlayer is discord.player.AudioPlayer
+    assert dev.PCMAudio is discord.player.PCMAudio
+    assert dev.PCMVolumeTransformer is discord.player.PCMVolumeTransformer
+    assert dev.AudioSource is discord.player.AudioSource
+    assert issubclass(dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio)
+    assert issubclass(dev.FFmpegOpusAudio, discord.player.FFmpegOpusAudio)
+    assert issubclass(dev.VoiceConnectionState, discord.voice_state.VoiceConnectionState)
+    assert dev.ConnectionFlowState is discord.voice_state.ConnectionFlowState
+    assert dev.VoiceProtocol is discord.voice_client.VoiceProtocol
 
 
 def test_discord_voice_protocol_contract_methods_exist():

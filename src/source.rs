@@ -24,7 +24,7 @@ use ac_ffmpeg::format::io::IO;
 use ac_ffmpeg::format::stream::Stream;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyBytesMethods, PyDict};
+use pyo3::types::{PyBytes, PyDict};
 
 use crate::errors::FFmpegError;
 use crate::resample::StereoResampler;
@@ -633,84 +633,5 @@ mod tests {
         let mut file = File::open("/dev/null").unwrap();
         let mut buf = [0u8; 8];
         assert_eq!(file.read(&mut buf).unwrap(), 0);
-    }
-}
-
-/// Applies a volume multiplier to another `AudioSource`, replacing `discord.py`'s
-/// `PCMVolumeTransformer` (which relied on the removed `audioop` module).
-#[pyclass(module = "discord_ext_voice._native", name = "VolumeTransformer")]
-pub struct PyVolumeTransformer {
-    original: Py<PyAny>,
-    volume: Mutex<f64>,
-}
-
-#[pymethods]
-impl PyVolumeTransformer {
-    #[new]
-    #[pyo3(signature = (original, volume=1.0))]
-    fn new(original: Py<PyAny>, volume: f64) -> Self {
-        Self {
-            original,
-            volume: Mutex::new(volume.max(0.0)),
-        }
-    }
-
-    #[getter]
-    fn volume(&self) -> f64 {
-        *self.volume.lock()
-    }
-
-    #[setter]
-    fn set_volume(&self, value: f64) {
-        *self.volume.lock() = value.max(0.0);
-    }
-
-    /// Read from the wrapped source and scale every sample.
-    fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let original = self.original.bind(py);
-        let data = original.call_method0("read")?;
-        let bytes: Vec<u8> = if let Ok(bytes) = data.cast::<PyBytes>() {
-            bytes.as_bytes().to_vec()
-        } else {
-            data.extract()?
-        };
-
-        // `discord.py` clamps the applied factor at 2.0 and `audioop.mul` saturates.
-        let factor = self.volume.lock().min(2.0);
-        if (factor - 1.0).abs() < f64::EPSILON {
-            return Ok(PyBytes::new(py, &bytes));
-        }
-
-        let mut scaled = Vec::with_capacity(bytes.len());
-        for chunk in bytes.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-            let value =
-                (f64::from(sample) * factor).clamp(f64::from(i16::MIN), f64::from(i16::MAX));
-            scaled.extend_from_slice(&(value as i16).to_le_bytes());
-        }
-        if bytes.len() % 2 == 1 {
-            scaled.push(bytes[bytes.len() - 1]);
-        }
-        Ok(PyBytes::new(py, &scaled))
-    }
-
-    fn is_opus(&self, py: Python<'_>) -> PyResult<bool> {
-        self.original.bind(py).call_method0("is_opus")?.extract()
-    }
-
-    fn cleanup(&self, py: Python<'_>) -> PyResult<()> {
-        let original = self.original.bind(py);
-        if original.hasattr("cleanup")? {
-            original.call_method0("cleanup")?;
-        }
-        Ok(())
-    }
-
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        Ok(format!(
-            "<discord_ext_voice.VolumeTransformer volume={} original={:?}>",
-            self.volume(),
-            self.original.bind(py)
-        ))
     }
 }

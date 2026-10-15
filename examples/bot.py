@@ -42,7 +42,10 @@ async def on_message(message: discord.Message) -> None:
             await message.reply('join a voice channel first')
             return
         voice = await message.author.voice.channel.connect(cls=dev.VoiceClient)
-        print(f'connected to {voice.channel} (mode={voice.mode}, dave={voice.dave_protocol_version})')
+        print(
+            f'connected to {voice.channel} '
+            f'(mode={voice.mode}, dave={voice.native.dave_protocol_version})'
+        )
 
     elif message.content == '!play':
         voice = message.guild.voice_client

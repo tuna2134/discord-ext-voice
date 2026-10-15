@@ -69,11 +69,13 @@ class FakeGuild:
             if channel is None:
                 await voice.on_voice_state_update({'channel_id': None})
                 return
-            await voice.on_voice_state_update(
-                {'channel_id': str(channel.id), 'session_id': 'session-1'}
-            )
+            # Server update first: discord.py's reconnect path (close code 4015) only reaches
+            # `ConnectionFlowState.got_both_voice_updates` in that order.
             await voice.on_voice_server_update(
                 {'token': 'voice-token', 'guild_id': str(GUILD_ID), 'endpoint': endpoint}
+            )
+            await voice.on_voice_state_update(
+                {'channel_id': str(channel.id), 'session_id': 'session-1'}
             )
 
         self._dispatch = asyncio.get_running_loop().create_task(dispatch())
@@ -93,6 +95,8 @@ class FakeClient:
     def __init__(self) -> None:
         self._connection = FakeConnectionState()
         self.endpoint: str | None = None
+        # `discord.player.AudioPlayer._speak` schedules `ws.speak` on `client.loop`.
+        self.loop = asyncio.get_running_loop()
 
 
 async def make_client(gateway: FakeVoiceGateway) -> tuple[FakeClient, FakeChannel]:
@@ -124,7 +128,9 @@ async def test_connect_establishes_the_native_session(gateway_factory):
         assert voice.is_connected() is True
         assert voice.session_id == 'session-1'
         assert voice.token == 'voice-token'
-        assert voice.endpoint == gateway.endpoint.replace('ws://', '', 1)
+        # discord.py strips only the `wss://` scheme; a plaintext gateway endpoint is kept
+        # verbatim and the native transport understands the `ws://` prefix.
+        assert voice.endpoint == gateway.endpoint
         assert voice.ssrc == SSRC
         assert voice.mode == 'aead_xchacha20_poly1305_rtpsize'
         assert len(voice.secret_key) == 32
@@ -146,13 +152,14 @@ async def test_connect_asks_the_guild_to_change_voice_state(gateway_factory):
         await voice.disconnect()
 
 
-async def test_internal_socket_is_not_required_to_connect(gateway_factory):
-    """`dialect` compatibility: `socket` exists even though it is native."""
+async def test_native_connection_is_exposed(gateway_factory):
+    """The transport lives in Rust; Python only holds a handle plus discord.py's state."""
     gateway = await gateway_factory()
     client, channel = await make_client(gateway)
     voice = await join(client, channel)
     try:
-        assert voice._connection.socket is not None
+        assert voice.native is voice._connection.native
+        assert voice.native.is_connected() is True
         assert voice._connection.supported_modes == dev.VoiceClient.supported_modes
         assert voice._connection.max_dave_protocol_version == dev.DAVE_PROTOCOL_VERSION
     finally:
@@ -365,7 +372,8 @@ async def test_voice_privacy_code_is_none_without_dave(gateway_factory):
     voice = await join(client, channel)
     try:
         assert voice.voice_privacy_code is None
-        assert voice.dave_protocol_version == 0
+        assert voice._connection.dave_protocol_version == 0
+        assert voice._connection.dave_session is None
     finally:
         await voice.disconnect()
 
@@ -375,7 +383,7 @@ async def test_dave_is_negotiated_when_the_server_offers_it(gateway_factory):
     client, channel = await make_client(gateway)
     voice = await join(client, channel)
     try:
-        assert voice.dave_protocol_version == 1
+        assert voice._connection.dave_protocol_version == 1
         assert voice._connection.dave_session is not None
         # The MLS group is not ready yet, so payloads stay in plaintext until it is.
         assert voice._connection.can_encrypt is False

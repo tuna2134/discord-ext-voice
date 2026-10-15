@@ -1,13 +1,21 @@
-"""Exception types raised by :mod:`discord_ext_voice`.
+"""Exception types.
 
-The native core raises ``VoiceError`` subclasses; this module lines them up with the names
-``discord.py`` uses so that ``except discord.ClientException`` style code keeps working when
-the library is plugged into a real ``discord.py`` bot.
+The native core raises ``VoiceError`` subclasses. Where ``discord.py`` defines an equivalent
+error, that class is reused (or subclassed) so ``except discord.ClientException`` keeps
+working for code that mixes both clients.
 """
 
 from __future__ import annotations
 
-from ._native import (
+from discord.errors import (  # noqa: F401  (re-exported)
+    ClientException,
+    ConnectionClosed,
+    DiscordException,
+    FFmpegProcessError,
+)
+from discord.opus import OpusNotLoaded  # noqa: F401  (re-exported)
+
+from ._native import (  # noqa: F401  (re-exported)
     AlreadyConnected,
     ConnectionClosedError,
     DaveError,
@@ -20,37 +28,9 @@ from ._native import (
     VoiceError,
 )
 
-try:  # pragma: no cover - depends on whether discord.py is installed
-    from discord.errors import ClientException as _DiscordClientException
-except Exception:  # pragma: no cover
-    _DiscordClientException = None
-
-
-if _DiscordClientException is not None:
-
-    class ClientException(_DiscordClientException, VoiceError):  # type: ignore[misc]
-        """Mirrors ``discord.ClientException`` so both ``except`` clauses catch it."""
-
-else:
-
-    class ClientException(VoiceError):  # type: ignore[no-redef]
-        """Raised for the same reasons ``discord.ClientException`` would be."""
-
-
-class OpusNotLoaded(ClientException):
-    """Raised when a PCM source is used but no Opus encoder is available.
-
-    The native core always links libopus, so this is only raised for API compatibility.
-    """
-
-
-class FFmpegProcessError(ClientException):
-    """Raised when the ``ffmpeg`` fallback process exits with an error."""
-
-
 __all__ = (
+    # native
     'VoiceError',
-    'ClientException',
     'NotConnected',
     'AlreadyConnected',
     'HandshakeError',
@@ -59,7 +39,20 @@ __all__ = (
     'EncryptionError',
     'DaveError',
     'OpusError',
-    'OpusNotLoaded',
     'FFmpegError',
+    'FFmpegSourceError',
+    # discord.py's
+    'ClientException',
+    'ConnectionClosed',
+    'DiscordException',
     'FFmpegProcessError',
+    'OpusNotLoaded',
 )
+
+
+class FFmpegSourceError(ClientException, FFmpegError):
+    """FFmpeg could not open or decode an audio source.
+
+    Inherits from both :class:`discord.ClientException` (what ``discord.py`` raises for a bad
+    source) and the native :class:`FFmpegError`, so either ``except`` clause catches it.
+    """

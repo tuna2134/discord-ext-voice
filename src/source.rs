@@ -18,7 +18,10 @@ use std::path::PathBuf;
 
 use ac_ffmpeg::codec::Decoder;
 use ac_ffmpeg::codec::audio::AudioDecoder;
-use ac_ffmpeg::codec::audio::frame::AudioFrame;
+use ac_ffmpeg::codec::audio::AudioResampler;
+use ac_ffmpeg::codec::audio::frame::{
+    AudioFrame, ChannelLayout, SampleFormat, get_channel_layout, get_sample_format,
+};
 use ac_ffmpeg::format::demuxer::{Demuxer, DemuxerWithStreamInfo};
 use ac_ffmpeg::format::io::IO;
 use ac_ffmpeg::format::stream::Stream;
@@ -27,7 +30,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::errors::FFmpegError;
-use crate::resample::StereoResampler;
 use crate::{log_debug, log_info};
 
 /// One 20ms frame of 48kHz stereo signed 16 bit PCM.
@@ -206,7 +208,10 @@ pub struct DecodeSource {
     demuxer: Demuxer<Input>,
     stream_index: usize,
     decoder: AudioDecoder,
-    resampler: Option<StereoResampler>,
+    resampler: Option<AudioResampler>,
+    /// The parameters the current resampler was built for, so it can be rebuilt when the
+    /// decoder's output changes mid-stream.
+    resampler_source: Option<(SampleFormat, u32, ChannelLayout)>,
     pending: VecDeque<u8>,
     input_done: bool,
     flushed: bool,
@@ -233,6 +238,7 @@ impl DecodeSource {
             stream_index,
             decoder,
             resampler: None,
+            resampler_source: None,
             pending: VecDeque::new(),
             input_done: false,
             flushed: false,
@@ -241,47 +247,69 @@ impl DecodeSource {
     }
 
     /// Feed one decoded frame through the resampler and buffer the resulting stereo PCM.
+    /// Feed one decoded frame through the resampler and buffer the resulting stereo PCM.
     fn push_decoded(&mut self, frame: AudioFrame) -> Result<(), PyErr> {
-        let format_name = frame.sample_format().name();
-        let sample_rate = frame.sample_rate();
-        let channels = frame.channel_layout().channels();
+        let parameters = (
+            frame.sample_format(),
+            frame.sample_rate(),
+            frame.channel_layout().to_owned(),
+        );
 
-        let rebuild = match self.resampler.as_ref() {
-            None => true,
-            Some(resampler) => !resampler.matches(format_name, sample_rate, channels),
-        };
-        if rebuild {
+        if self.resampler.is_none() || self.resampler_source.as_ref() != Some(&parameters) {
             log_debug!(
-                "building a resampler: {format_name} {sample_rate}Hz {channels}ch -> s16 48000Hz stereo"
+                "building a resampler: {} {}Hz {}ch -> s16 48000Hz stereo",
+                parameters.0.name(),
+                parameters.1,
+                parameters.2.channels()
             );
-            self.resampler = Some(
-                StereoResampler::new(format_name, sample_rate, channels, TARGET_SAMPLE_RATE)
-                    .map_err(ffmpeg_err)?,
-            );
+            let resampler = AudioResampler::builder()
+                .source_channel_layout(parameters.2.clone())
+                .source_sample_format(parameters.0)
+                .source_sample_rate(parameters.1)
+                .target_channel_layout(get_channel_layout("stereo"))
+                .target_sample_format(get_sample_format("s16"))
+                .target_sample_rate(TARGET_SAMPLE_RATE)
+                .target_frame_samples(Some(FRAME_SAMPLES))
+                .build()
+                .map_err(|err| {
+                    ffmpeg_err(format!("FFmpeg could not build the resampler: {err}"))
+                })?;
+            self.resampler = Some(resampler);
+            self.resampler_source = Some(parameters);
         }
 
-        let samples = frame.samples();
-        let planes = frame.planes();
-        let borrowed: Vec<&[u8]> = planes.iter().map(|plane| plane.data()).collect();
-        let mut converted = Vec::new();
-
-        let Some(resampler) = self.resampler.as_mut() else {
-            return Ok(());
-        };
+        let resampler = self.resampler.as_mut().expect("resampler just built");
         resampler
-            .convert(&borrowed, samples, &mut converted)
-            .map_err(ffmpeg_err)?;
+            .push(frame)
+            .map_err(|err| ffmpeg_err(format!("FFmpeg resampler error: {err}")))
+    }
 
-        if converted.is_empty() {
-            return Ok(());
+    /// Move every resampled frame the resampler has ready into `pending`.
+    fn drain_resampler(&mut self) -> Result<(), PyErr> {
+        loop {
+            let frame = match self.resampler.as_mut() {
+                Some(resampler) => resampler
+                    .take()
+                    .map_err(|err| ffmpeg_err(format!("FFmpeg resampler error: {err}")))?,
+                None => return Ok(()),
+            };
+
+            match frame {
+                Some(frame) => {
+                    if let Some(plane) = frame.planes().first() {
+                        self.pending.extend(plane.data().iter().copied());
+                    }
+                }
+                None => return Ok(()),
+            }
         }
-        self.pending.extend(converted.iter().copied());
-        Ok(())
     }
 
     /// Advance the pipeline until at least one 20ms frame is buffered or the input ends.
     fn pump(&mut self) -> Result<(), PyErr> {
         loop {
+            self.drain_resampler()?;
+
             if self.pending.len() >= FRAME_BYTES || self.finished {
                 return Ok(());
             }
@@ -302,9 +330,9 @@ impl DecodeSource {
                         .flush()
                         .map_err(|err| ffmpeg_err(format!("FFmpeg decoder flush failed: {err}")))?;
                     if let Some(resampler) = self.resampler.as_mut() {
-                        let mut converted = Vec::new();
-                        resampler.flush(&mut converted).map_err(ffmpeg_err)?;
-                        self.pending.extend(converted.iter().copied());
+                        resampler.flush().map_err(|err| {
+                            ffmpeg_err(format!("FFmpeg resampler flush failed: {err}"))
+                        })?;
                     }
                     continue;
                 }

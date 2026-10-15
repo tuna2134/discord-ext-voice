@@ -32,6 +32,11 @@ dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5"]
 module-name = "discord_ext_voice._native"
 python-source = "python"
 features = ["extension-module", "abi3"]
+# `cargo package` leaves path dependencies out of the sdist, so the vendored, patched
+# `ac-ffmpeg` has to be added back explicitly (see vendor/README.md).
+include = [{ path = "vendor/ac-ffmpeg/**/*", format = "sdist" }]
+# The reference `discord.py` checkout some working copies carry is not part of this package.
+exclude = ["discord.py/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

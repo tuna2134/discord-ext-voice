@@ -29,7 +29,7 @@ Everything that must be native is native — and that is the whole voice protoco
 | RTP encryption (all four modes) | Rust: `xsalsa20poly1305` / `chacha20poly1305` |
 | DAVE end-to-end encryption (MLS) | Rust: `davey` |
 | Opus codec | Rust: `audiopus` (libopus) |
-| Audio decode + resample | Rust: `ac-ffmpeg` + `libswresample` |
+| Audio decode + resample | Rust: `ac-ffmpeg` (vendored with one upstream fix, see [vendor/README.md](vendor/README.md)) |
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
@@ -44,8 +44,10 @@ Everything that must be native is native — and that is the whole voice protoco
   `aead_xchacha20_poly1305_rtpsize` are implemented natively, including the incrementing nonce
   behaviour discord.py relies on. The test suite decrypts every mode with PyNaCl to prove
   byte-level compatibility.
-* **No `ffmpeg` subprocess for local media.** `FFmpegPCMAudio` decodes and resamples in
-  process with libav; the binary is only used for URLs, pipes and explicit CLI options.
+* **No `ffmpeg` subprocess for local media.** `FFmpegPCMAudio` demuxes, decodes and resamples
+  in process with libav; the binary is only used for URLs, pipes and explicit CLI options.
+  Getting there needed one upstream fix to `ac-ffmpeg` — see
+  [vendor/README.md](vendor/README.md).
 * **Encoding, encryption and the UDP send happen in Rust**, so playback jitter does not
   compete with Python work — the Python player thread just hands Rust 20ms of PCM.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
@@ -76,8 +78,8 @@ sudo pacman -S pkgconf ffmpeg opus
 ```
 
 At runtime the extension is **dynamically linked** against those FFmpeg and Opus libraries.
-Building fully self-contained wheels would mean vendoring and statically linking FFmpeg, which
-is deliberately out of scope.
+Building fully self-contained wheels would mean statically linking FFmpeg, which is deliberately
+out of scope.
 
 ## Install
 
@@ -86,6 +88,9 @@ python -m venv .venv && . .venv/bin/activate
 pip install maturin
 maturin develop --release
 ```
+
+`ac-ffmpeg` is vendored in-tree (`vendor/ac-ffmpeg`, patched — see
+[vendor/README.md](vendor/README.md)), so a plain checkout builds without any extra step.
 
 Only plain `discord.py` is required. `discord.py[voice]` (PyNaCl + the Python `davey`
 bindings) is **not** needed: `VoiceClient` implements `VoiceProtocol` directly, so discord.py's
@@ -190,7 +195,6 @@ src/                             # the core
 ├── crypto.rs                    # the four RTP encryption modes
 ├── dave.rs                      # DAVE/MLS session and transition state machine
 ├── opus.rs                      # libopus encode/decode
-├── resample.rs                  # libswresample driver (48kHz stereo s16)
 └── source.rs                    # FFmpeg-backed audio sources
 ```
 
@@ -207,11 +211,14 @@ top-level member without consuming its value, and Discord's voice gateway sends 
 alongside `op`/`d`. Every incoming frame is filtered down to `op` + `d` (recording `seq` for
 `RESUME`) and re-parsed from text.
 
-**Resampling talks to libswresample directly.** `ac-ffmpeg`'s `AudioResampler` wraps
-`swr_convert_frame`, whose per-frame parameter check rejects the *unspecified* channel layouts
-that current FFmpeg decoders emit for plain mono/stereo streams. `src/resample.rs` drives the
-buffer-based `swr_convert` API instead, which has no such check. Demuxing and decoding still
-go through `ac-ffmpeg`.
+**`ac-ffmpeg` is vendored with one resampler fix.** Its `AudioResampler` hands frames straight
+to `swr_convert_frame`, which rejects the *unspecified* channel layouts that current FFmpeg
+decoders emit for plain PCM streams (`AVERROR_INPUT_CHANGED`, "Input changed"), and its public
+API offers no configuration that avoids it. `vendor/ac-ffmpeg` is upstream `09f1421`
+(release 0.19.0) plus a small fix that normalises the layout of a shallow frame copy before
+converting, exported as `patches/0001-resampler-accept-unspecified-channel-layout.patch` for
+upstream. Dropping the vendored copy once a fixed release exists is a three line change; see
+[vendor/README.md](vendor/README.md).
 
 **The audio player thread stays in Python**, because it is discord.py's. Each 20ms frame goes
 from that thread into Rust for encoding, encryption and transmission, so the timing model is
@@ -220,7 +227,7 @@ identical to discord.py's while the work is native.
 ## Testing
 
 ```bash
-cargo test          # 22 Rust unit tests
+cargo test          # 16 Rust unit tests
 pytest -q           # 128 Python tests (the interop module skips itself without PyNaCl)
 ```
 

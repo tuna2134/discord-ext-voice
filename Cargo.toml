@@ -60,6 +60,17 @@ thiserror = "2"
 parking_lot = "0.12"
 rand = "0.8"
 
+[workspace]
+# `vendor/ac-ffmpeg` is a workspace of its own (see vendor/README.md). Excluding it keeps
+# `cargo fmt`, `clippy` and `test` from ever wandering into the vendored sources.
+exclude = ["vendor/ac-ffmpeg"]
+
+# The vendored copy carries one fix on top of the released 0.19.0: its audio resampler
+# rejected the unspecified channel layouts that current FFmpeg decoders produce for plain PCM
+# streams (`AVERROR_INPUT_CHANGED`). See vendor/ac-ffmpeg and patches/.
+[patch.crates-io]
+ac-ffmpeg = { path = "vendor/ac-ffmpeg/ac-ffmpeg" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

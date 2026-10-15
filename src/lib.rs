@@ -8,7 +8,7 @@
 //!   `aead_xchacha20_poly1305_rtpsize`).
 //! * [`dave`] — the DAVE/MLS end-to-end encryption session built on `davey`.
 //! * [`opus`] — Opus encode/decode built on `audiopus`.
-//! * [`source`] — in-process FFmpeg decoding/resampling built on `ac-ffmpeg`.
+//! * [`source`] — in-process FFmpeg demuxing, decoding and resampling built on `ac-ffmpeg`.
 //! * [`connection`] — the `VoiceConnection` Python object tying it all together.
 //!
 //! The protocol payload types come from the `voice-model` crate (published as
@@ -22,7 +22,6 @@ mod dave;
 mod errors;
 mod logging;
 mod opus;
-mod resample;
 mod source;
 mod transport;
 

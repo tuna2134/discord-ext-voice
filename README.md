@@ -29,13 +29,13 @@ Everything that must be native is native — and that is the whole voice protoco
 | UDP socket, IP discovery, heartbeat, RTP | Rust |
 | RTP encryption (all four modes) | Rust: `xsalsa20poly1305` / `chacha20poly1305` |
 | DAVE end-to-end encryption (MLS) | Rust: `davey` |
-| Opus codec | Rust: `audiopus` (libopus) |
+| Opus codec | Rust: `oprs` (libopus 1.6.1, ported to pure Rust) |
 | Audio decode + resample | Rust: `symphonia` (containers, codecs) + `rubato` (sample rates) |
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
 | Connection flow, reconnect policy | Rust: `_native.ConnectionFlow` (phases, close codes, retries, backoff), driven by `discord_ext_voice.voice_state` |
-| Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `symphonia` / `rubato` / `libopus` |
+| Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `symphonia` / `rubato` / `oprs` |
 | `http(s)` inputs | `reqwest` (rustls, no OpenSSL), streamed straight into the decoder |
 | Playback clock (the player thread) | Rust: `discord_ext_voice.player` (20ms pacing, silence, speaking) |
 | Voice gateway opcodes and frame surface | This package: `discord_ext_voice.gateway` (Discord's opcode values) |
@@ -49,9 +49,9 @@ Everything that must be native is native — and that is the whole voice protoco
   byte-level compatibility.
 * **No FFmpeg, in any form.** The audio sources are this package's own
   (`discord_ext_voice.sources`): `symphonia` demuxes and decodes in process, `rubato` converts
-  the sample rate, `libopus` (through `audiopus`) handles Opus — which symphonia has no decoder
-  for — and `seek=` replaces `-ss`. No `ffmpeg` binary, no C library to install, no child
-  process to reap: the extension links nothing but libc and libopus.
+  the sample rate, `oprs` (libopus 1.6.1, ported to pure Rust) handles Opus — which symphonia has
+  no decoder for — and `seek=` replaces `-ss`. No `ffmpeg` binary, no C library, no child process:
+  the extension links nothing but libc.
 * **Encoding, encryption, the UDP send and the playback clock itself happen in Rust**, so
   playback jitter does not compete with Python work — the player reads one frame from the source
   and paces it against a native 20ms clock.
@@ -72,27 +72,15 @@ Runtime:
 Build time:
 
 * Rust 1.85 or newer (edition 2024)
-* `pkg-config`
-* `libopus` development libraries
+* `git`, for the first build: `oprs` is not on crates.io yet, so Cargo fetches it from
+  [its repository](https://github.com/tuna2134/oprs) once and `Cargo.lock` pins the commit
 
-Nothing else: the demuxers, decoders and resamplers are pure Rust (`symphonia`, `rubato`).
+Nothing else — no `pkg-config`, no C library: the demuxers, decoders, the resampler and the Opus
+codec are all pure Rust (`symphonia`, `rubato`, `oprs`).
 
-Debian/Ubuntu:
-
-```bash
-sudo apt install pkg-config libopus-dev
-```
-
-Arch:
-
-```bash
-sudo pacman -S pkgconf opus
-```
-
-A wheel from the package index is **self-contained**: `maturin` bundles the one library the
-extension links against (`libopus`) into `discord_ext_voice.libs/` and points the extension's
-RPATH at it, so nothing has to be installed to run it. A wheel is around 8MB; a build from source
-links against the system libopus instead.
+A wheel from the package index is **self-contained**: the extension links nothing but libc, so
+there is nothing to bundle and nothing to install. A wheel is around 5MB; a build from source is
+the same, except that it fetches `oprs` from its repository once.
 
 ## Install
 
@@ -182,7 +170,7 @@ and decodes in process with `symphonia` — no FFmpeg, no binary:
 | --- | --- |
 | `PCMAudio(stream)` | Raw 16-bit 48kHz stereo PCM from a file object |
 | `FFmpegPCMAudio(source, *, seek=None, headers=None)` | `symphonia` + `rubato` decode and resample to 48kHz stereo `s16` |
-| `FFmpegOpusAudio(source, *, seek=None, headers=None)` | Opus packets passed through, otherwise PCM + libopus |
+| `FFmpegOpusAudio(source, *, seek=None, headers=None)` | Opus packets passed through, otherwise PCM + `oprs` |
 | `PCMVolumeTransformer(source, volume)` | Volume, scaled by the native core (no `audioop`) |
 | `AudioPlayer(source, client, after=...)` | This package: a thin wrapper over the native playback thread |
 
@@ -284,7 +272,7 @@ src/                             # the core
 ├── transport.rs                 # websocket + UDP actor, heartbeat, IP discovery
 ├── crypto.rs                    # the four RTP encryption modes
 ├── dave.rs                      # DAVE/MLS session and transition state machine
-├── opus.rs                      # libopus encode/decode
+├── opus.rs                      # Opus encode/decode (oprs)
 └── source.rs                    # audio sources: symphonia decoding, files, objects, http(s)
 ```
 
@@ -303,7 +291,7 @@ alongside `op`/`d`. Every incoming frame is filtered down to `op` + `d` (recordi
 
 **Decoding is pure Rust.** `symphonia` reads the container and decodes the codec, `rubato`
 converts anything that is not already 48kHz stereo, and Opus packets — the one codec symphonia
-has no decoder for — go to libopus through `audiopus`, the same library the encoder uses. A
+has no decoder for — go to `oprs`, the same pure-Rust libopus port the encoder uses. A
 44.1kHz MP3 is therefore resampled in process, and a WebM/Opus stream (what a YouTube URL
 gives) is demuxed by symphonia and decoded by libopus.
 
@@ -322,8 +310,9 @@ waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — 
 ## Testing
 
 ```bash
-cargo test --lib    # 40 Rust unit tests
-pytest -q           # 182 Python tests (6 crypto interop tests need PyNaCl; 1 live URL test skipped)
+cargo test --lib    # 41 Rust unit tests
+pytest -q           # 183 Python tests, 4 skipped (6 crypto interop tests need PyNaCl; 3 libopus
+                    # oracle tests need DISCORD_EXT_VOICE_OPUS_ORACLE=1; 1 live URL test needs a URL)
 ```
 
 The Python suite includes:
@@ -343,6 +332,9 @@ The Python suite includes:
   upstream signature change is caught here rather than in a bot;
 * `tests/test_stream_live.py` plays a real extractor URL (with its `http_headers`) through the
   whole stack — opt-in, via `DISCORD_EXT_VOICE_LIVE_URL`, because it needs the network;
+* `tests/test_opus.py` compares the encoder with the system libopus, packet for packet and PCM for
+  PCM — opt-in, via `DISCORD_EXT_VOICE_OPUS_ORACLE=1`, because it only means anything when that
+  libopus is the version `oprs` ports (1.6.1);
 * `tests/test_flow.py` for the native connection flow: the phase round-trip, the waiting
   primitives (including the timeout contract), and that every action Rust can return has a name
   in Python. The transition table itself is unit-tested in `src/flow.rs`.

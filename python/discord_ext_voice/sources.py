@@ -3,8 +3,8 @@
 Every source here is implemented in this package and decodes in process:
 
 * ``symphonia`` for containers and codecs, and ``rubato`` for sample rates,
-* ``libopus`` (through ``audiopus``) for Opus, both the packets the encoder produces and the
-  ones a stream already carries.
+* ``oprs`` (libopus ported to pure Rust) for Opus, both the packets the encoder produces and
+  the ones a stream already carries.
 
 There is no FFmpeg anywhere, which is why discord.py's FFmpeg-CLI arguments
 (``executable``, ``pipe``, ``stderr``, ``before_options``, ``options``, ``force_cli``) do not

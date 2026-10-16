@@ -1,9 +1,9 @@
 """Opus encoding and decoding.
 
-The :class:`Encoder` and :class:`Decoder` here are the native ones (libopus through
-``audiopus``), which means they work without ``discord.opus.load_opus``. The parameter type
-aliases come from :mod:`discord.opus` so the two implementations can never disagree, and the
-silence packet is the native constant the player sends.
+The :class:`Encoder` and :class:`Decoder` here are the native ones (`oprs`, a pure-Rust port of
+libopus 1.6.1), which means they work without ``discord.opus.load_opus`` and without a C library.
+The parameter type aliases come from :mod:`discord.opus` so the two implementations can never
+disagree, and the silence packet is the native constant the player sends.
 """
 
 from __future__ import annotations

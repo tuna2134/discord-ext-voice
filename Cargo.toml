@@ -1,8 +1,8 @@
 [package]
 name = "discord-ext-voice"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A discord.py VoiceClient-compatible voice library built on pyo3, tokio-tungstenite, symphonia, davey and audiopus"
+description = "A discord.py VoiceClient-compatible voice library built on pyo3, tokio-tungstenite, symphonia, oprs and davey"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/tuna2134/discord-ext-voice"
@@ -41,8 +41,8 @@ futures-util = "0.3"
 
 # Audio demuxing, decoding and resampling, all in pure Rust: `symphonia` for the containers and
 # codecs, `rubato` for the sample-rate conversion that libswresample used to do. Opus is the one
-# codec symphonia has no decoder for, so those packets go to `audiopus` (the same libopus the
-# encoder already uses).
+# codec symphonia has no decoder for, so those packets go to `oprs` (the same pure-Rust codec
+# the encoder uses).
 symphonia = { version = "0.6", default-features = false, features = [
     "aac", "adpcm", "aiff", "alac", "flac", "isomp4", "mkv", "mpa", "mp3", "ogg", "pcm",
     "vorbis", "wav", "all-meta", "opt-simd",
@@ -66,8 +66,10 @@ voice-model = { package = "serenity-voice-model", version = "0.3" }
 # Discord Audio & Video End-to-End Encryption (DAVE) / MLS
 davey = "0.1.4"
 
-# Opus codec
-audiopus = "0.3.0-rc.0"
+# Opus codec. `oprs` is libopus 1.6.1 ported to pure Rust, with an `audiopus`-compatible API, so
+# nothing links a C library any more. It is not on crates.io yet: the dependency comes from the
+# repository and `Cargo.lock` pins the commit (`cargo update -p oprs` to move it).
+oprs = { git = "https://github.com/tuna2134/oprs", branch = "master" }
 
 # Voice transport encryption.
 #

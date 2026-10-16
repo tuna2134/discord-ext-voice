@@ -52,8 +52,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            pkg-config patchelf \
-            libopus-dev
+            pkg-config patchelf
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

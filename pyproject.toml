@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "discord-ext-voice"
-description = "A discord.py VoiceClient-compatible Discord voice library powered by Rust (pyo3, tokio-tungstenite, rustls, symphonia, davey, audiopus)"
+description = "A discord.py VoiceClient-compatible Discord voice library powered by Rust (pyo3, tokio-tungstenite, rustls, symphonia, oprs, davey)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"

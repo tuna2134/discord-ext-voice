@@ -2,7 +2,7 @@
 // lint even though the generated code is correct.
 #![allow(clippy::field_reassign_with_default)]
 
-//! Opus encoding built on `audiopus`.
+//! Opus encoding and decoding built on `oprs`, a pure-Rust port of libopus.
 //!
 //! The parameter names and accepted values match `discord.opus.Encoder` so that
 //! `VoiceClient.play(..., application=..., bitrate=..., fec=..., bandwidth=..., signal_type=...)`
@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
-use audiopus::coder::Encoder as RawEncoder;
-use audiopus::packet::Packet;
-use audiopus::{Application, Bandwidth, Bitrate, Channels, MutSignals, SampleRate, Signal};
+use oprs::coder::Encoder as RawEncoder;
+use oprs::packet::Packet;
+use oprs::{Application, Bandwidth, Bitrate, Channels, MutSignals, SampleRate, Signal};
 
 /// Samples per 20ms frame at 48kHz.
 pub const SAMPLES_PER_FRAME: usize = 960;
@@ -153,7 +153,7 @@ impl OpusEncoder {
     }
 }
 
-fn opus_err(err: audiopus::Error) -> String {
+fn opus_err(err: oprs::Error) -> String {
     format!("Opus error: {err}")
 }
 
@@ -177,14 +177,14 @@ pub fn validate_config(config: &EncoderConfig) -> PyResult<()> {
 
 /// Decode a raw Opus packet into interleaved 48kHz stereo `i16` samples.
 pub struct OpusDecoder {
-    inner: audiopus::coder::Decoder,
+    inner: oprs::coder::Decoder,
     buffer: Vec<i16>,
 }
 
 impl OpusDecoder {
     pub fn new() -> Result<Self, String> {
-        let inner = audiopus::coder::Decoder::new(SampleRate::Hz48000, Channels::Stereo)
-            .map_err(opus_err)?;
+        let inner =
+            oprs::coder::Decoder::new(SampleRate::Hz48000, Channels::Stereo).map_err(opus_err)?;
         Ok(Self {
             inner,
             buffer: vec![0i16; SAMPLES_PER_FRAME * CHANNELS],
@@ -452,7 +452,7 @@ impl PyOpusEncoder {
     const FRAME_SIZE: usize = SAMPLES_PER_FRAME * CHANNELS * 2;
 
     fn __repr__(&self) -> String {
-        "<discord_ext_voice.opus.Encoder (libopus via audiopus)>".to_owned()
+        "<discord_ext_voice.opus.Encoder (pure Rust oprs)>".to_owned()
     }
 }
 
@@ -504,6 +504,6 @@ impl PyOpusDecoder {
     }
 
     fn __repr__(&self) -> String {
-        "<discord_ext_voice.opus.Decoder (libopus via audiopus)>".to_owned()
+        "<discord_ext_voice.opus.Decoder (pure Rust oprs)>".to_owned()
     }
 }

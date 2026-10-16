@@ -570,7 +570,7 @@ mod tests {
         );
     }
 
-    /// The silence packet is libopus' DTX frame; the wire format is Discord's, not ours.
+    /// The silence packet is Opus' DTX frame; the wire format is Discord's, not ours.
     #[test]
     fn silence_is_the_opus_dtx_frame() {
         assert_eq!(crate::opus::OPUS_SILENCE, [0xf8, 0xff, 0xfe]);

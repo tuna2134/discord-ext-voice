@@ -1,6 +1,10 @@
-"""Opus codec tests (native `audiopus` encoder/decoder)."""
+"""Opus codec tests (the native `oprs` encoder/decoder)."""
 
 from __future__ import annotations
+
+import array
+import math
+import os
 
 import pytest
 
@@ -99,3 +103,50 @@ def test_silence_packet_matches_discord_py():
     import discord.opus
 
     assert dev.OPUS_SILENCE == discord.opus.OPUS_SILENCE
+
+
+# ---------------------------------------------------------------------------- the libopus oracle
+
+
+@pytest.mark.skipif(
+    os.environ.get('DISCORD_EXT_VOICE_OPUS_ORACLE') != '1',
+    reason='set DISCORD_EXT_VOICE_OPUS_ORACLE=1 to compare against the system libopus',
+)
+@pytest.mark.parametrize(
+    ('application', 'bitrate', 'fec', 'bandwidth'),
+    [('voip', 96, True, 'full'), ('audio', 128, True, 'full'), ('lowdelay', 64, False, 'wide')],
+)
+def test_the_encoder_matches_the_system_libopus(application, bitrate, fec, bandwidth):
+    """`oprs` is a port of libopus 1.6.1, and this is what proves it in the build that ships.
+
+    The packets and the decoded PCM have to be byte-identical to what the system libopus produces
+    for the same input, otherwise the audio Discord receives would change with this dependency. It
+    only means anything while the system libopus is the version `oprs` reproduces (1.6.1), which is
+    why it is opt-in: a CI image with a different libopus would fail it for no good reason.
+    """
+    import discord.opus
+
+    pytest.importorskip('discord')
+    try:
+        discord.opus.load_opus('libopus.so.0')
+    except Exception as exc:  # no system libopus to compare against
+        pytest.skip(f'the system libopus is not loadable: {exc}')
+
+    samples = array.array('h')
+    for index in range(dev.SAMPLES_PER_FRAME * dev.CHANNELS):
+        samples.append(int(9000 * math.sin(2 * math.pi * 440 * index / 48000)))
+    pcm = samples.tobytes()
+
+    ours = dev.opus.Encoder(application=application, bitrate=bitrate, fec=fec, bandwidth=bandwidth)
+    theirs = discord.opus.Encoder(
+        application=application, bitrate=bitrate, fec=fec, bandwidth=bandwidth
+    )
+    packets = [
+        (ours.encode(pcm), theirs.encode(pcm, dev.SAMPLES_PER_FRAME)) for _ in range(5)
+    ]
+    assert all(ours_packet == theirs_packet for ours_packet, theirs_packet in packets)
+
+    our_decoder = dev.opus.Decoder()
+    their_decoder = discord.opus.Decoder()
+    for ours_packet, theirs_packet in packets:
+        assert our_decoder.decode(ours_packet) == their_decoder.decode(theirs_packet)

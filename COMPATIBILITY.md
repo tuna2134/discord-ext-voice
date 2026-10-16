@@ -130,7 +130,7 @@ reader left to wrap.
 
 `FFmpegPCMAudio`/`FFmpegOpusAudio` take the media plus `seek` (the native `-ss`). The names are
 discord.py's and are kept, but nothing here is FFmpeg: `symphonia` demuxes and decodes, `rubato`
-resamples, `audiopus` handles Opus. discord.py's FFmpeg-CLI arguments (`executable`, `pipe`,
+resamples, `oprs` handles Opus. discord.py's FFmpeg-CLI arguments (`executable`, `pipe`,
 `stderr`, `before_options`, `options`, `force_cli`) raise `TypeError` naming the argument, and
 `FFmpegAudio` is not re-exported: there is no subprocess to configure.
 
@@ -144,7 +144,7 @@ Opus packets through when the input has them.
 
 | Member | Source |
 | --- | --- |
-| `Encoder`, `Decoder` | **native** (`audiopus`/libopus) — same keyword arguments, validation, `ValueError`s and class constants as `discord.opus.Encoder` |
+| `Encoder`, `Decoder` | **native** (`oprs`, a pure-Rust libopus port) — same keyword arguments, validation, `ValueError`s and class constants as `discord.opus.Encoder`, and byte-identical output (see `tests/test_opus.py`) |
 | `OpusError` | native; raised for codec failures |
 | `OPUS_SILENCE`, `APPLICATION_AUDIO`, `APPLICATION_VOIP`, `APPLICATION_LOWDELAY` | re-exported from `discord.opus` |
 | `load_opus`, `is_loaded`, `OpusNotLoaded` | **not re-exported from this package**; use `discord.opus` if you need discord.py's ctypes encoder. The native encoder requires no loading step |

@@ -3,8 +3,8 @@
 //!
 //! Nothing here needs FFmpeg: containers and codecs come from `symphonia` (pure Rust), the
 //! sample-rate conversion that `libswresample` used to do comes from `rubato`, and Opus — the one
-//! codec symphonia has no decoder for — is decoded by `audiopus`, the same libopus the encoder
-//! uses.
+//! codec symphonia has no decoder for — is decoded by `oprs`, the same pure-Rust libopus port the
+//! encoder uses.
 //!
 //! Two flavours are provided:
 //!
@@ -53,7 +53,7 @@ pub const FRAME_SAMPLES: usize = 960;
 pub const FRAME_CHANNELS: usize = 2;
 pub const FRAME_BYTES: usize = FRAME_SAMPLES * FRAME_CHANNELS * 2;
 const TARGET_SAMPLE_RATE: u32 = 48_000;
-/// libopus always decodes to 48kHz, whatever the stream's original rate was.
+/// Opus always decodes to 48kHz, whatever the stream's original rate was.
 const OPUS_RATE: u32 = TARGET_SAMPLE_RATE;
 /// Frames per resampler chunk: short enough to keep the filter's delay inaudible, long enough to
 /// be cheap.
@@ -568,7 +568,7 @@ fn codec_name(codec: AudioCodecId) -> &'static str {
 /// The decoder for one track.
 ///
 /// Symphonia decodes everything except Opus, which it has no decoder for; those packets go to
-/// libopus through `audiopus`, the same library the encoder uses.
+/// `oprs` (a pure-Rust libopus port), the same codec the encoder uses.
 enum TrackDecoder {
     Symphonia(Box<dyn AudioDecoder>),
     Opus(crate::opus::OpusDecoder),
@@ -598,7 +598,7 @@ impl TrackDecoder {
                 decoder.reset();
                 Ok(())
             }
-            // libopus carries state between packets, so a fresh decoder is the reset.
+            // The decoder carries state between packets, so a fresh one is the reset.
             Self::Opus(_) => {
                 *self = Self::Opus(crate::opus::OpusDecoder::new()?);
                 Ok(())
@@ -635,8 +635,8 @@ pub struct DecodeSource {
     finished: bool,
 }
 
-// SAFETY: the only non-`Send` member is libopus' decoder, which is used behind the `Mutex` this
-// type lives in and never shared: one thread at a time drives `DecodeSource`.
+// SAFETY: the decoder is used behind the `Mutex` this type lives in and is never shared: one
+// thread at a time drives `DecodeSource`.
 unsafe impl Send for DecodeSource {}
 
 impl DecodeSource {

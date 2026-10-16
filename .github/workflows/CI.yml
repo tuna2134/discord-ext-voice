@@ -1,9 +1,8 @@
 # Continuous integration for discord-ext-voice.
 #
-# The native core links against the system Opus library (through `audiopus`) and nothing else:
-# decoding, demuxing and resampling are pure Rust (`symphonia`, `rubato`). The `ffmpeg` binary is
-# installed for the test fixtures, which use it to *create* media in each codec; the package
-# itself never runs it.
+# The native core links nothing but libc: decoding, demuxing, resampling and the Opus codec are
+# all pure Rust (`symphonia`, `rubato`, `oprs`). The `ffmpeg` binary is installed for the test
+# fixtures, which use it to *create* media in each codec; the package itself never runs it.
 #
 # `patchelf` is installed as well: maturin uses it to rewrite the RPATH of the built
 # extension, and warns (leaving the build-time RPATH in place) when it is missing.
@@ -50,7 +49,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             pkg-config patchelf \
-            libopus-dev \
             ffmpeg
 
       - uses: dtolnay/rust-toolchain@stable
@@ -102,8 +100,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            pkg-config patchelf \
-            libopus-dev
+            pkg-config patchelf
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

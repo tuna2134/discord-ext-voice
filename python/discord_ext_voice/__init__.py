@@ -19,7 +19,7 @@ Voice websocket         ``tokio`` + ``tokio-rustls`` + ``tokio-tungstenite``
 Voice gateway payloads  ``voice-model``
 RTP encryption          ``xsalsa20poly1305`` / ``chacha20poly1305``
 End-to-end encryption   ``davey`` (DAVE / MLS)
-Opus codec              ``audiopus``
+Opus codec              ``oprs`` (pure-Rust libopus)
 Audio sources           :mod:`discord_ext_voice.sources` (no binary, no C library)
 Audio decode/resample   ``symphonia`` + ``rubato``
 Connection flow         :mod:`discord_ext_voice.voice_state` + ``_native.ConnectionFlow``

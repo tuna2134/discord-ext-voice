@@ -90,3 +90,7 @@ ac-ffmpeg = { git = "https://github.com/tuna2134/rust-ac-ffmpeg", branch = "mast
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Wheels are the distribution artefact: strip the symbol tables so they are not tens of
+# megabytes of debug information. `debuginfo` keeps line tables for a backtrace; `symbols`
+# drops those too, which is what a released extension wants.
+strip = "symbols"

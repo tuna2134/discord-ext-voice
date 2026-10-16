@@ -83,3 +83,5 @@ docs/_build/
 .python-version
 
 *.webm
+
+site

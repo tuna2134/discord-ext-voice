@@ -44,7 +44,7 @@ ac-ffmpeg = "0.19"
 
 # HTTP(S) inputs for the audio sources: a URL is streamed straight into libav. `rustls-tls`
 # keeps the TLS stack the same one the voice websocket uses (and avoids OpenSSL).
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-tls"] }
 
 # Discord voice gateway protocol models (the maintained successor of the
 # `voice-model` crate, renamed by its upstream)

@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""Build a PEP 503 simple index for GitHub Pages from built distributions.
+"""Build the PEP 503 simple index that GitHub Pages serves.
 
-The layout it writes is what ``pip install --extra-index-url <url>/simple/`` expects:
+``pip install --extra-index-url <pages-url>/simple/ discord-ext-voice`` reads exactly this:
 
     site/
     ├── index.html                      # a landing page with the pip command
     └── simple/
         ├── index.html                  # the project list (PEP 503)
         └── discord-ext-voice/
-            ├── index.html              # that project's files, with sha256 hashes
-            ├── discord_ext_voice-0.1.0-cp313-...whl
-            └── discord_ext_voice-0.1.0.tar.gz
+            └── index.html              # that project's files, with sha256 hashes
 
-The project and version of every file are read from the archive itself (``.dist-info/METADATA``
-or ``PKG-INFO``), not from the file name: an sdist is named ``<name>-<version>.tar.gz`` and the
-name may contain ``-``, which makes the file name ambiguous.
+The distributions themselves are *not* copied here: they are published as GitHub release assets
+(a wheel is ~73MB, because maturin bundles the FFmpeg libraries into it, and a Pages deployment
+replaces the whole site on every publish). Each link therefore points at a release asset, with the
+``#sha256=`` fragment pip verifies against.
 
-``--previous-url`` merges what is already published into the new tree. A Pages deployment replaces
-the whole site, so without it publishing 0.2.0 would silently drop 0.1.0 from the index.
+Because the site is replaced on every publish, ``--previous-url`` reads the index that is live now
+and carries its links over, so publishing 0.2.0 does not drop 0.1.0 from the index. Only the small
+HTML pages are fetched for that; the distributions are never downloaded here.
+
+The project and version of each file are read from the archive itself (``.dist-info/METADATA`` or
+``PKG-INFO``), not from the file name: an sdist is named ``<name>-<version>.tar.gz`` and the name
+may contain ``-``, which makes the file name ambiguous.
 """
 
 from __future__ import annotations
@@ -26,15 +30,28 @@ import argparse
 import hashlib
 import html
 import re
-import shutil
 import tarfile
 import urllib.parse
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
-#: Matches the `href` of a link in an index page this script wrote.
-HREF = re.compile(r'href="([^"]+)"')
+#: The `href` of an anchor in a page this script wrote, with its optional hash fragment.
+ANCHOR = re.compile(
+    r'<a href="(?P<href>[^"#]+)(?:#sha256=(?P<sha256>[0-9a-f]+))?"'
+    r'(?:\s+data-requires-python="(?P<requires>[^"]*)")?>(?P<text>[^<]*)</a>'
+)
+
+
+@dataclass(frozen=True)
+class Link:
+    """One distribution: where pip downloads it, and what it should check."""
+
+    filename: str
+    href: str
+    sha256: str
+    requires_python: str | None
 
 
 def normalize(name: str) -> str:
@@ -75,91 +92,71 @@ def digest(path: Path) -> str:
     return accumulator.hexdigest()
 
 
+def local_links(dist: Path, base_url: str) -> dict[str, list[Link]]:
+    """The distributions in ``dist``, keyed by normalised project name."""
+    projects: dict[str, list[Link]] = {}
+    for path in sorted(dist.iterdir()):
+        if not path.is_file() or not (path.suffix == '.whl' or path.name.endswith('.tar.gz')):
+            continue
+        name, _, requires = metadata(path)
+        href = f'{base_url.rstrip("/")}/{urllib.parse.quote(path.name)}'
+        projects.setdefault(normalize(name), []).append(
+            Link(path.name, href, digest(path), requires)
+        )
+    return projects
+
+
 def fetch(url: str) -> str:
     with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 (our own site)
         return response.read().decode('utf-8', 'replace')
 
 
-def hrefs(page: str) -> list[str]:
-    return HREF.findall(page)
-
-
-def merge_previous(previous_url: str, site: Path) -> int:
-    """Copy the already-published files into the new tree, returning how many were fetched."""
+def published_links(previous_url: str) -> dict[str, list[Link]]:
+    """The links of the index that is live now, keyed by normalised project name."""
     if not previous_url:
-        return 0
+        return {}
 
     try:
         root = fetch(previous_url)
-    except Exception as exc:  # a first publish has nothing to merge
+    except Exception as exc:  # a first publish has nothing to carry over
         print(f'no previous index at {previous_url} ({exc}); starting from scratch')
-        return 0
+        return {}
 
-    fetched = 0
-    for link in hrefs(root):
-        project_url = urllib.parse.urljoin(previous_url, link)
+    projects: dict[str, list[Link]] = {}
+    for anchor in ANCHOR.finditer(root):
+        project_url = urllib.parse.urljoin(previous_url, anchor.group('href'))
         if not project_url.endswith('/'):
             continue
-        directory = site / 'simple' / urllib.parse.unquote(project_url.rstrip('/').rsplit('/', 1)[-1])
+        project = urllib.parse.unquote(project_url.rstrip('/').rsplit('/', 1)[-1])
+
         try:
             page = fetch(project_url)
         except Exception as exc:
             print(f'skipping {project_url}: {exc}')
             continue
 
-        for file_link in hrefs(page):
-            name = Path(urllib.parse.unquote(file_link.split('#', 1)[0])).name
-            if not name or name == 'index.html':
-                continue
-            target = directory / name
-            if target.exists():
-                continue
-            try:
-                with urllib.request.urlopen(  # noqa: S310 (our own site)
-                    urllib.parse.urljoin(project_url, file_link), timeout=120
-                ) as response:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(response.read())
-            except Exception as exc:
-                print(f'unable to fetch {file_link}: {exc}')
-                continue
-            fetched += 1
+        links = projects.setdefault(project, [])
+        for found in ANCHOR.finditer(page):
+            filename = found.group('text').strip() or found.group('href').rsplit('/', 1)[-1]
+            links.append(
+                Link(
+                    filename,
+                    urllib.parse.urljoin(project_url, found.group('href')),
+                    found.group('sha256') or '',
+                    found.group('requires') or None,
+                )
+            )
 
-    print(f'merged {fetched} file(s) from {previous_url}')
-    return fetched
+    print(f'carried over {sum(len(v) for v in projects.values())} link(s) from {previous_url}')
+    return projects
 
 
-def place(dist: Path, site: Path) -> int:
-    """Copy the built distributions into their project directories, returning how many."""
-    placed = 0
-    for path in sorted(dist.iterdir()):
-        if not path.is_file() or not (path.suffix == '.whl' or path.name.endswith('.tar.gz')):
-            continue
-        name, _, _ = metadata(path)
-        target = site / 'simple' / normalize(name) / path.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-        placed += 1
-    return placed
-
-
-def write_pages(site: Path) -> dict[str, int]:
-    """Write every index page from the files that are in the tree, returning per-project counts."""
+def write_pages(site: Path, projects: dict[str, list[Link]], url: str) -> None:
+    """Write the index pages: one per project, plus the root list and a landing page."""
     simple = site / 'simple'
-    projects: dict[str, list[tuple[Path, str, str | None]]] = {}
+    simple.mkdir(parents=True, exist_ok=True)
 
-    for path in sorted(simple.rglob('*')):
-        if not path.is_file() or path.name == 'index.html':
-            continue
-        name, version, requires = metadata(path)
-        directory = simple / normalize(name)
-        if path.parent != directory:  # a file that was merged into the wrong place
-            directory.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(path), str(directory / path.name))
-            path = directory / path.name
-        projects.setdefault(normalize(name), []).append((path, version, requires))
-
-    for project, files in sorted(projects.items()):
+    for project, links in sorted(projects.items()):
         lines = [
             '<!DOCTYPE html>',
             '<html lang="en">',
@@ -170,13 +167,20 @@ def write_pages(site: Path) -> dict[str, int]:
             '  <body>',
             f'    <h1>Links for {html.escape(project)}</h1>',
         ]
-        for path, _, requires in sorted(files, key=lambda item: item[0].name):
-            attributes = f' data-requires-python="{html.escape(requires)}"' if requires else ''
+        # Newest last, which is the order the releases were published in.
+        for link in links:
+            fragment = f'#sha256={link.sha256}' if link.sha256 else ''
+            attributes = (
+                f' data-requires-python="{html.escape(link.requires_python)}"'
+                if link.requires_python
+                else ''
+            )
             lines.append(
-                f'    <a href="{html.escape(path.name)}#sha256={digest(path)}"{attributes}>'
-                f'{html.escape(path.name)}</a><br>'
+                f'    <a href="{html.escape(link.href)}{fragment}"{attributes}>'
+                f'{html.escape(link.filename)}</a><br>'
             )
         lines += ['  </body>', '</html>', '']
+        (simple / project / 'index.html').parent.mkdir(parents=True, exist_ok=True)
         (simple / project / 'index.html').write_text('\n'.join(lines), encoding='utf-8')
 
     lines = [
@@ -191,15 +195,9 @@ def write_pages(site: Path) -> dict[str, int]:
     for project in sorted(projects):
         lines.append(f'    <a href="{html.escape(project)}/">{html.escape(project)}</a><br>')
     lines += ['  </body>', '</html>', '']
-    simple.mkdir(parents=True, exist_ok=True)
     (simple / 'index.html').write_text('\n'.join(lines), encoding='utf-8')
 
-    return {project: len(files) for project, files in projects.items()}
-
-
-def write_landing(site: Path, url: str) -> None:
-    """A small page at the site root, so the URL is useful when opened in a browser."""
-    command = f'pip install --extra-index-url {url}/simple/ discord-ext-voice'
+    command = f'pip install --extra-index-url {url.rstrip("/")}/simple/ discord-ext-voice'
     (site / 'index.html').write_text(
         '\n'.join(
             [
@@ -211,7 +209,8 @@ def write_landing(site: Path, url: str) -> None:
                 '  </head>',
                 '  <body>',
                 '    <h1>discord-ext-voice package index</h1>',
-                '    <p>A PEP 503 index, built from this repository\'s GitHub Actions runs.</p>',
+                "    <p>A PEP 503 index, built from this repository's GitHub Actions runs. "
+                'The distributions themselves are release assets.</p>',
                 f'    <p>Index: <a href="simple/">{html.escape(url)}/simple/</a></p>',
                 f'    <pre>{html.escape(command)}</pre>',
                 '  </body>',
@@ -228,22 +227,30 @@ def main() -> None:
     parser.add_argument('--dist', type=Path, default=Path('dist'), help='built distributions')
     parser.add_argument('--site', type=Path, default=Path('site'), help='the tree to write')
     parser.add_argument(
+        '--base-url',
+        required=True,
+        help='where the distributions are downloadable, e.g. a release download URL',
+    )
+    parser.add_argument(
         '--previous-url',
         default='',
-        help='the already-published simple index, merged into the new tree',
+        help='the simple index that is live now, whose links are carried over',
     )
-    parser.add_argument('--url', default='', help='the public URL, for the landing page')
+    parser.add_argument('--url', default='', help='the public URL of the site, for the landing page')
     args = parser.parse_args()
 
     args.site.mkdir(parents=True, exist_ok=True)
-    placed = place(args.dist, args.site)
-    merged = merge_previous(args.previous_url, args.site)
-    projects = write_pages(args.site)
-    write_landing(args.site, args.url.rstrip('/') or 'the site')
+    projects = published_links(args.previous_url)
+    added = local_links(args.dist, args.base_url)
+    for project, links in added.items():
+        known = {link.filename for link in projects.setdefault(project, [])}
+        projects[project].extend(link for link in links if link.filename not in known)
 
-    print(f'placed {placed} distribution(s), merged {merged} file(s)')
-    for project, count in projects.items():
-        print(f'  {project}: {count} file(s)')
+    write_pages(args.site, projects, args.url.rstrip('/') or 'the site')
+
+    for project, links in sorted(projects.items()):
+        print(f'{project}: {len(links)} file(s)')
+    print(f'added {sum(len(v) for v in added.values())} from {args.dist}')
 
 
 if __name__ == '__main__':

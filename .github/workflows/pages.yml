@@ -1,0 +1,139 @@
+# Publish the package index: a PEP 503 simple index on GitHub Pages, with the distributions as
+# release assets.
+#
+# `pip install --extra-index-url https://<owner>.github.io/<repo>/simple/ discord-ext-voice`
+#
+# The distributions do not live on Pages: a wheel is ~73MB (maturin bundles the FFmpeg libraries
+# into it), and every Pages deployment replaces the whole site. They are attached to a GitHub
+# release instead, and the index links to them with a `#sha256=` fragment. `scripts/pages_index.py`
+# carries the links of the currently published index over, so a new version does not drop the old
+# ones.
+#
+# Pages has to be enabled once for the repository, with "GitHub Actions" as the source:
+#   gh api -X POST repos/<owner>/<repo>/pages -f build_type=workflow
+name: Publish the package index
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release that holds the distributions
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the distributions (CPython ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The whole supported range: 3.11 is the floor, so it has to keep building.
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install FFmpeg and Opus development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config patchelf \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
+            libopus-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'maturin>=1.15,<2.0'
+
+      - name: Build the wheel
+        # `-i python` is the interpreter `actions/setup-python` put on PATH.
+        run: maturin build --release --out dist -i python
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: distributions-cp${{ matrix.python-version }}
+          path: dist
+
+  sdist:
+    name: Build the sdist
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: distributions-sdist
+          path: dist
+
+  index:
+    name: Publish the index
+    needs: [build, sdist]
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: distributions-*
+          merge-multiple: true
+          path: dist
+
+      - uses: actions/configure-pages@v6
+        id: pages
+
+      - name: Attach the distributions to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A tag push publishes that tag; a manual run publishes the version in Cargo.toml.
+          tag="${GITHUB_REF_NAME}"
+          case "$GITHUB_REF_TYPE" in
+            tag) ;;
+            *) tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" ;;
+          esac
+
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
+            --title "$tag" \
+            --notes "Wheels and the sdist for \`$tag\`. Install with: \`pip install --extra-index-url ${{ steps.pages.outputs.base_url }}/simple/ discord-ext-voice\`"
+          gh release upload "$tag" dist/* --clobber
+
+          echo "tag=$tag" >> "$GITHUB_ENV"
+          echo "assets=${{ github.server_url }}/${{ github.repository }}/releases/download/$tag" >> "$GITHUB_ENV"
+
+      - name: Build the PEP 503 index
+        run: |
+          python3 scripts/pages_index.py \
+            --dist dist \
+            --site site \
+            --base-url "$assets" \
+            --previous-url "${{ steps.pages.outputs.base_url }}/simple/" \
+            --url "${{ steps.pages.outputs.base_url }}"
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v5
+        id: deploy

@@ -90,9 +90,10 @@ Arch:
 sudo pacman -S pkgconf ffmpeg opus
 ```
 
-At runtime the extension is **dynamically linked** against those FFmpeg and Opus libraries.
-Building fully self-contained wheels would mean statically linking FFmpeg, which is deliberately
-out of scope.
+A wheel from the package index is **self-contained**: `maturin` bundles the FFmpeg, Opus and
+supporting libraries the extension links against into `discord_ext_voice.libs/` and points the
+extension's RPATH at them, so nothing has to be installed to run it (that is also why a wheel is
+around 74MB). A build from source links against the system libraries listed above instead.
 
 ## Install
 
@@ -107,6 +108,30 @@ maturin develop --release
 [patches/README.md](patches/README.md)). Cargo fetches it automatically — no submodule, no
 vendored tree — and `Cargo.lock` pins the exact commit, so the first build needs `git` and
 network access and every later build is offline.
+
+### From the package index
+
+Every release is published to a PEP 503 index on GitHub Pages, with the wheels and the sdist
+attached to the matching GitHub release:
+
+```bash
+pip install --extra-index-url https://tuna2134.dev/discord-ext-voice/simple/ discord-ext-voice
+```
+
+`https://tuna2134.github.io/discord-ext-voice/simple/` is the same index (it redirects to the
+custom domain). The distributions themselves are release assets — a wheel is ~74MB, so they are
+not part of the Pages site — and the index lists each file with its SHA-256, which pip verifies.
+
+In a `requirements.txt`:
+
+```
+--extra-index-url https://tuna2134.dev/discord-ext-voice/simple/
+discord-ext-voice
+```
+
+The index is rebuilt by [`.github/workflows/pages.yml`](.github/workflows/pages.yml), which runs on
+a tag push (the tag names the release) or on demand from the Actions tab. It carries the links of
+the already-published index over, so a new version never drops the old ones.
 
 Only plain `discord.py` is required. `discord.py[voice]` (PyNaCl + the Python `davey`
 bindings) is **not** needed: `VoiceClient` implements `VoiceProtocol` directly, so discord.py's

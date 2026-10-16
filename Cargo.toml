@@ -24,7 +24,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 # Python bindings. `extension-module` is an opt-in feature so that `cargo test` links against
 # libpython and the Rust unit tests can actually run.
-pyo3 = "0.29"
+pyo3 = "0.30"
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 
 # Async runtime / websocket / udp

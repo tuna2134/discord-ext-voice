@@ -134,7 +134,7 @@ jobs:
           smoke/bin/python -c "import discord_ext_voice as dev; print(dev.__version__, dev.SUPPORTED_MODES)"
 
       - name: Upload the wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-x86_64-cp${{ matrix.python-version }}
           path: dist
@@ -148,7 +148,7 @@ jobs:
         with:
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: dist

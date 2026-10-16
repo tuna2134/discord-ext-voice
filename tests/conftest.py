@@ -67,8 +67,19 @@ class _RangeHandler(http.server.SimpleHTTPRequestHandler):
     (the source's `headers=` argument, the user agent, a `Range`).
     """
 
-    def __init__(self, *args: object, record: list[dict[str, str]] | None = None, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *args: object,
+        record: list[dict[str, str]] | None = None,
+        truncate_first: int | None = None,
+        served: list[int] | None = None,
+        **kwargs: object,
+    ) -> None:
         self._record = record
+        #: Cut the body of the first response short, as a CDN that drops an idle connection does.
+        self._truncate_first = truncate_first
+        #: How many requests *this server* has answered; the handler is rebuilt for every one.
+        self._served = served
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
     def log_message(self, *args: object) -> None:
@@ -79,6 +90,10 @@ class _RangeHandler(http.server.SimpleHTTPRequestHandler):
             # HTTP header names are case-insensitive and `HeaderName` lower-cases them, so a
             # test should look them up lower-cased too.
             self._record.append({name.lower(): value for name, value in self.headers.items()})
+        first_request = False
+        if self._served is not None:
+            self._served[0] += 1
+            first_request = self._served[0] == 1
 
         path = Path(self.translate_path(self.path))
         if not path.is_file():
@@ -98,6 +113,12 @@ class _RangeHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_response(200)
 
+        remaining = end - start + 1
+        # The length is still the whole body: only the *body* stops early, which is what a dropped
+        # connection looks like from the client's side.
+        if self._truncate_first is not None and first_request:
+            remaining = min(self._truncate_first, remaining)
+
         self.send_header('Content-Type', 'application/octet-stream')
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Content-Length', str(end - start + 1))
@@ -105,7 +126,7 @@ class _RangeHandler(http.server.SimpleHTTPRequestHandler):
 
         handle = path.open('rb')
         handle.seek(start)
-        return _LimitedReader(handle, end - start + 1)
+        return _LimitedReader(handle, remaining)
 
 
 @pytest.fixture
@@ -119,8 +140,17 @@ def http_server():
     servers: list[http.server.ThreadingHTTPServer] = []
     requests: list[dict[str, str]] = []
 
-    def start(directory: Path) -> str:
-        handler = functools.partial(_RangeHandler, directory=str(directory), record=requests)
+    def start(directory: Path, *, truncate_first: int | None = None) -> str:
+        # One counter per server: the handler is rebuilt for every request, and the fixture can
+        # be asked for several servers.
+        served = [0]
+        handler = functools.partial(
+            _RangeHandler,
+            directory=str(directory),
+            record=requests,
+            truncate_first=truncate_first,
+            served=served,
+        )
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)

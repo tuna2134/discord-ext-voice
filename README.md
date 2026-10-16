@@ -177,7 +177,10 @@ dev.FFmpegPCMAudio(info['url'], headers=info['http_headers'])
 
 An `http(s)` URL is fetched by `reqwest` (rustls, so no OpenSSL is needed) and handed to libav as
 a stream: playback starts before the download finishes, and seeking uses `Range` requests when the
-server supports them (otherwise the request is restarted and the offset skipped).
+server supports them (otherwise the request is restarted and the offset skipped). A connection
+that dies or is cut short mid-stream — a throttling CDN closing an idle one, which is routine for
+a long stream — is picked up again from the byte it reached instead of looking like the end of the
+file, which is how libav would read it.
 
 `headers=` sends extra HTTP headers with every request the reader makes (the first fetch and any
 `Range` a seek issues). Extractors hand those out with the URLs they produce — `yt-dlp`'s
@@ -334,9 +337,11 @@ The Python suite includes:
   be mapped onto the in-process decoder. `seek=` covers `-ss`, and everything else belongs in
   the media file.
 * **`http(s)` URLs need a server that behaves.** Seeking backwards on a server without `Range`
-  support restarts the request and skips forward, which is slower; a stalled response blocks the
-  reader thread until the connection fails (there is a 10s connect timeout, but no read timeout
-  while streaming). Redirects are followed.
+  support restarts the request and skips forward, which is slower. A connection that is *dropped*
+  is resumed from the byte it reached (three times in a row, then the error is reported), but a
+  server that stops sending without closing anything blocks the reader thread until the OS gives
+  up: there is a 10s connect timeout, and no read timeout while streaming. Redirects are
+  followed.
 * **A missing local file fails at construction**, not on the first `read()`, so a typo is
   reported immediately.
 * **Wheels are dynamically linked** against the system FFmpeg and Opus.

@@ -205,6 +205,9 @@ else is reachable through the native `VoiceError` hierarchy.
   `wait_closed`, ...
 * `FFmpegPCMAudio(source, seek=...)` / `FFmpegOpusAudio(source, seek=...)` — the native `-ss`,
   implemented by seeking the demuxer and rebuilding the decoder.
+* A dropped `http(s)` stream is resumed from the byte it reached (a `Range` request, or a
+  restart-and-skip for a server that ignores ranges) instead of ending playback. discord.py
+  hands the URL to the `ffmpeg` binary, which has its own reconnect behaviour.
 * `FFmpegPCMAudio(url, headers={...})` / `FFmpegOpusAudio(url, headers={...})` /
   `probe(url, headers={...})` — extra HTTP headers for every request the URL reader makes,
   which is what a URL from an extractor needs (`yt-dlp`'s `http_headers`); a `User-Agent` there

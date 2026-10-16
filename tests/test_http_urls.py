@@ -81,6 +81,28 @@ def test_http_url_seeks(sine_wav, http_server):
         reader.cleanup()
 
 
+def test_http_url_resumes_a_dropped_stream(sine_wav, http_server):
+    """A server that closes the connection mid-body must not look like the end of the file.
+
+    A throttling CDN drops an idle connection all the time, and libav reads the end of the input
+    as the end of the file — so playback used to stop with `FFmpeg demux error`. The reader asks
+    for the rest from the byte it reached instead.
+    """
+    whole = http_server(sine_wav.parent)
+    dropped = http_server(sine_wav.parent, truncate_first=4096)
+
+    complete = read_frames(dev.FFmpegPCMAudio(f'{whole}/{sine_wav.name}'))
+    resumed = read_frames(dev.FFmpegPCMAudio(f'{dropped}/{sine_wav.name}'))
+
+    assert len(complete) > 20, 'the fixture has to be longer than one truncated response'
+    assert resumed == complete, 'the resumed stream has to be the same audio'
+
+    # The first response was cut short, and the rest was asked for by range.
+    assert any('range' in request for request in http_server.requests[1:]), (
+        http_server.requests
+    )
+
+
 # ---------------------------------------------------------------------------- headers
 
 

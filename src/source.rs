@@ -52,6 +52,10 @@ fn ffmpeg_err(message: impl Into<String>) -> PyErr {
 /// How much of a forward seek to do by reading instead of asking the server again.
 const SEEK_SKIP_LIMIT: u64 = 1 << 20;
 
+/// How many consecutive read failures to recover from before giving up. A dropped connection is
+/// normal for a long stream; a server that refuses every request is not.
+const MAX_RESUMES: u32 = 3;
+
 /// A byte source for libav: a real file, a Python file-like object, or an HTTP(S) URL.
 pub enum Input {
     File(File),
@@ -99,7 +103,9 @@ impl Seek for Input {
 /// the server ignores ranges. libav needs that for containers whose index sits at the end (MP4).
 ///
 /// The connection is opened on the first read, so constructing a source never blocks on the
-/// network.
+/// network, and a connection that dies mid-stream is picked up again from the byte it reached: a
+/// throttling CDN closing an idle connection is normal, while libav reads the end of the input as
+/// the end of the file.
 pub struct HttpStream {
     url: String,
     client: reqwest::blocking::Client,
@@ -108,6 +114,8 @@ pub struct HttpStream {
     position: u64,
     /// `Content-Length` of the whole stream, when the server reports one.
     length: Option<u64>,
+    /// How many reads in a row had to be resumed. Reset by the first read that delivers.
+    resumes: u32,
 }
 
 impl HttpStream {
@@ -138,22 +146,35 @@ impl HttpStream {
             response: None,
             position: 0,
             length: None,
+            resumes: 0,
         })
     }
 
+    /// The response to read from, requesting it when there is none.
+    ///
+    /// The first request is a plain `GET`; after a dropped connection the stream continues from
+    /// `position`, which [`HttpStream::request_from`] turns into a `Range` request — or, for a
+    /// server that ignores ranges, a restart that is skipped forward.
     fn response(&mut self) -> io::Result<&mut reqwest::blocking::Response> {
         if self.response.is_none() {
-            let response = self
-                .client
-                .get(&self.url)
-                .send()
-                .map_err(|err| http_error(&self.url, &err))?
-                .error_for_status()
-                .map_err(|err| http_error(&self.url, &err))?;
-            self.length = response.content_length();
-            self.response = Some(response);
+            let offset = self.position;
+            if !self.request_from(offset)? && offset > 0 {
+                self.skip(offset)?;
+            }
         }
         Ok(self.response.as_mut().expect("just connected"))
+    }
+
+    /// Pick the stream up again at `position`, counting the attempt.
+    fn resume(&mut self) -> io::Result<()> {
+        self.resumes += 1;
+        self.response = None;
+        self.response().map(|_| ())
+    }
+
+    /// Whether the response stopped short of the length the server advertised.
+    fn truncated(&self) -> bool {
+        matches!(self.length, Some(length) if self.position < length)
     }
 
     /// Request `offset` onwards, returning whether the server honoured the range.
@@ -213,9 +234,32 @@ fn shift(base: u64, delta: i64) -> io::Result<u64> {
 
 impl Read for HttpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.response()?.read(buf)?;
-        self.position += read as u64;
-        Ok(read)
+        loop {
+            let outcome = self.response()?.read(buf);
+
+            match outcome {
+                // A response that ended before the length it advertised is a truncated one, not
+                // the end of the stream.
+                Ok(0) if self.truncated() && self.resumes < MAX_RESUMES => {
+                    if self.resume().is_err() {
+                        return Ok(0);
+                    }
+                }
+                Ok(read) => {
+                    self.position += read as u64;
+                    self.resumes = 0;
+                    return Ok(read);
+                }
+                // A dropped connection is not the end of the stream either: ask for the rest
+                // from the byte we reached and carry on.
+                Err(err) if self.position > 0 && self.resumes < MAX_RESUMES => {
+                    if self.resume().is_err() {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
 

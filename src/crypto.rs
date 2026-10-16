@@ -9,9 +9,16 @@
 //! The layouts below are byte-for-byte identical to the ones produced by the `PyNaCl` based
 //! implementation in `discord.py` so that a bot can switch between the two freely.
 
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+// Two AEAD crates, two `aead` versions: `chacha20poly1305` 0.11 uses aead 0.6, whose in-place
+// trait is `AeadInOut`, while `xsalsa20poly1305` 0.9 (the last release) still uses aead 0.5 and
+// its `AeadInPlace`. Both traits are imported anonymously: each cipher type implements exactly
+// one of them, so a method call resolves to the right one.
+use chacha20poly1305::aead::AeadInOut as _;
+use chacha20poly1305::aead::KeyInit as _;
 use chacha20poly1305::{Key as ChachaKey, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use rand::Rng;
+use xsalsa20poly1305::AeadInPlace as _;
+use xsalsa20poly1305::KeyInit as _;
 use xsalsa20poly1305::{Key as SalsaKey, Nonce as SalsaNonce, XSalsa20Poly1305};
 
 use crate::errors::CryptoError;
@@ -92,7 +99,7 @@ impl PacketEncryptor {
         Ok(Self {
             mode,
             counter: 0,
-            chacha: XChaCha20Poly1305::new(ChachaKey::from_slice(&key)),
+            chacha: XChaCha20Poly1305::new(&ChachaKey::from(key)),
             salsa: XSalsa20Poly1305::new(SalsaKey::from_slice(&key)),
         })
     }
@@ -122,7 +129,7 @@ impl PacketEncryptor {
 
                 let mut buffer = data.to_vec();
                 self.chacha
-                    .encrypt_in_place(XNonce::from_slice(&full_nonce), header, &mut buffer)
+                    .encrypt_in_place(&XNonce::from(full_nonce), header, &mut buffer)
                     .map_err(|_| CryptoError::Encrypt)?;
 
                 let mut out = Vec::with_capacity(header.len() + buffer.len() + 4);
@@ -149,7 +156,7 @@ impl PacketEncryptor {
             }
             Mode::XSalsa20Poly1305Suffix => {
                 let mut full_nonce = [0u8; 24];
-                rand::thread_rng().fill_bytes(&mut full_nonce);
+                rand::rng().fill_bytes(&mut full_nonce);
 
                 let mut buffer = data.to_vec();
                 self.salsa
@@ -194,7 +201,7 @@ impl PacketEncryptor {
                 buffer = body.to_vec();
                 if self.mode == Mode::AeadXChaCha20Poly1305Rtpsize {
                     self.chacha
-                        .decrypt_in_place(XNonce::from_slice(&full_nonce), header, &mut buffer)
+                        .decrypt_in_place(&XNonce::from(full_nonce), header, &mut buffer)
                         .map_err(|_| CryptoError::Decrypt)?;
                 } else {
                     self.salsa

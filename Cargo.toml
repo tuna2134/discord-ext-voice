@@ -24,7 +24,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 # Python bindings. `extension-module` is an opt-in feature so that `cargo test` links against
 # libpython and the Rust unit tests can actually run.
-pyo3 = "0.29"
+pyo3 = "0.30"
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 
 # Async runtime / websocket / udp
@@ -42,9 +42,10 @@ futures-util = "0.3"
 # Audio decoding / resampling
 ac-ffmpeg = "0.19"
 
-# HTTP(S) inputs for the audio sources: a URL is streamed straight into libav. `rustls-tls`
-# keeps the TLS stack the same one the voice websocket uses (and avoids OpenSSL).
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-tls"] }
+# HTTP(S) inputs for the audio sources: a URL is streamed straight into libav. `rustls` +
+# `webpki-roots` keeps the TLS stack the same one the voice websocket uses (and avoids OpenSSL):
+# reqwest 0.13 renamed the old `rustls-tls` feature, which was exactly those two.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots"] }
 
 # Discord voice gateway protocol models (the maintained successor of the
 # `voice-model` crate, renamed by its upstream)

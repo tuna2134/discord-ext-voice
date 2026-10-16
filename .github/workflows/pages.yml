@@ -31,7 +31,7 @@ concurrency:
 jobs:
   build:
     name: Build the distributions (CPython ${{ matrix.python-version }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -71,7 +71,7 @@ jobs:
 
   sdist:
     name: Build the sdist
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: PyO3/maturin-action@v1
@@ -86,7 +86,7 @@ jobs:
   index:
     name: Publish the index
     needs: [build, sdist]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}

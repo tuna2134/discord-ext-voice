@@ -38,7 +38,7 @@ env:
 jobs:
   test:
     name: Rust + Python tests
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       # `maturin develop` installs into the active virtualenv, and `actions/setup-python`
       # provides an interpreter but no environment, so the job makes its own.
@@ -91,7 +91,7 @@ jobs:
 
   build-wheel:
     name: Build a wheel (CPython ${{ matrix.python-version }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -141,7 +141,7 @@ jobs:
 
   sdist:
     name: Build the sdist
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: PyO3/maturin-action@v1

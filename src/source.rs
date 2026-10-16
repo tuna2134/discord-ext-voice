@@ -11,7 +11,7 @@
 //! Both accept either a filesystem path or a Python file-like object, which means a bot never
 //! has to shell out to the `ffmpeg` binary for local media.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ use ac_ffmpeg::time::Timestamp;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::errors::FFmpegError;
 use crate::{log_debug, log_info};
@@ -110,9 +111,26 @@ pub struct HttpStream {
 }
 
 impl HttpStream {
-    fn open(url: &str) -> io::Result<Self> {
+    /// `headers` are sent with every request (the first read, and any `Range` request a seek
+    /// makes). They come from whatever produced the URL — an extractor's `http_headers`, for
+    /// instance — because such URLs are often bound to the client that requested them. A
+    /// `User-Agent` in `headers` replaces this package's own.
+    fn open(url: &str, headers: &HeaderMap) -> io::Result<Self> {
+        let mut defaults = HeaderMap::new();
+        defaults.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_str(concat!(
+                "discord-ext-voice/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .expect("the version string is a valid header value"),
+        );
+        for (name, value) in headers {
+            defaults.insert(name.clone(), value.clone());
+        }
+
         let client = reqwest::blocking::Client::builder()
-            .user_agent(concat!("discord-ext-voice/", env!("CARGO_PKG_VERSION")))
+            .default_headers(defaults)
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|err| io::Error::other(format!("unable to create the HTTP client: {err}")))?;
@@ -304,15 +322,43 @@ impl Seek for PyFile {
     }
 }
 
+/// A Python mapping of header names to values, as a [`HeaderMap`].
+///
+/// Raises `ValueError` for a name or value HTTP cannot carry, naming the offending header, so a
+/// typo in `headers=` is reported before any connection is attempted.
+fn parse_headers(headers: Option<HashMap<String, String>>) -> PyResult<HeaderMap> {
+    let Some(headers) = headers else {
+        return Ok(HeaderMap::new());
+    };
+
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let parsed_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "{name:?} is not a valid HTTP header name: {err}"
+            ))
+        })?;
+        let parsed_value = HeaderValue::from_str(&value).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "the value of the {name:?} header is not valid: {err}"
+            ))
+        })?;
+        map.insert(parsed_name, parsed_value);
+    }
+    Ok(map)
+}
+
 /// Turn a Python object into libav input.
 ///
 /// Only the Python object is touched here: opening an HTTP(S) URL is left to the first read, and
 /// the libav part of the handshake happens in [`demux`], which the callers run without the GIL.
-fn open_input(source: &Bound<'_, PyAny>) -> Result<Input, String> {
+///
+/// `headers` apply to an HTTP(S) input; a path or a file object ignores them.
+fn open_input(source: &Bound<'_, PyAny>, headers: &HeaderMap) -> Result<Input, String> {
     if let Ok(text) = source.extract::<String>() {
         if text.starts_with("http://") || text.starts_with("https://") {
             log_info!("streaming {text} over HTTP");
-            return HttpStream::open(&text)
+            return HttpStream::open(&text, headers)
                 .map(|stream| Input::Http(Box::new(stream)))
                 .map_err(|err| format!("unable to open {text}: {err}"));
         }
@@ -731,8 +777,13 @@ pub struct PyDecodeSource {
 #[pymethods]
 impl PyDecodeSource {
     #[new]
-    fn new(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let input = open_input(source).map_err(ffmpeg_err)?;
+    #[pyo3(signature = (source, headers=None))]
+    fn new(
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        headers: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let input = open_input(source, &parse_headers(headers)?).map_err(ffmpeg_err)?;
         // Probing reads from the input, which for a URL means the network: do it without the GIL
         // so the rest of the interpreter keeps running.
         let inner = py
@@ -785,8 +836,13 @@ pub struct PyOpusSource {
 #[pymethods]
 impl PyOpusSource {
     #[new]
-    fn new(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let input = open_input(source).map_err(ffmpeg_err)?;
+    #[pyo3(signature = (source, headers=None))]
+    fn new(
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        headers: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let input = open_input(source, &parse_headers(headers)?).map_err(ffmpeg_err)?;
         let inner = py.detach(|| OpusSource::open(input)).map_err(ffmpeg_err)?;
         Ok(Self {
             inner: Mutex::new(inner),
@@ -824,8 +880,13 @@ impl PyOpusSource {
 
 /// Probe a media source without decoding it.
 #[pyfunction]
-pub fn probe(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<ProbeResult> {
-    let input = open_input(source).map_err(ffmpeg_err)?;
+#[pyo3(signature = (source, headers=None))]
+pub fn probe(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    headers: Option<HashMap<String, String>>,
+) -> PyResult<ProbeResult> {
+    let input = open_input(source, &parse_headers(headers)?).map_err(ffmpeg_err)?;
     py.detach(|| probe_source(input)).map_err(ffmpeg_err)
 }
 

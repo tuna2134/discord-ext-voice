@@ -208,6 +208,26 @@ voice.native.dave_protocol_version   # 0 when DAVE is not negotiated
 voice.native.mode                    # negotiated RTP encryption mode
 ```
 
+### Examples
+
+Two runnable bots live in [`examples/`](examples):
+
+| Example | What it shows | Extra dependency |
+| --- | --- | --- |
+| [`bot.py`](examples/bot.py) | `!join` / `!play` / `!status` / `!leave` on a local file | none |
+| [`ytdl.py`](examples/ytdl.py) | `!yt` / `!stream` / `!play` / `!volume` / `!stop`, with `yt-dlp` resolving the URL | `pip install yt-dlp` |
+
+```bash
+DISCORD_TOKEN=... python examples/bot.py song.mp3
+DISCORD_TOKEN=... python examples/ytdl.py
+```
+
+`ytdl.py` is discord.py's own example, adapted: it connects with `cls=dev.VoiceClient` (so this
+backend is the one that speaks voice), passes the media to `dev.FFmpegPCMAudio` without the
+FFmpeg CLI arguments discord.py's copy uses, and patches `yt_dlp.utils.bug_reports_message` in a
+way that accepts the arguments current yt-dlp passes. `tests/test_examples.py` imports both and
+checks that patch, so an upstream signature change is caught here.
+
 ## Architecture
 
 ```
@@ -268,7 +288,7 @@ waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — 
 
 ```bash
 cargo test --lib    # 40 Rust unit tests
-pytest -q           # 174 Python tests (6 crypto interop tests need PyNaCl)
+pytest -q           # 177 Python tests (6 crypto interop tests need PyNaCl)
 ```
 
 The Python suite includes:
@@ -284,6 +304,8 @@ The Python suite includes:
 * end-to-end `VoiceClient` tests covering playback, pause/resume, `after` callbacks,
   `disconnect`, resume-after-4015 and the `discord.py` layering checks (only `VoiceClient`
   inherits from it);
+* `tests/test_examples.py` imports both examples and checks the yt-dlp patch they carry, so an
+  upstream signature change is caught here rather than in a bot;
 * `tests/test_flow.py` for the native connection flow: the phase round-trip, the waiting
   primitives (including the timeout contract), and that every action Rust can return has a name
   in Python. The transition table itself is unit-tested in `src/flow.rs`.

@@ -81,6 +81,84 @@ def test_http_url_seeks(sine_wav, http_server):
         reader.cleanup()
 
 
+# ---------------------------------------------------------------------------- headers
+
+
+def test_http_url_sends_the_given_headers(sine_wav, http_server):
+    """A URL from an extractor is usually bound to the client that asked for it."""
+    base = http_server(sine_wav.parent)
+    headers = {
+        'User-Agent': 'yt-dlp/2026.08.19',
+        'Referer': 'https://example.com/watch',
+        'X-Extra': 'yes',
+    }
+    source = dev.FFmpegPCMAudio(f'{base}/{sine_wav.name}', headers=headers)
+    read_frames(source, limit=1)
+
+    assert http_server.requests, 'the server saw no request'
+    first = http_server.requests[0]
+    assert first['user-agent'] == 'yt-dlp/2026.08.19', 'a given User-Agent replaces ours'
+    assert first['referer'] == 'https://example.com/watch'
+    assert first['x-extra'] == 'yes'
+
+
+def test_http_url_sends_them_on_every_request(sine_wav, http_server):
+    """The first read and the re-request a backward seek makes both carry them."""
+    base = http_server(sine_wav.parent)
+    url = f'{base}/{sine_wav.name}'
+
+    reader = _native.DecodeSource(url, headers={'X-Extra': 'seek'})
+    try:
+        assert len(reader.read()) == dev.FRAME_SIZE
+        reader.seek(0.05)  # backwards: a ranged request, not a skip
+        assert len(reader.read()) == dev.FRAME_SIZE
+    finally:
+        reader.cleanup()
+
+    assert len(http_server.requests) >= 2, http_server.requests
+    assert any('range' in request for request in http_server.requests), (
+        'the backward seek has to re-request the input'
+    )
+    assert all(request.get('x-extra') == 'seek' for request in http_server.requests)
+
+
+def test_http_url_headers_are_optional(sine_wav, http_server):
+    base = http_server(sine_wav.parent)
+    read_frames(dev.FFmpegPCMAudio(f'{base}/{sine_wav.name}'), limit=1)
+
+    user_agent = http_server.requests[0]['user-agent']
+    assert user_agent.startswith('discord-ext-voice/'), user_agent
+
+
+def test_headers_are_rejected_where_they_cannot_be_sent(sine_wav, tmp_path):
+    with pytest.raises(TypeError, match='only applies to an http'):
+        dev.FFmpegPCMAudio(str(sine_wav), headers={'X-Extra': 'yes'})
+
+    with pytest.raises(TypeError, match='mapping'):
+        dev.FFmpegPCMAudio('https://example.com/a.mp3', headers=['X-Extra', 'yes'])
+
+    with pytest.raises(TypeError, match='str to str'):
+        dev.FFmpegPCMAudio('https://example.com/a.mp3', headers={'X-Extra': 1})
+
+    with pytest.raises(ValueError, match='header name'):
+        dev.FFmpegPCMAudio('https://example.com/a.mp3', headers={'not a name': 'yes'})
+
+    with pytest.raises(ValueError, match='not valid'):
+        dev.FFmpegPCMAudio('https://example.com/a.mp3', headers={'X-Extra': 'line\nbreak'})
+
+
+def test_opus_sources_take_headers_too(opus_file, http_server):
+    base = http_server(opus_file.parent)
+    source = dev.FFmpegOpusAudio(f'{base}/{opus_file.name}', headers={'X-Extra': 'opus'})
+    try:
+        assert source.is_opus() is True
+        assert len(source.read()) > 0
+    finally:
+        source.cleanup()
+
+    assert all(request.get('x-extra') == 'opus' for request in http_server.requests)
+
+
 # ---------------------------------------------------------------------------- opus
 
 

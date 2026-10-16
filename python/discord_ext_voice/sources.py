@@ -22,6 +22,7 @@ import asyncio
 import io
 import math
 import os
+from collections.abc import Mapping
 from typing import Any, Optional, TypeVar
 
 from discord.errors import ClientException
@@ -83,6 +84,34 @@ def _validate_seek(seek: Optional[float]) -> None:
         raise ValueError('the seek position must be a finite, non-negative number of seconds')
 
 
+def _validate_headers(source: Any, headers: Any) -> Optional[dict[str, str]]:
+    """Check ``headers=`` and return it as a plain dict, or ``None`` when there are none.
+
+    Headers are only meaningful for an ``http(s)`` input, which is what the native reader sends
+    them on; a local file or a file object would silently ignore them, so that is an error
+    instead. HTTP cannot carry every string, so an unusable name or value is reported by the
+    native side as a :class:`ValueError`.
+    """
+    if headers is None:
+        return None
+    if not _is_url(source):
+        raise TypeError(
+            'headers= only applies to an http(s) URL: a local file or a file object is read '
+            'directly and would ignore them'
+        )
+    if not isinstance(headers, Mapping):
+        raise TypeError(
+            f'headers must be a mapping of header names to values, not {type(headers).__name__}'
+        )
+
+    validated: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise TypeError('headers must be a mapping of str to str')
+        validated[name] = value
+    return validated
+
+
 def _is_url(source: Any) -> bool:
     """Whether ``source`` is an ``http(s)`` URL, which the native reader streams itself."""
     return isinstance(source, str) and source.startswith(('http://', 'https://'))
@@ -93,7 +122,9 @@ def _is_path(source: Any) -> bool:
     return isinstance(source, (str, os.PathLike)) and not _is_url(source)
 
 
-def _open_reader(source: Any, seek: Optional[float], *, opus_first: bool) -> Any:
+def _open_reader(
+    source: Any, seek: Optional[float], *, opus_first: bool, headers: Optional[dict[str, str]] = None
+) -> Any:
     """Create and (optionally) seek the native reader, reporting failures as our own error."""
     reader: Any = None
     try:
@@ -101,14 +132,14 @@ def _open_reader(source: Any, seek: Optional[float], *, opus_first: bool) -> Any
         # it is as likely to be an Ogg/WebM as a plain file is.
         if opus_first and (_is_path(source) or _is_url(source)):
             try:
-                reader = _native.OpusSource(source)
+                reader = _native.OpusSource(source, headers=headers)
             except _native.FFmpegError:
                 # Not an Opus stream: fall through to decoding, which is what the old
                 # `probe_codec(...) == 'opus'` check decided, without opening the input twice
                 # for a probe and then again for the decoder.
                 reader = None
         if reader is None:
-            reader = _native.DecodeSource(source)
+            reader = _native.DecodeSource(source, headers=headers)
         if seek is not None:
             reader.seek(seek)
     except _native.FFmpegError as exc:
@@ -191,6 +222,12 @@ class FFmpegPCMAudio(AudioSource):
         Start this many seconds into the stream — the native form of ``-ss``. The input has to
         be seekable, otherwise creating the source raises
         :class:`~discord_ext_voice.FFmpegSourceError`.
+    headers: Optional[:class:`~collections.abc.Mapping` of :class:`str` to :class:`str`]
+        Extra HTTP headers, sent with the request that fetches an ``http(s)`` URL and with any
+        ``Range`` request a seek makes. Extractors hand these out with the URLs they produce
+        (``yt-dlp``'s ``http_headers``, for instance), and many CDNs reject a URL fetched
+        without them. A ``User-Agent`` here replaces this package's own. Passing them for a
+        local file or a file object is a :class:`TypeError`, because nothing would send them.
 
     Raises
     ------
@@ -200,11 +237,18 @@ class FFmpegPCMAudio(AudioSource):
     """
 
     def __init__(
-        self, source: Any, *, seek: Optional[float] = None, **options: Any
+        self,
+        source: Any,
+        *,
+        seek: Optional[float] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        **options: Any,
     ) -> None:
         _reject_ffmpeg_cli_options(options)
         _validate_seek(seek)
-        self._reader = _open_reader(source, seek, opus_first=False)
+        self._reader = _open_reader(
+            source, seek, opus_first=False, headers=_validate_headers(source, headers)
+        )
 
 
 class FFmpegOpusAudio(AudioSource):
@@ -223,14 +267,23 @@ class FFmpegOpusAudio(AudioSource):
         takes the decoding path: probing it for Opus would consume it.)
     seek: Optional[:class:`float`]
         Start this many seconds into the stream, see :class:`FFmpegPCMAudio`.
+    headers: Optional[:class:`~collections.abc.Mapping` of :class:`str` to :class:`str`]
+        Extra HTTP headers for an ``http(s)`` URL, see :class:`FFmpegPCMAudio`.
     """
 
     def __init__(
-        self, source: Any, *, seek: Optional[float] = None, **options: Any
+        self,
+        source: Any,
+        *,
+        seek: Optional[float] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        **options: Any,
     ) -> None:
         _reject_ffmpeg_cli_options(options)
         _validate_seek(seek)
-        self._reader = _open_reader(source, seek, opus_first=True)
+        self._reader = _open_reader(
+            source, seek, opus_first=True, headers=_validate_headers(source, headers)
+        )
 
     @staticmethod
     def probe_codec(source: Any) -> Optional[str]:

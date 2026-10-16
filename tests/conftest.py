@@ -61,12 +61,25 @@ class _LimitedReader:
 
 
 class _RangeHandler(http.server.SimpleHTTPRequestHandler):
-    """A file server that honours `Range` requests, which is what seeking over HTTP uses."""
+    """A file server that honours `Range` requests, which is what seeking over HTTP uses.
+
+    Every request's headers are appended to `record`, so a test can assert what the client sent
+    (the source's `headers=` argument, the user agent, a `Range`).
+    """
+
+    def __init__(self, *args: object, record: list[dict[str, str]] | None = None, **kwargs: object) -> None:
+        self._record = record
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
     def log_message(self, *args: object) -> None:
         pass
 
     def send_head(self):  # type: ignore[override]
+        if self._record is not None:
+            # HTTP header names are case-insensitive and `HeaderName` lower-cases them, so a
+            # test should look them up lower-cased too.
+            self._record.append({name.lower(): value for name, value in self.headers.items()})
+
         path = Path(self.translate_path(self.path))
         if not path.is_file():
             self.send_error(404, 'not found')
@@ -97,16 +110,23 @@ class _RangeHandler(http.server.SimpleHTTPRequestHandler):
 
 @pytest.fixture
 def http_server():
-    """Serve a directory over HTTP, returning a factory for its base URL."""
+    """Serve a directory over HTTP, returning a factory for its base URL.
+
+    The factory also carries what the server saw: ``http_server.requests`` is a list of the
+    header dictionaries of every request, oldest first.
+    """
 
     servers: list[http.server.ThreadingHTTPServer] = []
+    requests: list[dict[str, str]] = []
 
     def start(directory: Path) -> str:
-        handler = functools.partial(_RangeHandler, directory=str(directory))
+        handler = functools.partial(_RangeHandler, directory=str(directory), record=requests)
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
         return f'http://127.0.0.1:{server.server_port}'
+
+    start.requests = requests  # type: ignore[attr-defined]
 
     try:
         yield start

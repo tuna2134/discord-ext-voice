@@ -72,7 +72,7 @@ jobs:
         run: |
           "$VIRTUAL_ENV/bin/python" -m pip install --upgrade pip
           "$VIRTUAL_ENV/bin/python" -m pip install \
-            maturin pytest pytest-asyncio websockets pynacl 'discord.py>=2.7'
+            maturin pytest pytest-asyncio websockets pynacl yt-dlp 'discord.py>=2.7'
 
       - name: Check formatting
         run: cargo fmt --check

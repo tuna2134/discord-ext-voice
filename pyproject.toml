@@ -30,8 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # PyNaCl is used by the test suite only, to prove the native RTP packets are byte-compatible
-# with discord.py's own encryption.
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5"]
+# with discord.py's own encryption; yt-dlp is what `examples/ytdl.py` drives, and the test for
+# that example skips itself when it is missing.
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5", "yt-dlp>=2025"]
 
 [tool.maturin]
 module-name = "discord_ext_voice._native"

@@ -125,7 +125,7 @@ async def test_a_failing_source_is_reported_to_after(gateway_factory):
         assert voice.is_playing() is False
         await wait_until(lambda: source.cleanups == 1)
         # `discord.py`'s player announces the end of the voice state when it fails as well.
-        assert speaking_states(gateway)[-1] == 0
+        await wait_until(lambda: speaking_states(gateway)[-1] == 0)
     finally:
         await voice.disconnect()
 

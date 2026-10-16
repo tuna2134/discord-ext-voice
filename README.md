@@ -157,8 +157,8 @@ and decodes in process with libav — the `ffmpeg` binary is never started:
 | Class | Behaviour |
 | --- | --- |
 | `PCMAudio(stream)` | Raw 16-bit 48kHz stereo PCM from a file object |
-| `FFmpegPCMAudio(source, *, seek=None)` | libav decodes and resamples to 48kHz stereo `s16` |
-| `FFmpegOpusAudio(source, *, seek=None)` | Opus packets passed through, otherwise PCM + libopus |
+| `FFmpegPCMAudio(source, *, seek=None, headers=None)` | libav decodes and resamples to 48kHz stereo `s16` |
+| `FFmpegOpusAudio(source, *, seek=None, headers=None)` | Opus packets passed through, otherwise PCM + libopus |
 | `PCMVolumeTransformer(source, volume)` | Volume, scaled by the native core (no `audioop`) |
 | `AudioPlayer(source, client, after=...)` | This package: a thin wrapper over the native playback thread |
 
@@ -169,11 +169,21 @@ dev.FFmpegPCMAudio(open('song.mp3', 'rb'))     # a seekable file object works to
 dev.FFmpegPCMAudio('https://example.com/a.mp3')  # streamed with reqwest, no download step
 dev.FFmpegOpusAudio('voice.ogg')               # Opus packets passed through untouched
 dev.PCMVolumeTransformer(dev.FFmpegPCMAudio('song.mp3'), 0.5)
+
+# A URL an extractor produced: send the headers it handed out with it.
+info = ytdl.extract_info(url, download=False)
+dev.FFmpegPCMAudio(info['url'], headers=info['http_headers'])
 ```
 
 An `http(s)` URL is fetched by `reqwest` (rustls, so no OpenSSL is needed) and handed to libav as
 a stream: playback starts before the download finishes, and seeking uses `Range` requests when the
 server supports them (otherwise the request is restarted and the offset skipped).
+
+`headers=` sends extra HTTP headers with every request the reader makes (the first fetch and any
+`Range` a seek issues). Extractors hand those out with the URLs they produce — `yt-dlp`'s
+`http_headers`, for instance — and many CDNs reject a URL fetched without them, because the URL is
+bound to the client that asked for it. A `User-Agent` there replaces this package's own; passing
+headers for a local file or a file object is a `TypeError`, since nothing would send them.
 
 `dev.AudioSource` is this package's own base class, and nothing here inherits from discord.py: a
 source only has to provide `read`/`is_opus`/`cleanup`, which is also what makes a user's own
@@ -224,9 +234,12 @@ DISCORD_TOKEN=... python examples/ytdl.py
 
 `ytdl.py` is discord.py's own example, adapted: it connects with `cls=dev.VoiceClient` (so this
 backend is the one that speaks voice), passes the media to `dev.FFmpegPCMAudio` without the
-FFmpeg CLI arguments discord.py's copy uses, and patches `yt_dlp.utils.bug_reports_message` in a
-way that accepts the arguments current yt-dlp passes. `tests/test_examples.py` imports both and
-checks that patch, so an upstream signature change is caught here.
+FFmpeg CLI arguments discord.py's copy uses, hands yt-dlp's `http_headers` to the reader on the
+`!stream` path (a CDN URL is usually bound to the client that requested it), and patches
+`yt_dlp.utils.bug_reports_message` in a way that accepts the arguments current yt-dlp passes.
+`tests/test_examples.py` imports both and checks that patch, so an upstream signature change is
+caught here, and `tests/test_stream_live.py` plays a real extractor URL end to end when
+`DISCORD_EXT_VOICE_LIVE_URL` is set.
 
 ## Architecture
 
@@ -288,7 +301,7 @@ waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — 
 
 ```bash
 cargo test --lib    # 40 Rust unit tests
-pytest -q           # 177 Python tests (6 crypto interop tests need PyNaCl)
+pytest -q           # 182 Python tests (6 crypto interop tests need PyNaCl; 1 live URL test skipped)
 ```
 
 The Python suite includes:
@@ -306,6 +319,8 @@ The Python suite includes:
   inherits from it);
 * `tests/test_examples.py` imports both examples and checks the yt-dlp patch they carry, so an
   upstream signature change is caught here rather than in a bot;
+* `tests/test_stream_live.py` plays a real extractor URL (with its `http_headers`) through the
+  whole stack — opt-in, via `DISCORD_EXT_VOICE_LIVE_URL`, because it needs the network;
 * `tests/test_flow.py` for the native connection flow: the phase round-trip, the waiting
   primitives (including the timeout contract), and that every action Rust can return has a name
   in Python. The transition table itself is unit-tested in `src/flow.rs`.

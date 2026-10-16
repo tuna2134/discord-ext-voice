@@ -205,6 +205,11 @@ else is reachable through the native `VoiceError` hierarchy.
   `wait_closed`, ...
 * `FFmpegPCMAudio(source, seek=...)` / `FFmpegOpusAudio(source, seek=...)` — the native `-ss`,
   implemented by seeking the demuxer and rebuilding the decoder.
+* `FFmpegPCMAudio(url, headers={...})` / `FFmpegOpusAudio(url, headers={...})` /
+  `probe(url, headers={...})` — extra HTTP headers for every request the URL reader makes,
+  which is what a URL from an extractor needs (`yt-dlp`'s `http_headers`); a `User-Agent` there
+  replaces the package's own. discord.py has no equivalent, because it hands the URL to the
+  `ffmpeg` binary.
 * `AudioPlayer.join(timeout=None)` / `is_alive()` — wait for the playback thread from Python.
 * `voice.native.flow` — the `_native.ConnectionFlow`: `state` (the same 0-8 ladder as
   `ConnectionFlowState`), `joined`, `expecting_disconnect`, `voice_state_update(...)`,

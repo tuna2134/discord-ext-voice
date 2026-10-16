@@ -8,7 +8,9 @@ Every source here is implemented in this package and decodes in process:
 The ``ffmpeg`` binary is never spawned, which is why discord.py's FFmpeg-CLI arguments
 (``executable``, ``pipe``, ``stderr``, ``before_options``, ``options``, ``force_cli``) do not
 exist here — pass the media itself (a path, a file object or an ``http(s)`` URL, which is
-streamed with ``reqwest``), and use ``seek`` where ``-ss`` used to go.
+streamed with ``reqwest``), and use ``seek`` where ``-ss`` used to go. An ``http(s)`` source
+also takes ``headers``, which is how a URL from an extractor (``yt-dlp``'s ``http_headers``)
+stays fetchable.
 
 ":class:`AudioSource` is this package's own base class; nothing here inherits from discord.py.
 A source only has to provide ``read``/``is_opus``/``cleanup``, which is also the contract

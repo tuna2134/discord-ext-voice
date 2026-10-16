@@ -119,11 +119,8 @@ impl HttpStream {
         let mut defaults = HeaderMap::new();
         defaults.insert(
             reqwest::header::USER_AGENT,
-            HeaderValue::from_str(concat!(
-                "discord-ext-voice/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .expect("the version string is a valid header value"),
+            HeaderValue::from_str(concat!("discord-ext-voice/", env!("CARGO_PKG_VERSION")))
+                .expect("the version string is a valid header value"),
         );
         for (name, value) in headers {
             defaults.insert(name.clone(), value.clone());

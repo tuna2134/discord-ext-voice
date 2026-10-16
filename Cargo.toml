@@ -57,7 +57,13 @@ davey = "0.1.4"
 # Opus codec
 audiopus = "0.3.0-rc.0"
 
-# Voice transport encryption
+# Voice transport encryption.
+#
+# These two are on different `aead` versions on purpose, and cannot be aligned: `chacha20poly1305`
+# 0.11 uses aead 0.6 (its in-place trait is `AeadInOut`), while `xsalsa20poly1305` has not been
+# released since 0.9.1 (2023) and still uses aead 0.5 (`AeadInPlace`). `crypto.rs` imports both
+# traits anonymously, so each cipher resolves to its own; dropping either bump would break that
+# arrangement rather than fix it.
 xsalsa20poly1305 = "0.9"
 chacha20poly1305 = "0.11"
 

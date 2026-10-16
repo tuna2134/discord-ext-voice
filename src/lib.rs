@@ -32,9 +32,22 @@ mod transport;
 
 pub(crate) use logging::{log_debug, log_error, log_info, log_warning};
 
+/// Select the process-wide rustls crypto provider.
+///
+/// rustls cannot choose when more than one provider is compiled in (the dependency graph decides
+/// that, not this crate), and `reqwest` — built with `rustls-no-provider`, see Cargo.toml — asks
+/// for the process default instead of shipping one. Ring is the provider this crate enables, so
+/// install it once, before anything can build a TLS client. A provider someone else installed
+/// first is left alone.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// The native extension module.
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    install_crypto_provider();
+
     module.add_class::<connection::VoiceConnection>()?;
     module.add_class::<source::PyDecodeSource>()?;
     module.add_class::<source::PyOpusSource>()?;

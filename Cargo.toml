@@ -42,10 +42,14 @@ futures-util = "0.3"
 # Audio decoding / resampling
 ac-ffmpeg = "0.19"
 
-# HTTP(S) inputs for the audio sources: a URL is streamed straight into libav. `rustls` +
-# `webpki-roots` keeps the TLS stack the same one the voice websocket uses (and avoids OpenSSL):
-# reqwest 0.13 renamed the old `rustls-tls` feature, which was exactly those two.
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots"] }
+# HTTP(S) inputs for the audio sources: a URL is streamed straight into libav. `rustls-no-provider`
+# + `webpki-roots` keeps the TLS stack the same one the voice websocket uses (and avoids OpenSSL).
+#
+# Not `rustls`: that feature pulls in `rustls/aws-lc-rs` as well, and rustls refuses to choose
+# between two compiled-in providers — it panics with "Could not automatically determine the
+# process-level CryptoProvider" the first time a TLS client is built. With no provider of its own,
+# reqwest asks for the process default, which `_native` installs (ring) at import time.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "webpki-roots"] }
 
 # Discord voice gateway protocol models (the maintained successor of the
 # `voice-model` crate, renamed by its upstream)

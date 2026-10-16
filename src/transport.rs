@@ -413,7 +413,12 @@ pub fn tls_config() -> Arc<ClientConfig> {
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
 
-            let config = ClientConfig::builder()
+            // Naming the provider keeps this independent of which `rustls` provider features the
+            // dependency graph happens to enable (see the comment on `reqwest` in Cargo.toml).
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("the ring provider supports the default protocol versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Arc::new(config)
@@ -1138,6 +1143,45 @@ async fn discover_ip(socket: &UdpSocket, ssrc: u32) -> Result<(IpAddr, u16), Tra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both TLS clients this crate builds have to be buildable, whatever provider features the
+    /// dependency graph enables.
+    ///
+    /// This is the regression test for the panic that took `!join` down: rustls cannot choose a
+    /// provider on its own, so `_native` installs ring at import and every client names or
+    /// inherits it. Building a `reqwest` client is the part that *depends* on that install.
+    #[test]
+    fn tls_clients_can_be_built() {
+        crate::install_crypto_provider();
+
+        let _ = tls_config(); // the voice websocket
+        reqwest::blocking::Client::builder()
+            .build()
+            .expect("the HTTP(S) audio source client must be buildable");
+    }
+
+    /// The same, but over the network: a real TLS websocket handshake, against Discord's own
+    /// gateway. Ignored by default (it needs the network and a reachable Discord); run it with
+    /// `cargo test -- --ignored` after touching anything TLS.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn a_tls_websocket_handshake_works() {
+        crate::install_crypto_provider();
+
+        match connect_websocket("gateway.discord.gg:443").await {
+            // The TLS handshake and the websocket upgrade both have to get somewhere: Discord
+            // answers the gateway path, and anything else is a protocol answer rather than the
+            // provider panic this test exists for.
+            Ok(_) => {}
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    !message.contains("CryptoProvider"),
+                    "the rustls provider was not selected: {message}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn splits_endpoints_with_and_without_ports() {

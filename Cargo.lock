@@ -472,7 +472,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "pyo3",
  "pyo3-async-runtimes",
- "rand 0.8.8",
+ "rand 0.10.3",
  "reqwest",
  "rustls",
  "rustls-native-certs",

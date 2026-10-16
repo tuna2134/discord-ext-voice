@@ -44,7 +44,7 @@ jobs:
       # provides an interpreter but no environment, so the job makes its own.
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg and Opus development libraries
         run: |
@@ -98,7 +98,7 @@ jobs:
         # The whole supported range: 3.11 is the floor, so it has to keep building.
         python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg and Opus development libraries
         run: |
@@ -143,7 +143,7 @@ jobs:
     name: Build the sdist
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist

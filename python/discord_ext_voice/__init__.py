@@ -20,8 +20,8 @@ Voice gateway payloads  ``voice-model``
 RTP encryption          ``xsalsa20poly1305`` / ``chacha20poly1305``
 End-to-end encryption   ``davey`` (DAVE / MLS)
 Opus codec              ``audiopus``
-Audio sources           :mod:`discord_ext_voice.sources` (``ac-ffmpeg``, no binary)
-Audio decode/resample   ``ac-ffmpeg`` + ``libswresample``
+Audio sources           :mod:`discord_ext_voice.sources` (no binary, no C library)
+Audio decode/resample   ``symphonia`` + ``rubato``
 Connection flow         :mod:`discord_ext_voice.voice_state` + ``_native.ConnectionFlow``
 Playback clock          :mod:`discord_ext_voice.player` (own thread)
 Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)

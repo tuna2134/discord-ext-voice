@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Links for {{ project }}</title>
+  </head>
+  <body>
+    <h1>Links for {{ project }}</h1>
+{% for link in links %}
+    <a href="{{ link.href }}{% if link.sha256 %}#sha256={{ link.sha256 }}{% endif %}"{% if link.requires_python %} data-requires-python="{{ link.requires_python }}"{% endif %}>{{ link.filename }}</a><br>
+{% endfor %}
+  </body>
+</html>

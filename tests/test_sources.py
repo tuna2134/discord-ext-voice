@@ -1,4 +1,4 @@
-"""Audio source tests: `ac-ffmpeg` decoding, seeking, resampling, Opus pass-through, volume.
+"""Audio source tests: `symphonia` decoding, seeking, resampling, Opus pass-through, volume.
 
 Everything here is this package's own source implementation, so the `ffmpeg` binary is only
 ever used to *create* the Opus fixture; no test decodes through a subprocess.

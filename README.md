@@ -16,7 +16,7 @@ for alternative voice backends — on top of the native transport, and is the on
 package that inherits from `discord.py`. Everything below it is this package's own:
 `dev.VoiceConnectionState` (the connection flow, whose decisions are native),
 `dev.DiscordVoiceWebSocket` (the opcode surface the player talks to), `dev.AudioPlayer` (the
-playback clock) and the audio sources (decoding in process with libav). From `discord.py` we
+playback clock) and the audio sources (decoding in process with `symphonia`). From `discord.py` we
 *use* the host framework rather than inherit it: the client and its gateway, and the exception
 classes the public API raises.
 
@@ -30,13 +30,13 @@ Everything that must be native is native — and that is the whole voice protoco
 | RTP encryption (all four modes) | Rust: `xsalsa20poly1305` / `chacha20poly1305` |
 | DAVE end-to-end encryption (MLS) | Rust: `davey` |
 | Opus codec | Rust: `audiopus` (libopus) |
-| Audio decode + resample | Rust: `ac-ffmpeg` (a fork carrying one fix, see [patches/README.md](patches/README.md)) |
+| Audio decode + resample | Rust: `symphonia` (containers, codecs) + `rubato` (sample rates) |
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
 | Connection flow, reconnect policy | Rust: `_native.ConnectionFlow` (phases, close codes, retries, backoff), driven by `discord_ext_voice.voice_state` |
-| Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `ac-ffmpeg` / `libopus` |
-| `http(s)` inputs | `reqwest` (rustls, no OpenSSL), streamed straight into libav |
+| Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `symphonia` / `rubato` / `libopus` |
+| `http(s)` inputs | `reqwest` (rustls, no OpenSSL), streamed straight into the decoder |
 | Playback clock (the player thread) | Rust: `discord_ext_voice.player` (20ms pacing, silence, speaking) |
 | Voice gateway opcodes and frame surface | This package: `discord_ext_voice.gateway` (Discord's opcode values) |
 | `ffmpeg` subprocess | **not used** — no binary, no pipe, no process to reap |
@@ -47,11 +47,11 @@ Everything that must be native is native — and that is the whole voice protoco
   `aead_xchacha20_poly1305_rtpsize` are implemented natively, including the incrementing nonce
   behaviour discord.py relies on. The test suite decrypts every mode with PyNaCl to prove
   byte-level compatibility.
-* **No `ffmpeg` subprocess, ever.** The audio sources are this package's own
-  (`discord_ext_voice.sources`): libav demuxes, decodes and resamples in process,
-  `libswresample`/`libopus` do the rest, and `seek=` replaces `-ss`. There is no binary to
-  install and no child process to reap. Getting the resampler there needed one upstream fix to
-  `ac-ffmpeg` — see [patches/README.md](patches/README.md).
+* **No FFmpeg, in any form.** The audio sources are this package's own
+  (`discord_ext_voice.sources`): `symphonia` demuxes and decodes in process, `rubato` converts
+  the sample rate, `libopus` (through `audiopus`) handles Opus — which symphonia has no decoder
+  for — and `seek=` replaces `-ss`. No `ffmpeg` binary, no C library to install, no child
+  process to reap: the extension links nothing but libc and libopus.
 * **Encoding, encryption, the UDP send and the playback clock itself happen in Rust**, so
   playback jitter does not compete with Python work — the player reads one frame from the source
   and paces it against a native 20ms clock.
@@ -73,27 +73,26 @@ Build time:
 
 * Rust 1.85 or newer (edition 2024)
 * `pkg-config`
-* FFmpeg development libraries: `libavformat`, `libavcodec`, `libavutil`, `libswresample`
 * `libopus` development libraries
-* `git`, for the first build: `ac-ffmpeg` comes from a fork on GitHub (see
-  [patches/README.md](patches/README.md)) and Cargo clones it once into its own cache
+
+Nothing else: the demuxers, decoders and resamplers are pure Rust (`symphonia`, `rubato`).
 
 Debian/Ubuntu:
 
 ```bash
-sudo apt install pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libopus-dev
+sudo apt install pkg-config libopus-dev
 ```
 
 Arch:
 
 ```bash
-sudo pacman -S pkgconf ffmpeg opus
+sudo pacman -S pkgconf opus
 ```
 
-A wheel from the package index is **self-contained**: `maturin` bundles the FFmpeg, Opus and
-supporting libraries the extension links against into `discord_ext_voice.libs/` and points the
-extension's RPATH at them, so nothing has to be installed to run it (that is also why a wheel is
-around 74MB). A build from source links against the system libraries listed above instead.
+A wheel from the package index is **self-contained**: `maturin` bundles the one library the
+extension links against (`libopus`) into `discord_ext_voice.libs/` and points the extension's
+RPATH at it, so nothing has to be installed to run it. A wheel is around 8MB; a build from source
+links against the system libopus instead.
 
 ## Install
 
@@ -103,11 +102,6 @@ python -m venv .venv && . .venv/bin/activate
 pip install maturin
 maturin develop --release
 ```
-
-`ac-ffmpeg` is used through a small fork that carries one fix (see
-[patches/README.md](patches/README.md)). Cargo fetches it automatically — no submodule, no
-vendored tree — and `Cargo.lock` pins the exact commit, so the first build needs `git` and
-network access and every later build is offline.
 
 ### From the package index
 
@@ -119,8 +113,9 @@ pip install --extra-index-url https://tuna2134.dev/discord-ext-voice/simple/ dis
 ```
 
 `https://tuna2134.github.io/discord-ext-voice/simple/` is the same index (it redirects to the
-custom domain). The distributions themselves are release assets — a wheel is ~74MB, so they are
-not part of the Pages site — and the index lists each file with its SHA-256, which pip verifies.
+custom domain). The distributions themselves are release assets rather than Pages content — every
+deployment replaces the whole site, and the index has to keep every published version — and the
+index lists each file with its SHA-256, which pip verifies.
 
 In a `requirements.txt`:
 
@@ -132,6 +127,10 @@ discord-ext-voice
 The index is rebuilt by [`.github/workflows/pages.yml`](.github/workflows/pages.yml), which runs on
 a tag push (the tag names the release) or on demand from the Actions tab. It carries the links of
 the already-published index over, so a new version never drops the old ones.
+
+The pages themselves are rendered by [`scripts/pages_index.py`](scripts/pages_index.py) from the
+Jinja2 templates in [`scripts/templates/`](scripts/templates), with autoescaping on: the values
+come from the built archives and from the release API.
 
 Only plain `discord.py` is required. `discord.py[voice]` (PyNaCl + the Python `davey`
 bindings) is **not** needed: `VoiceClient` implements `VoiceProtocol` directly, so discord.py's
@@ -177,18 +176,18 @@ accepts it because it implements `discord.VoiceProtocol`.
 ### Audio sources
 
 Every source is implemented in this package ([`discord_ext_voice.sources`](python/discord_ext_voice/sources.py))
-and decodes in process with libav — the `ffmpeg` binary is never started:
+and decodes in process with `symphonia` — no FFmpeg, no binary:
 
 | Class | Behaviour |
 | --- | --- |
 | `PCMAudio(stream)` | Raw 16-bit 48kHz stereo PCM from a file object |
-| `FFmpegPCMAudio(source, *, seek=None, headers=None)` | libav decodes and resamples to 48kHz stereo `s16` |
+| `FFmpegPCMAudio(source, *, seek=None, headers=None)` | `symphonia` + `rubato` decode and resample to 48kHz stereo `s16` |
 | `FFmpegOpusAudio(source, *, seek=None, headers=None)` | Opus packets passed through, otherwise PCM + libopus |
 | `PCMVolumeTransformer(source, volume)` | Volume, scaled by the native core (no `audioop`) |
 | `AudioPlayer(source, client, after=...)` | This package: a thin wrapper over the native playback thread |
 
 ```python
-dev.FFmpegPCMAudio('song.mp3')                 # decode in process with libav
+dev.FFmpegPCMAudio('song.mp3')                 # decode in process with symphonia
 dev.FFmpegPCMAudio('song.mp3', seek=30.0)      # start 30s in (what `-ss 30` used to do)
 dev.FFmpegPCMAudio(open('song.mp3', 'rb'))     # a seekable file object works too
 dev.FFmpegPCMAudio('https://example.com/a.mp3')  # streamed with reqwest, no download step
@@ -200,12 +199,12 @@ info = ytdl.extract_info(url, download=False)
 dev.FFmpegPCMAudio(info['url'], headers=info['http_headers'])
 ```
 
-An `http(s)` URL is fetched by `reqwest` (rustls, so no OpenSSL is needed) and handed to libav as
-a stream: playback starts before the download finishes, and seeking uses `Range` requests when the
+An `http(s)` URL is fetched by `reqwest` (rustls, so no OpenSSL is needed) and handed to the
+demuxer as a stream: playback starts before the download finishes, and seeking uses `Range` requests when the
 server supports them (otherwise the request is restarted and the offset skipped). A connection
 that dies or is cut short mid-stream — a throttling CDN closing an idle one, which is routine for
 a long stream — is picked up again from the byte it reached instead of looking like the end of the
-file, which is how libav would read it.
+file, which is how the demuxer would read it.
 
 `headers=` sends extra HTTP headers with every request the reader makes (the first fetch and any
 `Range` a seek issues). Extractors hand those out with the URLs they produce — `yt-dlp`'s
@@ -286,7 +285,7 @@ src/                             # the core
 ├── crypto.rs                    # the four RTP encryption modes
 ├── dave.rs                      # DAVE/MLS session and transition state machine
 ├── opus.rs                      # libopus encode/decode
-└── source.rs                    # audio sources: libav decoding, files, file objects, http(s)
+└── source.rs                    # audio sources: symphonia decoding, files, objects, http(s)
 ```
 
 ### Design notes
@@ -302,16 +301,11 @@ top-level member without consuming its value, and Discord's voice gateway sends 
 alongside `op`/`d`. Every incoming frame is filtered down to `op` + `d` (recording `seq` for
 `RESUME`) and re-parsed from text.
 
-**`ac-ffmpeg` is patched to a fork that carries one resampler fix.** Its `AudioResampler`
-hands frames straight to `swr_convert_frame`, which rejects the *unspecified* channel layouts
-that current FFmpeg
-decoders emit for plain PCM streams (`AVERROR_INPUT_CHANGED`, "Input changed"), and its public
-API offers no configuration that avoids it. The build therefore patches `ac-ffmpeg` to a fork
-of upstream `09f1421` (release 0.19.0) with a small fix that normalises the layout of a shallow
-frame copy before converting. The change is also exported as
-`patches/0001-resampler-accept-unspecified-channel-layout.patch`, which is what gets rebased
-onto new releases and sent upstream; dropping the fork once a fixed release exists is a three
-line change, see [patches/README.md](patches/README.md).
+**Decoding is pure Rust.** `symphonia` reads the container and decodes the codec, `rubato`
+converts anything that is not already 48kHz stereo, and Opus packets — the one codec symphonia
+has no decoder for — go to libopus through `audiopus`, the same library the encoder uses. A
+44.1kHz MP3 is therefore resampled in process, and a WebM/Opus stream (what a YouTube URL
+gives) is demuxed by symphonia and decoded by libopus.
 
 **The connection flow's decisions are native.** `discord_ext_voice.voice_state` awaits what only
 Python can await (discord.py's `Guild.change_voice_state`, the native handshake, the websocket

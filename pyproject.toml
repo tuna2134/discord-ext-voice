@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "discord-ext-voice"
-description = "A discord.py VoiceClient-compatible Discord voice library powered by Rust (pyo3, tokio-tungstenite, rustls, ac-ffmpeg, davey, audiopus)"
+description = "A discord.py VoiceClient-compatible Discord voice library powered by Rust (pyo3, tokio-tungstenite, rustls, symphonia, davey, audiopus)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -32,16 +32,21 @@ dependencies = [
 # PyNaCl is used by the test suite only, to prove the native RTP packets are byte-compatible
 # with discord.py's own encryption; yt-dlp is what `examples/ytdl.py` drives, and the test for
 # that example skips itself when it is missing.
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "websockets>=13", "pynacl>=1.5", "yt-dlp>=2025"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "websockets>=13",
+    "pynacl>=1.5",
+    "yt-dlp>=2025",
+    # `scripts/pages_index.py` renders the PEP 503 index GitHub Pages serves.
+    "jinja2>=3.1",
+]
 
 [tool.maturin]
 module-name = "discord_ext_voice._native"
 python-source = "python"
 # No `abi3`: one wheel per CPython version (3.11 and newer), built in CI for each of them.
 features = ["extension-module"]
-# Patching `ac-ffmpeg` with a git dependency (see patches/README.md) keeps the sdist small:
-# `pip install <sdist>` fetches the fork rather than shipping a copy of it, at the cost of
-# needing `git` and network access — exactly like building from a source checkout.
 # The reference `discord.py` checkout some working copies carry is not part of this package.
 exclude = ["discord.py/**"]
 

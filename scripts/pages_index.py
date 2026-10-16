@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build the PEP 503 simple index that GitHub Pages serves.
 
-``pip install --extra-index-url <pages-url>/simple/ discord-ext-voice`` reads exactly this:
+The pages are rendered from the Jinja2 templates in ``scripts/templates/``. What
+``pip install --extra-index-url <pages-url>/simple/ discord-ext-voice`` reads is:
 
     site/
     ├── index.html                      # a landing page with the pip command
@@ -14,6 +15,11 @@ The distributions themselves are *not* copied here: they are published as GitHub
 (a wheel is ~73MB, because maturin bundles the FFmpeg libraries into it, and a Pages deployment
 replaces the whole site on every publish). Each link therefore points at a release asset, with the
 ``#sha256=`` fragment pip verifies against.
+
+``--assets`` is the release's asset list (``gh release view --json assets``), and its ``digest``
+fields are what the hashes come from: they are what GitHub actually serves, which is not
+necessarily what this run built. Publishing a version twice would otherwise leave an index whose
+hashes belong to one build and files that belong to another.
 
 Because the site is replaced on every publish, ``--previous-url`` reads the index that is live now
 and carries its links over, so publishing 0.2.0 does not drop 0.1.0 from the index. Only the small
@@ -28,7 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import html
+import json
 import re
 import tarfile
 import urllib.parse
@@ -36,6 +42,8 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 #: The `href` of an anchor in a page this script wrote, with its optional hash fragment.
 ANCHOR = re.compile(
@@ -52,6 +60,19 @@ class Link:
     href: str
     sha256: str
     requires_python: str | None
+
+
+#: The Jinja2 templates, next to this script so that it runs from anywhere.
+TEMPLATES = Path(__file__).resolve().parent / 'templates'
+
+
+def environment() -> Environment:
+    """A Jinja2 environment with HTML escaping on: the values come from archives and the API."""
+    return Environment(
+        loader=FileSystemLoader(TEMPLATES),
+        autoescape=select_autoescape(['html']),
+        keep_trailing_newline=True,
+    )
 
 
 def normalize(name: str) -> str:
@@ -92,16 +113,35 @@ def digest(path: Path) -> str:
     return accumulator.hexdigest()
 
 
-def local_links(dist: Path, base_url: str) -> dict[str, list[Link]]:
-    """The distributions in ``dist``, keyed by normalised project name."""
+def release_digests(path: Path | None) -> dict[str, str]:
+    """The SHA-256 of every asset the release has, as ``gh release view --json assets`` reports."""
+    if path is None:
+        return {}
+
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    digests: dict[str, str] = {}
+    for asset in payload.get('assets', []):
+        digest = (asset.get('digest') or '').removeprefix('sha256:')
+        if asset.get('name') and digest:
+            digests[asset['name']] = digest
+    return digests
+
+
+def local_links(dist: Path, base_url: str, digests: dict[str, str]) -> dict[str, list[Link]]:
+    """The distributions in ``dist``, keyed by normalised project name.
+
+    The hash is the one the release reports for that file when it has it, and the local file's
+    otherwise (a dry run, or an asset the API has no digest for).
+    """
     projects: dict[str, list[Link]] = {}
     for path in sorted(dist.iterdir()):
         if not path.is_file() or not (path.suffix == '.whl' or path.name.endswith('.tar.gz')):
             continue
         name, _, requires = metadata(path)
         href = f'{base_url.rstrip("/")}/{urllib.parse.quote(path.name)}'
+        published = digests.get(path.name)
         projects.setdefault(normalize(name), []).append(
-            Link(path.name, href, digest(path), requires)
+            Link(path.name, href, published or digest(path), requires)
         )
     return projects
 
@@ -152,71 +192,33 @@ def published_links(previous_url: str) -> dict[str, list[Link]]:
 
 
 def write_pages(site: Path, projects: dict[str, list[Link]], url: str) -> None:
-    """Write the index pages: one per project, plus the root list and a landing page."""
+    """Render the index pages: one per project, plus the root list and a landing page."""
+    templates = environment()
     simple = site / 'simple'
     simple.mkdir(parents=True, exist_ok=True)
 
+    project_template = templates.get_template('project_index.html')
     for project, links in sorted(projects.items()):
-        lines = [
-            '<!DOCTYPE html>',
-            '<html lang="en">',
-            '  <head>',
-            '    <meta charset="utf-8">',
-            f'    <title>Links for {html.escape(project)}</title>',
-            '  </head>',
-            '  <body>',
-            f'    <h1>Links for {html.escape(project)}</h1>',
-        ]
+        directory = simple / project
+        directory.mkdir(parents=True, exist_ok=True)
         # Newest last, which is the order the releases were published in.
-        for link in links:
-            fragment = f'#sha256={link.sha256}' if link.sha256 else ''
-            attributes = (
-                f' data-requires-python="{html.escape(link.requires_python)}"'
-                if link.requires_python
-                else ''
-            )
-            lines.append(
-                f'    <a href="{html.escape(link.href)}{fragment}"{attributes}>'
-                f'{html.escape(link.filename)}</a><br>'
-            )
-        lines += ['  </body>', '</html>', '']
-        (simple / project / 'index.html').parent.mkdir(parents=True, exist_ok=True)
-        (simple / project / 'index.html').write_text('\n'.join(lines), encoding='utf-8')
+        (directory / 'index.html').write_text(
+            project_template.render(project=project, links=links), encoding='utf-8'
+        )
 
-    lines = [
-        '<!DOCTYPE html>',
-        '<html lang="en">',
-        '  <head>',
-        '    <meta charset="utf-8">',
-        '    <title>Simple index</title>',
-        '  </head>',
-        '  <body>',
-    ]
-    for project in sorted(projects):
-        lines.append(f'    <a href="{html.escape(project)}/">{html.escape(project)}</a><br>')
-    lines += ['  </body>', '</html>', '']
-    (simple / 'index.html').write_text('\n'.join(lines), encoding='utf-8')
+    (simple / 'index.html').write_text(
+        templates.get_template('simple_index.html').render(projects=sorted(projects)),
+        encoding='utf-8',
+    )
 
-    command = f'pip install --extra-index-url {url.rstrip("/")}/simple/ discord-ext-voice'
+    names = sorted(projects)
+    project = names[0] if names else 'the package'
+    base = url.rstrip('/')
     (site / 'index.html').write_text(
-        '\n'.join(
-            [
-                '<!DOCTYPE html>',
-                '<html lang="en">',
-                '  <head>',
-                '    <meta charset="utf-8">',
-                '    <title>discord-ext-voice package index</title>',
-                '  </head>',
-                '  <body>',
-                '    <h1>discord-ext-voice package index</h1>',
-                "    <p>A PEP 503 index, built from this repository's GitHub Actions runs. "
-                'The distributions themselves are release assets.</p>',
-                f'    <p>Index: <a href="simple/">{html.escape(url)}/simple/</a></p>',
-                f'    <pre>{html.escape(command)}</pre>',
-                '  </body>',
-                '</html>',
-                '',
-            ]
+        templates.get_template('landing.html').render(
+            project=project,
+            url=base,
+            command=f'pip install --extra-index-url {base}/simple/ {project}',
         ),
         encoding='utf-8',
     )
@@ -232,6 +234,12 @@ def main() -> None:
         help='where the distributions are downloadable, e.g. a release download URL',
     )
     parser.add_argument(
+        '--assets',
+        type=Path,
+        default=None,
+        help="the release's asset list (`gh release view --json assets`), whose digests are used",
+    )
+    parser.add_argument(
         '--previous-url',
         default='',
         help='the simple index that is live now, whose links are carried over',
@@ -241,7 +249,7 @@ def main() -> None:
 
     args.site.mkdir(parents=True, exist_ok=True)
     projects = published_links(args.previous_url)
-    added = local_links(args.dist, args.base_url)
+    added = local_links(args.dist, args.base_url, release_digests(args.assets))
     for project, links in added.items():
         known = {link.filename for link in projects.setdefault(project, [])}
         projects[project].extend(link for link in links if link.filename not in known)

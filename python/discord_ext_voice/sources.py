@@ -2,10 +2,11 @@
 
 Every source here is implemented in this package and decodes in process:
 
-* ``ac-ffmpeg`` (libavformat, libavcodec, libswresample) for containers and codecs,
-* ``libopus`` for the packets :class:`discord_ext_voice.opus.Encoder` produces at play time.
+* ``symphonia`` for containers and codecs, and ``rubato`` for sample rates,
+* ``libopus`` (through ``audiopus``) for Opus, both the packets the encoder produces and the
+  ones a stream already carries.
 
-The ``ffmpeg`` binary is never spawned, which is why discord.py's FFmpeg-CLI arguments
+There is no FFmpeg anywhere, which is why discord.py's FFmpeg-CLI arguments
 (``executable``, ``pipe``, ``stderr``, ``before_options``, ``options``, ``force_cli``) do not
 exist here — pass the media itself (a path, a file object or an ``http(s)`` URL, which is
 streamed with ``reqwest``), and use ``seek`` where ``-ss`` used to go. An ``http(s)`` source
@@ -69,8 +70,8 @@ def _reject_ffmpeg_cli_options(options: dict[str, Any]) -> None:
     names = ', '.join(sorted(options))
     plural = 's' if len(options) > 1 else ''
     raise TypeError(
-        f'unsupported argument{plural} {names}: this package decodes in process with ac-ffmpeg '
-        '(libav) and never runs the ffmpeg binary, so the FFmpeg CLI arguments of discord.py '
+        f'unsupported argument{plural} {names}: this package decodes in process with symphonia '
+        'and never runs an ffmpeg binary, so the FFmpeg CLI arguments of discord.py '
         '(before_options, options, executable, pipe, stderr, force_cli) do not exist here. '
         'Pass the media directly and use seek= instead of -ss.'
     )
@@ -212,13 +213,13 @@ class PCMAudio(AudioSource):
 
 
 class FFmpegPCMAudio(AudioSource):
-    """A PCM source decoded and resampled in process with libav (``ac-ffmpeg``).
+    """A PCM source decoded and resampled in process (``symphonia`` + ``rubato``).
 
     Parameters
     ----------
     source: :class:`str` | :term:`py:file object`
         A path to a media file, an ``http(s)`` URL, or a file-like object. A URL is fetched with
-        ``reqwest`` and handed to libav as a stream, so playback starts before the download
+        ``reqwest`` and handed to the demuxer as a stream, so playback starts before the download
         finishes; ranged requests are used for seeking when the server supports them.
     seek: Optional[:class:`float`]
         Start this many seconds into the stream — the native form of ``-ss``. The input has to
@@ -289,7 +290,7 @@ class FFmpegOpusAudio(AudioSource):
 
     @staticmethod
     def probe_codec(source: Any) -> Optional[str]:
-        """The codec name libav reports for ``source``, or ``None`` if it cannot be read."""
+        """The codec name the demuxer reports for ``source``, or ``None`` if it cannot be read."""
         try:
             probed = _native.probe(source)
         except _native.FFmpegError:
@@ -300,7 +301,7 @@ class FFmpegOpusAudio(AudioSource):
     async def probe(cls, source: Any) -> tuple[Optional[str], Optional[int]]:
         """Probe ``source`` for its codec and bitrate without decoding it.
 
-        Returns ``(codec, bitrate)``. The probing is libav's, so no ``ffprobe``/``ffmpeg``
+        Returns ``(codec, bitrate)``. The probing is in process, so no ``ffprobe``/``ffmpeg``
         process is started and the bitrate is always ``None`` — a transport stream does not
         carry one bitrate the way discord.py's CLI probe reports it.
         """

@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Simple index</title>
+  </head>
+  <body>
+{% for project in projects %}
+    <a href="{{ project }}/">{{ project }}</a><br>
+{% endfor %}
+  </body>
+</html>

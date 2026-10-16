@@ -8,7 +8,8 @@
 //!   `aead_xchacha20_poly1305_rtpsize`).
 //! * [`dave`] — the DAVE/MLS end-to-end encryption session built on `davey`.
 //! * [`opus`] — Opus encode/decode built on `audiopus`.
-//! * [`source`] — in-process FFmpeg demuxing, decoding and resampling built on `ac-ffmpeg`.
+//! * [`source`] — in-process demuxing and decoding built on `symphonia`, resampling on `rubato`
+//!   and Opus on `audiopus`.
 //! * [`player`] — the playback clock, reading an `AudioSource` and pacing 20ms frames.
 //! * [`flow`] — the connection flow's decisions: phase transitions, close codes, retries.
 //! * [`connection`] — the `VoiceConnection` Python object tying it all together.

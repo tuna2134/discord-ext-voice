@@ -1,5 +1,10 @@
-//! In-process audio decoding and resampling with `ac-ffmpeg` (libav*), exposed to Python as
-//! `AudioSource`-compatible objects.
+//! In-process audio decoding, demuxing and resampling, exposed to Python as `AudioSource`
+//! compatible objects.
+//!
+//! Nothing here needs FFmpeg: containers and codecs come from `symphonia` (pure Rust), the
+//! sample-rate conversion that `libswresample` used to do comes from `rubato`, and Opus — the one
+//! codec symphonia has no decoder for — is decoded by `audiopus`, the same libopus the encoder
+//! uses.
 //!
 //! Two flavours are provided:
 //!
@@ -8,8 +13,8 @@
 //! * [`PyOpusSource`] demuxes a stream whose audio codec is already Opus and hands out the raw
 //!   Opus packets, so no re-encoding is needed (`AudioSource.is_opus() is True`).
 //!
-//! Both accept either a filesystem path or a Python file-like object, which means a bot never
-//! has to shell out to the `ffmpeg` binary for local media.
+//! Both accept a filesystem path, a Python file-like object or an `http(s)` URL (streamed with
+//! `reqwest`, with resumable reads), so a bot never shells out for its media.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -17,20 +22,28 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ac_ffmpeg::codec::Decoder;
-use ac_ffmpeg::codec::audio::AudioDecoder;
-use ac_ffmpeg::codec::audio::AudioResampler;
-use ac_ffmpeg::codec::audio::frame::{
-    AudioFrame, ChannelLayout, SampleFormat, get_channel_layout, get_sample_format,
-};
-use ac_ffmpeg::format::demuxer::{Demuxer, DemuxerWithStreamInfo, SeekTarget};
-use ac_ffmpeg::format::io::IO;
-use ac_ffmpeg::format::stream::Stream;
-use ac_ffmpeg::time::Timestamp;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction, calculate_cutoff,
+};
+use symphonia::core::audio::Channels;
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
+use symphonia::core::codecs::audio::{
+    AudioCodecId, AudioCodecParameters, AudioDecoder, AudioDecoderOptions,
+};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::packet::Packet;
+use symphonia::core::units::Time;
 
 use crate::errors::FFmpegError;
 use crate::{log_debug, log_info};
@@ -40,6 +53,13 @@ pub const FRAME_SAMPLES: usize = 960;
 pub const FRAME_CHANNELS: usize = 2;
 pub const FRAME_BYTES: usize = FRAME_SAMPLES * FRAME_CHANNELS * 2;
 const TARGET_SAMPLE_RATE: u32 = 48_000;
+/// libopus always decodes to 48kHz, whatever the stream's original rate was.
+const OPUS_RATE: u32 = TARGET_SAMPLE_RATE;
+/// Frames per resampler chunk: short enough to keep the filter's delay inaudible, long enough to
+/// be cheap.
+const RESAMPLE_CHUNK: usize = 1024;
+/// Taps in the resampler's sinc filter.
+const SINC_LEN: usize = 128;
 
 /// Build the Python exception for an internal error message.
 ///
@@ -56,7 +76,7 @@ const SEEK_SKIP_LIMIT: u64 = 1 << 20;
 /// normal for a long stream; a server that refuses every request is not.
 const MAX_RESUMES: u32 = 3;
 
-/// A byte source for libav: a real file, a Python file-like object, or an HTTP(S) URL.
+/// A byte source for the demuxer: a real file, a Python file-like object, or an HTTP(S) URL.
 pub enum Input {
     File(File),
     PyFile(PyFile),
@@ -95,17 +115,18 @@ impl Seek for Input {
     }
 }
 
-/// An HTTP(S) response as a seekable byte stream for libav.
+/// An HTTP(S) response as a seekable byte stream for the demuxer.
 ///
-/// `read` hands libav what the server has sent so far, so playback starts before the file has
-/// been downloaded. `seek` reads forward when the target is close, and otherwise asks the server
-/// for the rest of the file with a `Range` header — falling back to restarting and skipping when
-/// the server ignores ranges. libav needs that for containers whose index sits at the end (MP4).
+/// `read` hands the demuxer what the server has sent so far, so playback starts before the file
+/// has been downloaded. `seek` reads forward when the target is close, and otherwise asks the
+/// server for the rest of the file with a `Range` header — falling back to restarting and
+/// skipping when the server ignores ranges. Containers whose index sits at the end (MP4) need
+/// that.
 ///
 /// The connection is opened on the first read, so constructing a source never blocks on the
 /// network, and a connection that dies mid-stream is picked up again from the byte it reached: a
-/// throttling CDN closing an idle connection is normal, while libav reads the end of the input as
-/// the end of the file.
+/// throttling CDN closing an idle connection is normal, while the demuxer reads the end of the
+/// input as the end of the file.
 pub struct HttpStream {
     url: String,
     client: reqwest::blocking::Client,
@@ -302,7 +323,7 @@ impl Seek for HttpStream {
     }
 }
 
-/// Adapter that drives a Python file-like object from libav's IO callbacks.
+/// Adapter that drives a Python file-like object from the demuxer's IO callbacks.
 pub struct PyFile {
     object: Py<PyAny>,
     seekable: bool,
@@ -389,10 +410,10 @@ fn parse_headers(headers: Option<HashMap<String, String>>) -> PyResult<HeaderMap
     Ok(map)
 }
 
-/// Turn a Python object into libav input.
+/// Turn a Python object into demuxer input.
 ///
 /// Only the Python object is touched here: opening an HTTP(S) URL is left to the first read, and
-/// the libav part of the handshake happens in [`demux`], which the callers run without the GIL.
+/// the probing happens in [`probe_input`], which the callers run without the GIL.
 ///
 /// `headers` apply to an HTTP(S) input; a path or a file object ignores them.
 fn open_input(source: &Bound<'_, PyAny>, headers: &HeaderMap) -> Result<Input, String> {
@@ -430,230 +451,423 @@ fn open_input(source: &Bound<'_, PyAny>, headers: &HeaderMap) -> Result<Input, S
     )
 }
 
-struct DemuxedInput {
-    demuxer: DemuxerWithStreamInfo<Input>,
-    stream_index: usize,
+/// The audio track that gets played, as the container reports it.
+struct AudioTrack {
+    id: u32,
+    params: AudioCodecParameters,
+    /// The container's duration, when it reports one.
+    duration: Option<f64>,
 }
 
-impl DemuxedInput {
-    fn stream(&self) -> &Stream {
-        &self.demuxer.streams()[self.stream_index]
+/// Let symphonia read from our inputs: a file, a Python file object or a resumable HTTP stream.
+impl MediaSource for Input {
+    fn is_seekable(&self) -> bool {
+        Input::seekable(self)
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        match self {
+            Input::File(file) => file.metadata().ok().map(|meta| meta.len()),
+            Input::PyFile(_) => None,
+            Input::Http(stream) => stream.length,
+        }
     }
 }
 
-fn demux(input: Input) -> Result<DemuxedInput, String> {
-    let seekable = input.seekable();
+/// Probe `input` for its container and audio track.
+fn probe_input(input: Input) -> Result<(Box<dyn FormatReader>, AudioTrack), String> {
+    let stream = MediaSourceStream::new(Box::new(input), MediaSourceStreamOptions::default());
+    let format = symphonia::default::get_probe()
+        .probe(
+            &Hint::new(),
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|err| format!("the input could not be identified: {err}"))?;
 
-    let io = if seekable {
-        IO::from_seekable_read_stream(input)
-    } else {
-        IO::from_read_stream(input)
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| "the input contains no audio stream".to_owned())?;
+
+    let id = track.id;
+    let num_frames = track.num_frames;
+    let params = match track.codec_params.as_ref() {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("the input's audio track carries no codec information".to_owned()),
     };
 
-    let demuxer = Demuxer::builder()
-        .build(io)
-        .map_err(|err| format!("FFmpeg could not open the input: {err}"))?;
-    let demuxer = demuxer
-        .find_stream_info(None)
-        .map_err(|(_, err)| format!("FFmpeg could not read stream information: {err}"))?;
+    let media = format.media_info();
+    let duration = media
+        .duration
+        .zip(media.time_base)
+        .and_then(|(duration, base)| base.calc_duration(duration))
+        .map(|time| time.as_secs_f64())
+        .or_else(|| {
+            let frames = num_frames?;
+            let rate = params.sample_rate?;
+            (rate > 0).then(|| frames as f64 / f64::from(rate))
+        });
 
-    let stream_index = demuxer
-        .streams()
-        .iter()
-        .position(|candidate| candidate.codec_parameters().is_audio_codec())
-        .ok_or("the input contains no audio stream".to_owned())?;
-
-    log_debug!("demuxed input with audio stream at index {stream_index}");
-
-    Ok(DemuxedInput {
-        demuxer,
-        stream_index,
-    })
+    Ok((
+        format,
+        AudioTrack {
+            id,
+            params,
+            duration,
+        },
+    ))
 }
 
-/// A decoding audio source: libav input -> decoder -> resampler -> 20ms PCM frames.
+/// The codec's name, spelled the way `ffmpeg` used to report it.
+fn codec_name(codec: AudioCodecId) -> &'static str {
+    use symphonia::core::codecs::audio::well_known::{
+        CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_FLAC, CODEC_ID_MP3, CODEC_ID_OPUS,
+        CODEC_ID_PCM_F32LE, CODEC_ID_PCM_F64LE, CODEC_ID_PCM_S8, CODEC_ID_PCM_S16BE,
+        CODEC_ID_PCM_S16LE, CODEC_ID_PCM_S24BE, CODEC_ID_PCM_S24LE, CODEC_ID_PCM_S32BE,
+        CODEC_ID_PCM_S32LE, CODEC_ID_PCM_U8, CODEC_ID_VORBIS,
+    };
+
+    if codec == CODEC_ID_PCM_S16LE {
+        "pcm_s16le"
+    } else if codec == CODEC_ID_PCM_S16BE {
+        "pcm_s16be"
+    } else if codec == CODEC_ID_PCM_S24LE {
+        "pcm_s24le"
+    } else if codec == CODEC_ID_PCM_S24BE {
+        "pcm_s24be"
+    } else if codec == CODEC_ID_PCM_S32LE {
+        "pcm_s32le"
+    } else if codec == CODEC_ID_PCM_S32BE {
+        "pcm_s32be"
+    } else if codec == CODEC_ID_PCM_S8 {
+        "pcm_s8"
+    } else if codec == CODEC_ID_PCM_U8 {
+        "pcm_u8"
+    } else if codec == CODEC_ID_PCM_F32LE {
+        "pcm_f32le"
+    } else if codec == CODEC_ID_PCM_F64LE {
+        "pcm_f64le"
+    } else if codec == CODEC_ID_MP3 {
+        "mp3"
+    } else if codec == CODEC_ID_AAC {
+        "aac"
+    } else if codec == CODEC_ID_FLAC {
+        "flac"
+    } else if codec == CODEC_ID_VORBIS {
+        "vorbis"
+    } else if codec == CODEC_ID_OPUS {
+        "opus"
+    } else if codec == CODEC_ID_ALAC {
+        "alac"
+    } else {
+        "unknown"
+    }
+}
+
+/// The decoder for one track.
+///
+/// Symphonia decodes everything except Opus, which it has no decoder for; those packets go to
+/// libopus through `audiopus`, the same library the encoder uses.
+enum TrackDecoder {
+    Symphonia(Box<dyn AudioDecoder>),
+    Opus(crate::opus::OpusDecoder),
+}
+
+impl TrackDecoder {
+    fn new(params: &AudioCodecParameters) -> Result<Self, String> {
+        if params.codec == CODEC_ID_OPUS {
+            return Ok(Self::Opus(crate::opus::OpusDecoder::new()?));
+        }
+
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
+            .map_err(|err| {
+                format!(
+                    "no decoder for the input's audio codec ({}): {err}",
+                    codec_name(params.codec)
+                )
+            })?;
+        Ok(Self::Symphonia(decoder))
+    }
+
+    /// Drop the decoder's state, as a seek requires.
+    fn reset(&mut self) -> Result<(), String> {
+        match self {
+            Self::Symphonia(decoder) => {
+                decoder.reset();
+                Ok(())
+            }
+            // libopus carries state between packets, so a fresh decoder is the reset.
+            Self::Opus(_) => {
+                *self = Self::Opus(crate::opus::OpusDecoder::new()?);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Where decoded samples go before they are handed out.
+enum Pipeline {
+    /// The source is already 48kHz stereo: only the sample format changes.
+    Direct,
+    /// A different rate: `rubato` converts it.
+    Resample(Box<dyn Resampler<f32>>),
+}
+
+/// Decodes any input to 48kHz stereo signed 16 bit PCM, in 20ms frames.
 pub struct DecodeSource {
-    demuxer: DemuxerWithStreamInfo<Input>,
-    stream_index: usize,
-    decoder: AudioDecoder,
-    resampler: Option<AudioResampler>,
-    /// The parameters the current resampler was built for, so it can be rebuilt when the
-    /// decoder's output changes mid-stream.
-    resampler_source: Option<(SampleFormat, u32, ChannelLayout)>,
+    format: Box<dyn FormatReader>,
+    track_id: u32,
+    /// Whether the input can seek at all. Symphonia can satisfy a small seek from what it has
+    /// buffered, but a source that is not seekable stays one: that is the documented contract.
+    seekable: bool,
+    decoder: TrackDecoder,
+    pipeline: Pipeline,
+    /// The rate the current resampler was built for.
+    pipeline_rate: u32,
+    /// Interleaved stereo `f32` waiting for a full resampler chunk.
+    staging: Vec<f32>,
+    /// Interleaved 48kHz stereo `s16`, ready to be handed out.
     pending: VecDeque<u8>,
+    /// Whether the container has produced its last packet.
     input_done: bool,
-    flushed: bool,
     finished: bool,
 }
 
-// SAFETY: libav contexts are plain C structs with no thread affinity. `DecodeSource` is only
-// ever touched while its enclosing `parking_lot::Mutex` is held, so it is never used from two
-// threads at once. `ac-ffmpeg` itself asserts the same property for its decoder and resampler
-// types.
+// SAFETY: the only non-`Send` member is libopus' decoder, which is used behind the `Mutex` this
+// type lives in and never shared: one thread at a time drives `DecodeSource`.
 unsafe impl Send for DecodeSource {}
 
 impl DecodeSource {
     fn open(input: Input) -> Result<Self, String> {
-        let demuxed = demux(input)?;
-        let stream_index = demuxed.stream_index;
-
-        let decoder = AudioDecoder::from_stream(demuxed.stream())
-            .and_then(|builder| builder.build())
-            .map_err(|err| format!("FFmpeg could not open the audio decoder: {err}"))?;
+        let seekable = input.seekable();
+        let (format, track) = probe_input(input)?;
+        let decoder = TrackDecoder::new(&track.params)?;
+        log_debug!(
+            "decoding {} {}Hz {}ch",
+            codec_name(track.params.codec),
+            track.params.sample_rate.unwrap_or(0),
+            track
+                .params
+                .channels
+                .as_ref()
+                .map(Channels::count)
+                .unwrap_or(0)
+        );
 
         Ok(Self {
-            demuxer: demuxed.demuxer,
-            stream_index,
+            format,
+            track_id: track.id,
+            seekable,
             decoder,
-            resampler: None,
-            resampler_source: None,
+            pipeline: Pipeline::Direct,
+            pipeline_rate: TARGET_SAMPLE_RATE,
+            staging: Vec::new(),
             pending: VecDeque::new(),
             input_done: false,
-            flushed: false,
             finished: false,
         })
     }
 
-    /// Feed one decoded frame through the resampler and buffer the resulting stereo PCM.
-    /// Feed one decoded frame through the resampler and buffer the resulting stereo PCM.
-    fn push_decoded(&mut self, frame: AudioFrame) -> Result<(), String> {
-        let parameters = (
-            frame.sample_format(),
-            frame.sample_rate(),
-            frame.channel_layout().to_owned(),
-        );
-
-        if self.resampler.is_none() || self.resampler_source.as_ref() != Some(&parameters) {
-            log_debug!(
-                "building a resampler: {} {}Hz {}ch -> s16 48000Hz stereo",
-                parameters.0.name(),
-                parameters.1,
-                parameters.2.channels()
-            );
-            let resampler = AudioResampler::builder()
-                .source_channel_layout(parameters.2.clone())
-                .source_sample_format(parameters.0)
-                .source_sample_rate(parameters.1)
-                .target_channel_layout(get_channel_layout("stereo"))
-                .target_sample_format(get_sample_format("s16"))
-                .target_sample_rate(TARGET_SAMPLE_RATE)
-                .target_frame_samples(Some(FRAME_SAMPLES))
-                .build()
-                .map_err(|err| format!("FFmpeg could not build the resampler: {err}"))?;
-            self.resampler = Some(resampler);
-            self.resampler_source = Some(parameters);
-        }
-
-        let resampler = self.resampler.as_mut().expect("resampler just built");
-        resampler
-            .push(frame)
-            .map_err(|err| format!("FFmpeg resampler error: {err}"))
-    }
-
-    /// Move every resampled frame the resampler has ready into `pending`.
-    fn drain_resampler(&mut self) -> Result<(), String> {
-        loop {
-            let frame = match self.resampler.as_mut() {
-                Some(resampler) => resampler
-                    .take()
-                    .map_err(|err| format!("FFmpeg resampler error: {err}"))?,
-                None => return Ok(()),
-            };
-
-            match frame {
-                Some(frame) => {
-                    if let Some(plane) = frame.planes().first() {
-                        self.pending.extend(plane.data().iter().copied());
-                    }
-                }
-                None => return Ok(()),
-            }
-        }
-    }
-
-    /// Advance the pipeline until at least one 20ms frame is buffered or the input ends.
+    /// Decode packets until a 20ms frame is buffered, or the input ends.
     fn pump(&mut self) -> Result<(), String> {
-        loop {
-            self.drain_resampler()?;
-
-            if self.pending.len() >= FRAME_BYTES || self.finished {
-                return Ok(());
-            }
-
-            if let Some(frame) = self
-                .decoder
-                .take()
-                .map_err(|err| format!("FFmpeg decoder error: {err}"))?
-            {
-                self.push_decoded(frame)?;
-                continue;
-            }
-
+        while self.pending.len() < FRAME_BYTES && !self.finished {
             if self.input_done {
-                if !self.flushed {
-                    self.flushed = true;
-                    self.decoder
-                        .flush()
-                        .map_err(|err| format!("FFmpeg decoder flush failed: {err}"))?;
-                    if let Some(resampler) = self.resampler.as_mut() {
-                        resampler
-                            .flush()
-                            .map_err(|err| format!("FFmpeg resampler flush failed: {err}"))?;
-                    }
-                    continue;
-                }
+                // Let the resampler produce the tail of what is left, then stop.
+                self.resample(true)?;
                 self.finished = true;
                 return Ok(());
             }
 
-            match self.demuxer.take() {
+            match self.format.next_packet() {
                 Ok(Some(packet)) => {
-                    if packet.stream_index() == self.stream_index {
-                        self.decoder.try_push(packet).map_err(|err| {
-                            format!(
-                                "FFmpeg could not decode an audio packet: {}",
-                                err.into_inner()
-                                    .map(|inner| inner.to_string())
-                                    .unwrap_or_else(|| "the decoder needs to be drained".to_owned())
-                            )
-                        })?;
+                    if packet.track_id == self.track_id {
+                        self.decode_packet(&packet)?;
                     }
                 }
                 Ok(None) => self.input_done = true,
-                Err(err) => return Err(format!("FFmpeg demux error: {err}")),
+                Err(SymphoniaError::ResetRequired) => {
+                    return Err("the container changed its track layout mid-stream".to_owned());
+                }
+                Err(err) => return Err(format!("the container could not be read: {err}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode one packet into `pending`, through the resampler when there is one.
+    fn decode_packet(&mut self, packet: &Packet) -> Result<(), String> {
+        let (samples, rate, channels) = match &mut self.decoder {
+            TrackDecoder::Symphonia(decoder) => match decoder.decode(packet) {
+                Ok(buffer) => {
+                    let spec = buffer.spec().clone();
+                    let channels = spec.channels().count();
+                    let mut samples = Vec::with_capacity(buffer.frames() * channels.max(1));
+                    buffer.copy_to_vec_interleaved::<f32>(&mut samples);
+                    (samples, spec.rate(), channels)
+                }
+                // A malformed packet is skipped, as symphonia documents: decoding continues with
+                // the next one.
+                Err(SymphoniaError::DecodeError(reason)) => {
+                    log_debug!("skipping an undecodable packet: {reason}");
+                    return Ok(());
+                }
+                Err(SymphoniaError::IoError(err)) => {
+                    log_debug!("skipping a packet the stream cut short: {err}");
+                    return Ok(());
+                }
+                Err(err) => return Err(format!("the audio decoder failed: {err}")),
+            },
+            TrackDecoder::Opus(decoder) => {
+                let decoded = decoder.decode(&packet.data)?;
+                let samples = decoded
+                    .iter()
+                    .map(|sample| f32::from(*sample) / 32768.0)
+                    .collect();
+                (samples, OPUS_RATE, FRAME_CHANNELS)
+            }
+        };
+
+        self.push_samples(&samples, rate, channels)
+    }
+
+    /// Convert decoded samples to 48kHz stereo `s16` and buffer them.
+    fn push_samples(&mut self, samples: &[f32], rate: u32, channels: usize) -> Result<(), String> {
+        if channels == 0 {
+            return Ok(());
+        }
+
+        // Stereo first: mono is duplicated, anything wider keeps its first two channels.
+        let stereo: Vec<f32> = match channels {
+            1 => samples
+                .iter()
+                .flat_map(|sample| [*sample, *sample])
+                .collect(),
+            2 => samples.to_vec(),
+            _ => samples
+                .chunks_exact(channels)
+                .flat_map(|frame| [frame[0], frame[1]])
+                .collect(),
+        };
+
+        self.ensure_pipeline(rate)?;
+        match self.pipeline {
+            Pipeline::Direct => {
+                self.push_s16(&stereo);
+                Ok(())
+            }
+            Pipeline::Resample(_) => {
+                self.staging.extend_from_slice(&stereo);
+                self.resample(false)
             }
         }
     }
 
-    /// Restart the stream `seconds` from its beginning.
-    ///
-    /// This is the native equivalent of the `-ss` argument of the `ffmpeg` binary: the demuxer
-    /// seeks, and everything downstream is rebuilt because it holds samples from the old
-    /// position. `ac-ffmpeg` only exposes draining a decoder (it pushes a null packet), not
-    /// `avcodec_flush_buffers`, so the decoder is recreated from the same stream instead.
-    fn seek(&mut self, seconds: f64) -> Result<(), String> {
-        let micros = seek_micros(seconds)?;
-        self.demuxer
-            .seek_to_timestamp(Timestamp::from_micros(micros), SeekTarget::Precise)
-            .map_err(|err| {
-                format!("FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}")
-            })?;
+    /// Build (or replace) the pipeline for a source at `rate`.
+    fn ensure_pipeline(&mut self, rate: u32) -> Result<(), String> {
+        if rate == TARGET_SAMPLE_RATE {
+            if !matches!(self.pipeline, Pipeline::Direct) {
+                log_debug!("no resampling needed");
+                self.pipeline = Pipeline::Direct;
+                self.staging.clear();
+            }
+            self.pipeline_rate = TARGET_SAMPLE_RATE;
+            return Ok(());
+        }
 
-        let decoder = AudioDecoder::from_stream(&self.demuxer.streams()[self.stream_index])
-            .and_then(|builder| builder.build())
-            .map_err(|err| {
-                format!("FFmpeg could not reopen the audio decoder after seeking: {err}")
-            })?;
+        if matches!(self.pipeline, Pipeline::Resample(_)) && self.pipeline_rate == rate {
+            return Ok(());
+        }
 
-        self.decoder = decoder;
-        self.resampler = None;
-        self.resampler_source = None;
-        self.pending.clear();
-        self.input_done = false;
-        self.flushed = false;
-        self.finished = false;
-        log_debug!("seeked the audio source to {seconds}s");
+        let parameters = SincInterpolationParameters {
+            sinc_len: SINC_LEN,
+            f_cutoff: Some(calculate_cutoff::<f32>(
+                SINC_LEN,
+                WindowFunction::BlackmanHarris2,
+            )),
+            oversampling_factor: 128,
+            interpolation: SincInterpolationType::Linear,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let resampler = Async::<f32>::new_sinc(
+            f64::from(TARGET_SAMPLE_RATE) / f64::from(rate),
+            1.1,
+            &parameters,
+            RESAMPLE_CHUNK,
+            FRAME_CHANNELS,
+            FixedAsync::Input,
+        )
+        .map_err(|err| format!("unable to build the resampler for {rate}Hz: {err}"))?;
+
+        log_debug!("resampling {rate}Hz to {TARGET_SAMPLE_RATE}Hz");
+        self.pipeline = Pipeline::Resample(Box::new(resampler));
+        self.pipeline_rate = rate;
+        self.staging.clear();
         Ok(())
+    }
+
+    /// Move whatever the resampler can produce into `pending`.
+    ///
+    /// `flushing` feeds the last, short chunk (padded with silence by the resampler) so that the
+    /// tail of the input is not dropped.
+    fn resample(&mut self, flushing: bool) -> Result<(), String> {
+        // The resampler is moved out so that `self` stays available while it runs.
+        let Pipeline::Resample(mut resampler) =
+            std::mem::replace(&mut self.pipeline, Pipeline::Direct)
+        else {
+            return Ok(());
+        };
+
+        let result = self.resample_with(&mut *resampler, flushing);
+        self.pipeline = Pipeline::Resample(resampler);
+        result
+    }
+
+    fn resample_with(
+        &mut self,
+        resampler: &mut dyn Resampler<f32>,
+        flushing: bool,
+    ) -> Result<(), String> {
+        loop {
+            let available = self.staging.len() / FRAME_CHANNELS;
+            if available == 0 {
+                return Ok(());
+            }
+
+            let wanted = resampler.input_frames_next();
+            let take = available.min(wanted);
+            let partial = take < wanted;
+            if partial && !flushing {
+                return Ok(()); // wait until a whole chunk has been decoded
+            }
+
+            let slice = &self.staging[..take * FRAME_CHANNELS];
+            let input = InterleavedSlice::new(slice, FRAME_CHANNELS, take)
+                .map_err(|err| format!("unable to hand samples to the resampler: {err}"))?;
+            let indexing = Indexing {
+                partial_len: partial.then_some(take),
+                ..Indexing::default()
+            };
+            let output = resampler
+                .process(&input, Some(&indexing))
+                .map_err(|err| format!("the resampler failed: {err}"))?;
+
+            self.staging.drain(..take * FRAME_CHANNELS);
+            let data = output.take_data();
+            self.push_s16(&data);
+
+            if partial {
+                return Ok(());
+            }
+        }
+    }
+
+    fn push_s16(&mut self, samples: &[f32]) {
+        for sample in samples {
+            let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+            self.pending.extend(value.to_le_bytes());
+        }
     }
 
     fn read_frame(&mut self) -> Result<Vec<u8>, String> {
@@ -671,77 +885,129 @@ impl DecodeSource {
         }
 
         let take = self.pending.len().min(FRAME_BYTES);
-        Ok(self.pending.drain(..take).collect())
+        let mut frame: Vec<u8> = self.pending.drain(..take).collect();
+        if frame.len() < FRAME_BYTES {
+            // The last frame of a source is padded rather than dropped: every frame the player
+            // sends has to be 20ms.
+            frame.resize(FRAME_BYTES, 0);
+        }
+        Ok(frame)
+    }
+
+    /// Restart the stream `seconds` from its beginning.
+    fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        let micros = seek_micros(seconds)?;
+        if !self.seekable {
+            return Err(not_seekable(seconds));
+        }
+        self.format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: Time::from_micros(micros),
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(|err| {
+                format!(
+                    "the input could not be seeked to {seconds}s (it has to be seekable): {err}"
+                )
+            })?;
+
+        self.decoder.reset()?;
+        self.staging.clear();
+        self.pending.clear();
+        self.input_done = false;
+        self.finished = false;
+        if let Pipeline::Resample(resampler) = &mut self.pipeline {
+            resampler.reset();
+        }
+        log_debug!("seeked the audio source to {seconds}s");
+        Ok(())
     }
 }
 
 /// A pass-through source that yields the raw Opus packets of an already-encoded stream.
 pub struct OpusSource {
-    demuxer: DemuxerWithStreamInfo<Input>,
-    stream_index: usize,
+    format: Box<dyn FormatReader>,
+    track_id: u32,
+    seekable: bool,
     finished: bool,
 }
 
-// SAFETY: see the note on `DecodeSource`.
-unsafe impl Send for OpusSource {}
-
 impl OpusSource {
     fn open(input: Input) -> Result<Self, String> {
-        let demuxed = demux(input)?;
-        let stream_index = demuxed.stream_index;
-
-        let codec = demuxed
-            .stream()
-            .codec_parameters()
-            .decoder_name()
-            .unwrap_or("unknown")
-            .to_owned();
-        if !codec.starts_with("opus") && codec != "libopus" {
+        let seekable = input.seekable();
+        let (format, track) = probe_input(input)?;
+        if track.params.codec != CODEC_ID_OPUS {
             return Err(format!(
-                "the audio codec is {codec}, not opus; an Opus pass-through source requires an Opus stream"
+                "the input's audio codec is {}, not Opus",
+                codec_name(track.params.codec)
             ));
         }
-        log_info!("using the Opus packet pass-through source (codec {codec})");
 
+        log_debug!("passing Opus packets through");
         Ok(Self {
-            demuxer: demuxed.demuxer,
-            stream_index,
+            format,
+            track_id: track.id,
+            seekable,
             finished: false,
         })
-    }
-
-    /// Restart the stream `seconds` from its beginning, keeping the packets as they are.
-    fn seek(&mut self, seconds: f64) -> Result<(), String> {
-        let micros = seek_micros(seconds)?;
-        self.demuxer
-            .seek_to_timestamp(Timestamp::from_micros(micros), SeekTarget::Precise)
-            .map_err(|err| {
-                format!("FFmpeg could not seek to {seconds}s (the input has to be seekable): {err}")
-            })?;
-        self.finished = false;
-        log_debug!("seeked the Opus source to {seconds}s");
-        Ok(())
     }
 
     fn read_packet(&mut self) -> Result<Vec<u8>, String> {
         if self.finished {
             return Ok(Vec::new());
         }
+
         loop {
-            match self.demuxer.take() {
-                Ok(Some(packet)) => {
-                    if packet.stream_index() == self.stream_index && !packet.data().is_empty() {
-                        return Ok(packet.data().to_vec());
-                    }
+            match self.format.next_packet() {
+                Ok(Some(packet)) if packet.track_id == self.track_id && !packet.data.is_empty() => {
+                    return Ok(packet.data.to_vec());
                 }
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     self.finished = true;
                     return Ok(Vec::new());
                 }
-                Err(err) => return Err(format!("FFmpeg demux error: {err}")),
+                Err(SymphoniaError::DecodeError(reason)) => {
+                    log_debug!("skipping an undecodable packet: {reason}");
+                }
+                Err(err) => return Err(format!("the container could not be read: {err}")),
             }
         }
     }
+
+    fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        let micros = seek_micros(seconds)?;
+        if !self.seekable {
+            return Err(not_seekable(seconds));
+        }
+        self.format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: Time::from_micros(micros),
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(|err| {
+                format!(
+                    "the input could not be seeked to {seconds}s (it has to be seekable): {err}"
+                )
+            })?;
+
+        self.finished = false;
+        log_debug!("seeked the Opus source to {seconds}s");
+        Ok(())
+    }
+}
+
+/// The error a seek reports when the input cannot seek at all.
+fn not_seekable(seconds: f64) -> String {
+    format!(
+        "the input could not be seeked to {seconds}s (it has to be seekable): the input is not seekable"
+    )
 }
 
 /// Translate a position in seconds into the microseconds a seek expects.
@@ -752,6 +1018,26 @@ fn seek_micros(seconds: f64) -> Result<i64, String> {
         );
     }
     Ok((seconds * 1_000_000.0).round().min(i64::MAX as f64) as i64)
+}
+
+/// What [`probe_source`] reports: codec name, sample rate, channel count and duration.
+pub type ProbeResult = Option<(String, u32, usize, Option<f64>)>;
+
+/// Probe a source and report `(codec, sample_rate, channels, duration_seconds)` without decoding
+/// anything.
+pub fn probe_source(input: Input) -> Result<ProbeResult, String> {
+    let (_format, track) = probe_input(input)?;
+    Ok(Some((
+        codec_name(track.params.codec).to_owned(),
+        track.params.sample_rate.unwrap_or(0),
+        track
+            .params
+            .channels
+            .as_ref()
+            .map(Channels::count)
+            .unwrap_or(0),
+        track.duration,
+    )))
 }
 
 /// Multiply every signed 16 bit little endian sample by `volume`, clamping to the `i16` range.
@@ -776,37 +1062,6 @@ pub fn scale_pcm_s16(data: &[u8], volume: f32) -> Vec<u8> {
 #[pyfunction]
 pub fn scale_pcm<'py>(py: Python<'py>, data: &[u8], volume: f32) -> Bound<'py, PyBytes> {
     PyBytes::new(py, &scale_pcm_s16(data, volume))
-}
-
-/// What [`probe_source`] reports: codec name, sample rate, channel count and duration.
-pub type ProbeResult = Option<(String, u32, usize, Option<f64>)>;
-
-/// Probe a source and report `(codec, sample_rate, channels, duration_seconds)` without
-/// decoding anything.
-pub fn probe_source(input: Input) -> Result<ProbeResult, String> {
-    let demuxed = demux(input)?;
-    let stream = demuxed.stream();
-
-    let parameters = stream.codec_parameters();
-    let codec = parameters.decoder_name().unwrap_or("unknown").to_owned();
-    let audio = parameters.as_audio_codec_parameters();
-    let sample_rate = audio.map(|params| params.sample_rate()).unwrap_or(0);
-    let channels = audio
-        .map(|params| params.channel_layout().channels() as usize)
-        .unwrap_or(0);
-
-    let duration = stream.duration();
-    let time_base = stream.time_base();
-    let seconds = if duration.is_null() {
-        None
-    } else {
-        let raw = duration.timestamp() as f64;
-        let (num, den) = (f64::from(time_base.num()), f64::from(time_base.den()));
-        let value = if den == 0.0 { 0.0 } else { raw * num / den };
-        (value > 0.0).then_some(value)
-    };
-
-    Ok(Some((codec, sample_rate, channels, seconds)))
 }
 
 /// Python-visible decoding audio source.
@@ -859,7 +1114,10 @@ impl PyDecodeSource {
             let mut guard = self.inner.lock();
             guard.finished = true;
             guard.pending.clear();
-            guard.resampler = None;
+            guard.staging.clear();
+            // Drop the resampler and the decoder with it: cleanup is what a source does when it
+            // is finished with.
+            guard.pipeline = Pipeline::Direct;
         });
     }
 

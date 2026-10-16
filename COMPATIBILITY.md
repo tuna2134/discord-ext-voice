@@ -124,16 +124,18 @@ reader left to wrap.
 | --- | --- |
 | `AudioSource` | **ours**, a standalone base class (nothing in this package inherits from `discord.py`); `is_audio_source(x)` accepts it, or any object with the same `read`/`is_opus`/`cleanup` methods |
 | `PCMAudio` | **ours**: raw PCM from a file object |
-| `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`), which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
+| `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: the native readers (`_native.DecodeSource` / `_native.OpusSource`) on `symphonia`, which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
 | `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
 | `AudioPlayer` | **ours**, a thin wrapper over the native thread: 20ms pacing, pause/resume, the silence frames, the `SPEAKING` announcements and the reconnection wait are Rust |
 
-`FFmpegPCMAudio`/`FFmpegOpusAudio` take the media plus `seek` (the native `-ss`). discord.py's
-FFmpeg-CLI arguments (`executable`, `pipe`, `stderr`, `before_options`, `options`,
-`force_cli`) raise `TypeError` naming the argument, and `FFmpegAudio` is not re-exported: there
-is no subprocess to configure.
+`FFmpegPCMAudio`/`FFmpegOpusAudio` take the media plus `seek` (the native `-ss`). The names are
+discord.py's and are kept, but nothing here is FFmpeg: `symphonia` demuxes and decodes, `rubato`
+resamples, `audiopus` handles Opus. discord.py's FFmpeg-CLI arguments (`executable`, `pipe`,
+`stderr`, `before_options`, `options`, `force_cli`) raise `TypeError` naming the argument, and
+`FFmpegAudio` is not re-exported: there is no subprocess to configure.
 
-`FFmpegOpusAudio.probe`/`probe_codec` use libav (`_native.probe`) instead of spawning
+`FFmpegOpusAudio.probe`/`probe_codec` use the in-process demuxer (`_native.probe`) instead of
+spawning
 `ffprobe`/`ffmpeg`, so the reported bitrate is always `None` and the `method`/`executable`
 arguments do not exist. `from_probe` is not needed: the constructor already probes and passes
 Opus packets through when the input has them.

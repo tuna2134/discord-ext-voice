@@ -2,7 +2,7 @@
 name = "discord-ext-voice"
 version = "0.1.0"
 edition = "2024"
-description = "A discord.py VoiceClient-compatible voice library built on pyo3, tokio-tungstenite, ac-ffmpeg, davey and audiopus"
+description = "A discord.py VoiceClient-compatible voice library built on pyo3, tokio-tungstenite, symphonia, davey and audiopus"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/tuna2134/discord-ext-voice"
@@ -39,10 +39,18 @@ rustls-native-certs = "0.8"
 webpki-roots = "1"
 futures-util = "0.3"
 
-# Audio decoding / resampling
-ac-ffmpeg = "0.19"
+# Audio demuxing, decoding and resampling, all in pure Rust: `symphonia` for the containers and
+# codecs, `rubato` for the sample-rate conversion that libswresample used to do. Opus is the one
+# codec symphonia has no decoder for, so those packets go to `audiopus` (the same libopus the
+# encoder already uses).
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac", "adpcm", "aiff", "alac", "flac", "isomp4", "mkv", "mpa", "mp3", "ogg", "pcm",
+    "vorbis", "wav", "all-meta", "opt-simd",
+] }
+rubato = "5"
 
-# HTTP(S) inputs for the audio sources: a URL is streamed straight into libav. `rustls-no-provider`
+# HTTP(S) inputs for the audio sources: a URL is streamed straight into the demuxer.
+# `rustls-no-provider`
 # + `webpki-roots` keeps the TLS stack the same one the voice websocket uses (and avoids OpenSSL).
 #
 # Not `rustls`: that feature pulls in `rustls/aws-lc-rs` as well, and rustls refuses to choose
@@ -77,15 +85,6 @@ serde_json = "1"
 thiserror = "2"
 parking_lot = "0.12"
 rand = "0.10"
-
-# The fork below is upstream 09f1421 ("Release v0.19.0") plus one fix: its audio resampler
-# rejected the unspecified channel layouts that current FFmpeg decoders produce for plain PCM
-# streams (`AVERROR_INPUT_CHANGED`). The change is exported for upstream as
-# patches/0001-resampler-accept-unspecified-channel-layout.patch; see patches/README.md.
-# `Cargo.lock` pins the exact commit, so bump the fork deliberately with
-# `cargo update -p ac-ffmpeg`.
-[patch.crates-io]
-ac-ffmpeg = { git = "https://github.com/tuna2134/rust-ac-ffmpeg", branch = "master" }
 
 [profile.release]
 lto = "thin"

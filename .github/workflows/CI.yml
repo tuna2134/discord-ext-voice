@@ -1,13 +1,22 @@
 # Continuous integration for discord-ext-voice.
 #
 # The native core links against the system FFmpeg and Opus libraries (libavformat,
-# libavcodec, libavutil, libswresample, libopus), so every job installs the matching
-# development packages first. Wheels built here are dynamically linked on purpose: see the
-# "Requirements at runtime" section of the README.
+# libavcodec, libavutil, libswresample, libswscale, libopus), so every job that compiles
+# installs the matching development packages first. `libswscale-dev` is easy to miss:
+# `ac-ffmpeg` compiles its video scaler unconditionally, even though this package only
+# decodes audio.
 #
-# The extension is not `abi3`, so a wheel is built for every supported CPython version. The
-# manylinux containers ship the interpreters under /opt/python and the action puts them on PATH,
-# which is what `-i pythonX.Y` selects.
+# `patchelf` is installed as well: maturin uses it to rewrite the RPATH of the built
+# extension, and warns (leaving the build-time RPATH in place) when it is missing.
+#
+# Wheels are built on the runner instead of inside a manylinux container: those containers
+# ship no FFmpeg development packages (manylinux2014 has no `ffmpeg-devel` at all), and this
+# project's wheels are deliberately linked against the system FFmpeg — see the runtime note
+# under "Requirements" in the README. Each wheel is therefore tagged for the runner's glibc
+# (`manylinux_2_39` on ubuntu-24.04) rather than for a portable baseline.
+#
+# The extension is not `abi3`, so a wheel is built for every supported CPython version, with
+# `actions/setup-python` selecting the interpreter maturin builds against.
 name: CI
 
 on:
@@ -30,6 +39,10 @@ jobs:
   test:
     name: Rust + Python tests
     runs-on: ubuntu-24.04
+    env:
+      # `maturin develop` installs into the active virtualenv, and `actions/setup-python`
+      # provides an interpreter but no environment, so the job makes its own.
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +50,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            pkg-config \
-            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
+            pkg-config patchelf \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
             libopus-dev \
             ffmpeg
 
@@ -50,10 +63,16 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Create the virtualenv
+        run: |
+          python -m venv "$VIRTUAL_ENV"
+          echo "$VIRTUAL_ENV/bin" >> "$GITHUB_PATH"
+
       - name: Install Python tooling
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install maturin pytest pytest-asyncio websockets pynacl 'discord.py>=2.7'
+          "$VIRTUAL_ENV/bin/python" -m pip install --upgrade pip
+          "$VIRTUAL_ENV/bin/python" -m pip install \
+            maturin pytest pytest-asyncio websockets pynacl 'discord.py>=2.7'
 
       - name: Check formatting
         run: cargo fmt --check
@@ -71,7 +90,7 @@ jobs:
         run: pytest -q
 
   build-wheel:
-    name: Build a manylinux wheel (CPython ${{ matrix.python-version }})
+    name: Build a wheel (CPython ${{ matrix.python-version }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -81,26 +100,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build the wheel
-        uses: PyO3/maturin-action@v1
+      - name: Install FFmpeg and Opus development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config patchelf \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
+            libopus-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
         with:
-          target: x86_64
-          manylinux: auto
-          args: --release --out dist -i python${{ matrix.python-version }}
-          # The build container does not ship FFmpeg, so install it before compiling.
-          before-script-linux: |
-            if command -v dnf > /dev/null; then
-              dnf install -y pkgconf-pkg-config ffmpeg-free-devel opus-devel
-            elif command -v yum > /dev/null; then
-              yum install -y pkgconfig ffmpeg-devel opus-devel
-            elif command -v apt-get > /dev/null; then
-              apt-get update
-              apt-get install --no-install-recommends -y pkg-config \
-                libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libopus-dev
-            else
-              echo "no known package manager; FFmpeg development libraries are required" >&2
-              exit 1
-            fi
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'maturin>=1.15,<2.0'
+
+      - name: Build the wheel
+        # `-i python` is the interpreter `actions/setup-python` put on PATH.
+        run: maturin build --release --out dist -i python
+
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          # A fresh environment proves the wheel carries every module and that its
+          # `discord.py` dependency is enough to import it.
+          python -m venv smoke
+          smoke/bin/python -m pip install --upgrade pip
+          smoke/bin/python -m pip install dist/*.whl
+          smoke/bin/python -c "import discord_ext_voice as dev; print(dev.__version__, dev.SUPPORTED_MODES)"
 
       - name: Upload the wheel
         uses: actions/upload-artifact@v4

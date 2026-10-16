@@ -20,10 +20,11 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-    # `VoiceClient` implements `discord.VoiceProtocol` and reuses discord.py's player, audio
-    # sources and connection-flow state machine. The `voice` extra (PyNaCl + the Python
-    # `davey` bindings) is deliberately *not* needed: the RTP encryption and the DAVE/MLS
-    # session are implemented natively in Rust.
+    # `VoiceClient` implements `discord.VoiceProtocol`, which is what has to come from
+    # discord.py: the client, its gateway and the extension point itself. The `voice` extra
+    # (PyNaCl + the Python `davey` bindings) is deliberately *not* needed — the RTP encryption
+    # and the DAVE/MLS session are implemented natively in Rust, as are the player, the
+    # connection flow, the audio sources and the websocket surface.
     "discord.py>=2.7",
 ]
 

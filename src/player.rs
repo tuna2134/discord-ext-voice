@@ -23,7 +23,6 @@ use pyo3::prelude::*;
 use voice_model as vm;
 
 use crate::connection::{self, SendError, VoiceConnection};
-use crate::opus::OpusEncoder;
 use crate::transport::{self, Hub, wait_duration};
 
 /// The gap between two frames. `discord.player.AudioPlayer.DELAY` is the same number, derived
@@ -86,9 +85,6 @@ struct PlayerInner {
     hub: Arc<Hub>,
     /// The source being played. Swapped by `set_source` while the thread runs.
     source: Mutex<Py<PyAny>>,
-    /// The encoder `VoiceClient.play` created, shared so that both paths use the same one. `None`
-    /// means every frame is passed through as Opus.
-    encoder: Option<Arc<Mutex<OpusEncoder>>>,
     /// The callback invoked once, with the error or `None`.
     after: Option<Py<PyAny>>,
     /// How long to wait for a reconnection before giving up.
@@ -125,14 +121,7 @@ impl PlayerInner {
     /// Send `count` frames of Opus silence. Any failure is inconsequential, so it is dropped.
     fn send_silence(&self, count: usize) {
         for _ in 0..count {
-            if connection::send_audio_frame(
-                &self.hub,
-                &crate::opus::OPUS_SILENCE,
-                false,
-                self.encoder.clone(),
-            )
-            .is_err()
-            {
+            if connection::send_audio_frame(&self.hub, &crate::opus::OPUS_SILENCE, false).is_err() {
                 return;
             }
         }
@@ -151,13 +140,12 @@ pub struct PyAudioPlayer {
 #[pymethods]
 impl PyAudioPlayer {
     #[new]
-    #[pyo3(signature = (connection, source, *, after=None, encoder=None, timeout=30.0))]
+    #[pyo3(signature = (connection, source, *, after=None, timeout=30.0))]
     fn new(
         py: Python<'_>,
         connection: PyRef<'_, VoiceConnection>,
         source: Py<PyAny>,
         after: Option<Py<PyAny>>,
-        encoder: Option<PyRef<'_, crate::opus::PyOpusEncoder>>,
         timeout: f64,
     ) -> PyResult<Self> {
         if let Some(after) = after.as_ref()
@@ -172,7 +160,6 @@ impl PyAudioPlayer {
             inner: Arc::new(PlayerInner {
                 hub: connection.hub(),
                 source: Mutex::new(source),
-                encoder: encoder.map(|encoder| encoder.handle()),
                 after,
                 timeout: wait_duration(timeout),
                 signals: Mutex::new(Signals::default()),
@@ -423,12 +410,7 @@ fn play(inner: &Arc<PlayerInner>) -> Outcome {
 
         // Encoded, encrypted and sent with no Python involvement at all: the GIL is only taken to
         // turn a failure into the exception `after` receives.
-        let result = connection::send_audio_frame(
-            &inner.hub,
-            &frame.data,
-            !frame.opus,
-            inner.encoder.clone(),
-        );
+        let result = connection::send_audio_frame(&inner.hub, &frame.data, !frame.opus);
         if let Err(err) = result {
             // The error has to be a Python object for `after`; if the interpreter is already
             // going away there is nobody left to tell, so stop quietly.

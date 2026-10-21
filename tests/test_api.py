@@ -51,11 +51,9 @@ def test_supported_modes_match_discord_py():
         'guild',
         'user',
         'session_id',
-        'token',
         'endpoint',
         'ssrc',
         'mode',
-        'secret_key',
         'ws',
         'timeout',
         'latency',
@@ -101,33 +99,13 @@ def test_sources_are_this_packages_own():
         assert not issubclass(getattr(dev, name), getattr(discord.player, name))
 
 
-def test_opus_encoder_surface():
-    encoder = dev.opus.Encoder(application='voip', bitrate=96, fec=True, bandwidth='full')
-    assert encoder.SAMPLES_PER_FRAME == 960
-    assert encoder.FRAME_LENGTH == 20
-    assert encoder.FRAME_SIZE == 3840
-    assert callable(encoder.encode)
-    # The native encoder agrees with the geometry discord.py advertises.
-    assert encoder.SAMPLES_PER_FRAME == discord.opus.Encoder.SAMPLES_PER_FRAME
-    assert encoder.FRAME_SIZE == discord.opus.Encoder.FRAME_SIZE
-
-
-def test_opus_encoder_rejects_bad_parameters():
-    with pytest.raises(ValueError):
-        dev.opus.Encoder(application='speech')
-    with pytest.raises(ValueError):
-        dev.opus.Encoder(bitrate=4)
-    with pytest.raises(ValueError):
-        dev.opus.Encoder(bandwidth='ultra')
-
-
-def test_gateway_opcode_constants():
-    ws = dev.DiscordVoiceWebSocket
-    assert (ws.IDENTIFY, ws.SELECT_PROTOCOL, ws.READY, ws.HEARTBEAT) == (0, 1, 2, 3)
-    assert (ws.SESSION_DESCRIPTION, ws.SPEAKING, ws.HEARTBEAT_ACK, ws.RESUME) == (4, 5, 6, 7)
-    assert (ws.HELLO, ws.RESUMED) == (8, 9)
-    assert ws.MLS_EXTERNAL_SENDER == 25
-    assert ws.MLS_INVALID_COMMIT_WELCOME == 31
+def test_frame_geometry_matches_discord_py():
+    assert dev.SAMPLES_PER_FRAME == 960
+    assert dev.FRAME_LENGTH == 20
+    assert dev.FRAME_SIZE == 3840
+    # The native constants agree with the geometry discord.py advertises.
+    assert dev.SAMPLES_PER_FRAME == discord.opus.Encoder.SAMPLES_PER_FRAME
+    assert dev.FRAME_SIZE == discord.opus.Encoder.FRAME_SIZE
 
 
 def test_exception_types_line_up_with_discord():

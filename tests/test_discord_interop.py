@@ -60,7 +60,6 @@ def test_voice_client_does_not_require_pynacl_or_davey(monkeypatch):
     voice = dev.VoiceClient(_Client(), _Channel())
     assert voice._connection.native is not None
     assert voice.native.is_connected() is False
-    assert voice.encoder is None
     assert voice.is_playing() is False
     assert asyncio.iscoroutinefunction(voice.connect)
 
@@ -84,29 +83,10 @@ def test_voice_websocket_is_this_packages_own():
     assert not issubclass(dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket)
     assert dev.DiscordVoiceWebSocket.__module__ == 'discord_ext_voice.gateway'
 
-    # The opcode constants keep Discord's values, so the frames stay interchangeable.
+    # Only the two members the Python layer still needs are left.
     ours = dev.DiscordVoiceWebSocket
-    theirs = discord.gateway.DiscordVoiceWebSocket
-    for name in (
-        'IDENTIFY',
-        'SELECT_PROTOCOL',
-        'READY',
-        'HEARTBEAT',
-        'SESSION_DESCRIPTION',
-        'SPEAKING',
-        'HEARTBEAT_ACK',
-        'RESUME',
-        'HELLO',
-        'RESUMED',
-        'MLS_EXTERNAL_SENDER',
-        'MLS_KEY_PACKAGE',
-        'MLS_INVALID_COMMIT_WELCOME',
-    ):
-        assert getattr(ours, name) == getattr(theirs, name), f'{name} must match Discord'
-
-    # What discord.py's player calls is implemented here.
-    assert callable(ours.speak)
     assert callable(ours.close)
+    assert isinstance(ours.latency, property)
 
 
 def test_nothing_of_discord_pys_implementation_is_reused():

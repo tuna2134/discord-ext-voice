@@ -30,7 +30,7 @@ from typing import Any, Optional, TypeVar
 
 from discord.errors import ClientException
 
-from . import _native, opus
+from . import _native
 from .errors import FFmpegSourceError
 
 __all__ = (
@@ -43,7 +43,7 @@ __all__ = (
 )
 
 #: One 20ms frame of 48kHz stereo signed 16 bit PCM, which is what the player sends.
-FRAME_SIZE: int = opus.Encoder.FRAME_SIZE
+FRAME_SIZE: int = _native.FRAME_SIZE
 
 AT = TypeVar('AT', bound='AudioSource')
 
@@ -259,7 +259,7 @@ class FFmpegOpusAudio(AudioSource):
 
     When the input already carries Opus packets (``.ogg``, ``.webm``, ``.mka``) they are passed
     through untouched and :meth:`is_opus` is true. Anything else is decoded to PCM exactly like
-    :class:`FFmpegPCMAudio`, and the native :class:`~discord_ext_voice.opus.Encoder` produces the
+    :class:`FFmpegPCMAudio`, and the player's native encoder produces the
     packets when they are sent — which is what ``discord.FFmpegOpusAudio`` asks the ``ffmpeg``
     binary to do with a second encoding pass.
 

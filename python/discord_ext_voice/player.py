@@ -56,14 +56,10 @@ class AudioPlayer:
 
         self.client: Any = client
         self.after: Optional[Callable[[Optional[Exception]], Any]] = after
-        #: The encoder `VoiceClient.play` built for this source, or ``None`` for Opus
-        #: passthrough. The native player encodes with this very object.
-        self.encoder: Any = getattr(client, 'encoder', None)
         self._native = _native.AudioPlayer(
             client.native,
             source,
             after=after,
-            encoder=self.encoder,
             timeout=client.timeout,
         )
 

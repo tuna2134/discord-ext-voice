@@ -191,13 +191,12 @@ def test_http_url_passes_opus_packets_through(opus_file, http_server):
     source = dev.FFmpegOpusAudio(f'{base}/{opus_file.name}')
     try:
         assert source.is_opus() is True
-        decoder = dev.opus.Decoder()
         packets = 0
         while packets < 10:
             packet = source.read()
             if not packet:
                 break
-            assert len(decoder.decode(packet)) == dev.FRAME_SIZE
+            assert 0 < len(packet) < 1500
             packets += 1
         assert packets > 3
     finally:

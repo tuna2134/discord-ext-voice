@@ -264,9 +264,6 @@ async def test_an_opus_source_is_passed_through(gateway_factory, opus_file):
 
     try:
         voice.play(source, after=after)
-        # No encoder is built for a pass-through source; there is nothing that could encode.
-        assert voice.encoder is None
-        assert voice._player.encoder is None
 
         await asyncio.wait_for(done.wait(), timeout=10.0)
         assert errors == [None]

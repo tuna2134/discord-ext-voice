@@ -1,7 +1,7 @@
 """Inspect and decode audio without a Discord connection.
 
-Shows the pieces of the library that do not need a gateway: the codec, the FFmpeg-backed
-audio sources and the volume transformer.
+Shows the pieces of the library that do not need a gateway: probing, the audio sources and the
+volume transformer.
 
     python examples/decode_file.py song.mp3
 """
@@ -20,12 +20,6 @@ def main() -> None:
 
     codec, sample_rate, channels, duration = dev.probe(path)
     print(f'{path}: codec={codec} rate={sample_rate} channels={channels} duration={duration!r}s')
-
-    # Native encoder/decoder round trip.
-    encoder = dev.opus.Encoder(application='voip', bitrate=96)
-    packet = encoder.encode(b'\x00' * dev.FRAME_SIZE)
-    print(f'opus: {len(packet)} byte frame for 20ms of silence')
-    print(f'opus: decoded back to {len(dev.opus.Decoder().decode(packet))} bytes of PCM')
 
     source = dev.FFmpegPCMAudio(path)
     try:

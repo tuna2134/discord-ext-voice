@@ -50,7 +50,8 @@ implementation, so its members are written here rather than inherited:
 | `__init__(client, channel)`, `create_connection_state()` | build the native-backed `VoiceConnectionState` |
 | `on_voice_state_update`, `on_voice_server_update` | forwarded to the connection state |
 | `connect`, `disconnect`, `move_to`, `is_connected`, `wait_until_connected` | thin delegations to the connection state |
-| `guild`, `user`, `session_id`, `token`, `endpoint`, `ssrc`, `mode`, `secret_key`, `ws`, `timeout` | read from the connection state |
+| `guild`, `user`, `session_id`, `endpoint`, `ssrc`, `mode`, `ws`, `timeout` | read from the connection state |
+| `token`, `secret_key` | **not exposed**: the session credentials stay in the native connection, where the handshake and the RTP encryption use them |
 | `latency`, `average_latency`, `voice_privacy_code` | read from the native transport |
 | `play`, `is_playing`, `is_paused`, `stop`, `pause`, `resume`, `source` | discord.py's semantics; `play` builds the native Opus encoder and starts a `discord_ext_voice.AudioPlayer` |
 | `send_audio_packet` | encodes, DAVE-encrypts, RTP-encrypts and sends in Rust |
@@ -109,14 +110,10 @@ reader left to wrap.
 
 | Member | Behaviour |
 | --- | --- |
-| Opcode constants (`IDENTIFY` … `MLS_INVALID_COMMIT_WELCOME`) | **ours**, with Discord's values, so the numbers match `discord.gateway.DiscordVoiceWebSocket` |
-| `speak` | sends `SPEAKING` with the native SSRC, for anything driving the websocket by hand; the native player sends the same frame itself |
-| `close`, `wait_closed` | close the native socket / wait for it to end and return `(code, reason)` |
-| `poll_event` | waits for the native socket to end and raises `discord.ConnectionClosed` |
-| `send_as_json`, `send_binary`, `send_heartbeat` | raw frame writers, for anything not covered above |
-| `close_code` | the native close code, falling back to the last code we closed with |
-| `seq_ack`, `secret_key`, `latency`, `average_latency` | native values; writes ignored |
-| `identify`, `resume`, `select_protocol`, `client_connect`, `send_transition_ready` | **not present**: the native handshake and DAVE session send those frames themselves |
+| `latency` | the native heartbeat round trip, in seconds |
+| `close` | close the native socket (the reconnect loop and `disconnect` call it) |
+| `resume` | whether this connection's handshake sends RESUME rather than IDENTIFY |
+| the opcode constants, `speak`, `send_as_json`, `send_binary`, `send_heartbeat`, `poll_event`, `wait_closed`, `close_code`, `seq_ack`, `secret_key`, `average_latency` | **not present**: the native transport sends and reads every frame, and the negotiated values are read from the native connection (`VoiceClient`, `VoiceConnectionState`) |
 
 ## Audio sources
 
@@ -144,7 +141,7 @@ Opus packets through when the input has them.
 
 | Member | Source |
 | --- | --- |
-| `Encoder`, `Decoder` | **native** (`oprs`, a pure-Rust libopus port) — same keyword arguments, validation, `ValueError`s and class constants as `discord.opus.Encoder`, and byte-identical output (see `tests/test_opus.py`) |
+| `Encoder`, `Decoder` | **not provided**: the codec is internal. `play()` and `send_audio_packet` encode with `oprs` (a pure-Rust libopus port) and validate the same parameters, raising `ValueError`; use `discord.opus` if you need the classes themselves |
 | `OpusError` | native; raised for codec failures |
 | `OPUS_SILENCE`, `APPLICATION_AUDIO`, `APPLICATION_VOIP`, `APPLICATION_LOWDELAY` | re-exported from `discord.opus` |
 | `load_opus`, `is_loaded`, `OpusNotLoaded` | **not re-exported from this package**; use `discord.opus` if you need discord.py's ctypes encoder. The native encoder requires no loading step |

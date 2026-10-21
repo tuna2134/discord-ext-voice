@@ -127,13 +127,15 @@ async def test_connect_establishes_the_native_session(gateway_factory):
     try:
         assert voice.is_connected() is True
         assert voice.session_id == 'session-1'
-        assert voice.token == 'voice-token'
         # discord.py strips only the `wss://` scheme; a plaintext gateway endpoint is kept
         # verbatim and the native transport understands the `ws://` prefix.
         assert voice.endpoint == gateway.endpoint
         assert voice.ssrc == SSRC
         assert voice.mode == 'aead_xchacha20_poly1305_rtpsize'
-        assert len(voice.secret_key) == 32
+        # The credentials stay native: the handshake and the RTP encryption use them there.
+        assert not hasattr(voice, 'token')
+        assert not hasattr(voice, 'secret_key')
+        assert len(voice.native.secret_key) == 32
         assert voice.guild.id == GUILD_ID
         assert voice.user.id == USER_ID
         assert voice.timeout == 10.0
@@ -299,17 +301,17 @@ async def test_pause_and_resume(gateway_factory):
         await voice.disconnect()
 
 
-async def test_send_audio_packet_uses_the_voice_client_encoder(gateway_factory):
+async def test_send_audio_packet_encodes_pcm(gateway_factory):
     gateway = await gateway_factory()
     client, channel = await make_client(gateway)
     voice = await join(client, channel)
 
     try:
-        # `play` normally creates the encoder; make sure an explicit one is honoured.
-        voice.encoder = dev.opus.Encoder(application='voip', bitrate=64)
         voice.send_audio_packet(b'\x00' * dev.FRAME_SIZE, encode=True)
         packets = await gateway.wait_for_rtp(count=1, timeout=10.0)
+        # One RTP packet whose payload is a small Opus frame, not the 3840 bytes of PCM.
         assert len(packets[0]) > 12
+        assert len(packets[0]) < dev.FRAME_SIZE
     finally:
         await voice.disconnect()
 

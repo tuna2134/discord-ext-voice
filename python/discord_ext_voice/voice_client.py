@@ -28,7 +28,6 @@ from typing import Any, Callable, Optional, Tuple
 from discord.voice_client import VoiceClient as _DiscordVoiceClient
 from discord.voice_client import VoiceProtocol
 
-from . import opus
 from .errors import ClientException, NotConnected
 from .player import AudioPlayer
 from .sources import AudioSource, is_audio_source
@@ -71,7 +70,6 @@ class VoiceClient(VoiceProtocol):
         self._player: Optional[AudioPlayer] = None
         #: The Opus encoder, set by :meth:`play` for PCM sources and handed to the native
         #: transport for every packet.
-        self.encoder: Any = None
         self._connection: VoiceConnectionState = self.create_connection_state()
 
     # ------------------------------------------------------------------ state accessors
@@ -101,11 +99,6 @@ class VoiceClient(VoiceProtocol):
         return self._connection.session_id
 
     @property
-    def token(self) -> Optional[str]:
-        """Optional[:class:`str`]: The voice connection token."""
-        return self._connection.token
-
-    @property
     def endpoint(self) -> Optional[str]:
         """Optional[:class:`str`]: The endpoint we are connecting to."""
         return self._connection.endpoint
@@ -119,11 +112,6 @@ class VoiceClient(VoiceProtocol):
     def mode(self) -> Optional[str]:
         """Optional[:class:`str`]: The negotiated RTP encryption mode."""
         return self._connection.mode
-
-    @property
-    def secret_key(self) -> Optional[list[int]]:
-        """Optional[List[:class:`int`]]: The RTP encryption key negotiated with Discord."""
-        return self._connection.secret_key
 
     @property
     def ws(self) -> Any:
@@ -229,9 +217,8 @@ class VoiceClient(VoiceProtocol):
         """Plays an :class:`AudioSource`.
 
         The finalizer ``after`` is called after the source has been exhausted or an error
-        occurred. The encoder parameters are only used for PCM based sources; they are passed
-        straight to the native :class:`discord_ext_voice.opus.Encoder`, which validates them
-        and raises :class:`ValueError` for bad values.
+        occurred. The encoder parameters are only used for PCM based sources; the native player
+        validates them and raises :class:`ValueError` for a bad value.
         """
         if not self.is_connected():
             raise ClientException('Not connected to voice.')
@@ -244,21 +231,24 @@ class VoiceClient(VoiceProtocol):
         if not is_audio_source(source):
             raise TypeError(f'source must be an AudioSource not {source.__class__.__name__}')
 
-        if not source.is_opus():
-            self.encoder = opus.Encoder(
-                application=application,
-                bitrate=bitrate,
-                fec=fec,
-                expected_packet_loss=expected_packet_loss,
-                bandwidth=bandwidth,
-                signal_type=signal_type,
+        if source.is_opus():
+            # The packets already are Opus: no encoder is involved at all.
+            self._connection.native.clear_encoder()
+        else:
+            self._connection.native.set_encoder(
+                application,
+                bitrate,
+                fec,
+                expected_packet_loss,
+                bandwidth,
+                signal_type,
             )
 
         _log.info(
             'Playing %r (opus passthrough=%s, encoder=%s)',
             source,
             source.is_opus(),
-            'native' if self.encoder is not None else 'none',
+            'none' if source.is_opus() else 'native',
         )
         self._player = AudioPlayer(source, self, after=after)
         self._player.start()
@@ -318,16 +308,14 @@ class VoiceClient(VoiceProtocol):
         encode: :class:`bool`
             Indicates if ``data`` should be encoded into Opus.
         """
-        encoder = self.encoder if isinstance(self.encoder, opus.Encoder) else None
         _log.debug(
-            'send_audio_packet: %d bytes, encode=%s, encoder=%s, dave=%s',
+            'send_audio_packet: %d bytes, encode=%s, dave=%s',
             len(data),
             encode,
-            'play()' if encoder is not None else 'default',
             self._connection.native.dave_protocol_version > 0,
         )
         try:
-            self._connection.native.send_audio_packet(data, encode=encode, encoder=encoder)
+            self._connection.native.send_audio_packet(data, encode=encode)
         except NotConnected as exc:
             raise ClientException(str(exc)) from exc
 

@@ -52,15 +52,19 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<connection::VoiceConnection>()?;
     module.add_class::<source::PyDecodeSource>()?;
     module.add_class::<source::PyOpusSource>()?;
-    module.add_class::<opus::PyOpusEncoder>()?;
-    module.add_class::<opus::PyOpusDecoder>()?;
     module.add_class::<player::PyAudioPlayer>()?;
     module.add_class::<flow::PyConnectionFlow>()?;
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
     module.add_function(wrap_pyfunction!(source::scale_pcm, module)?)?;
 
-    // Constants the Python layer reads. Frame geometry lives on `OpusEncoder`.
+    // Constants the Python layer reads.
     module.add("OPUS_SILENCE", PyBytes::new(py, &opus::OPUS_SILENCE))?;
+    module.add("SAMPLES_PER_FRAME", opus::SAMPLES_PER_FRAME)?;
+    module.add("FRAME_LENGTH", opus::FRAME_LENGTH)?;
+    module.add("SAMPLING_RATE", opus::SAMPLING_RATE)?;
+    module.add("CHANNELS", opus::CHANNELS)?;
+    module.add("SAMPLE_SIZE", opus::CHANNELS * 2)?;
+    module.add("FRAME_SIZE", opus::SAMPLES_PER_FRAME * opus::CHANNELS * 2)?;
     module.add(
         "DAVE_PROTOCOL_VERSION",
         dave::DaveState::max_protocol_version(),

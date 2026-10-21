@@ -124,7 +124,6 @@ class VoiceConnectionState:
         self.voice_port: Optional[int] = None
         self.ssrc: Any = MISSING
         self.mode: Optional[str] = None
-        self.secret_key: Any = MISSING
 
         # Rust owns the UDP socket, so discord.py's socket slot stays a sentinel.
         self.socket: Any = MISSING
@@ -552,7 +551,7 @@ class VoiceConnectionState:
     async def _connect_websocket(self, resume: bool) -> DiscordVoiceWebSocket:
         """Return the websocket facade; the native handshake happens in `_handshake_websocket`."""
         self.state = ConnectionFlowState.websocket_connected
-        return DiscordVoiceWebSocket(self._native, self, resume=resume)
+        return DiscordVoiceWebSocket(self._native, resume=resume)
 
     async def _handshake_websocket(self) -> None:
         """Complete the voice handshake: IDENTIFY/RESUME, UDP discovery, key negotiation."""
@@ -578,7 +577,6 @@ class VoiceConnectionState:
         self.port = self._native.port
         self.voice_port = self._native.voice_port
         self.mode = self._native.mode
-        self.secret_key = self._native.secret_key
         self.state = ConnectionFlowState.got_ip_discovery
         self.state = ConnectionFlowState.connected
 
@@ -631,7 +629,7 @@ class VoiceConnectionState:
         self._flow.reset_backoff()
         while True:
             try:
-                code, reason = await self.ws.wait_closed()
+                code, reason = await self._native.wait_closed()
             except asyncio.CancelledError:
                 return
 

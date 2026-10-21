@@ -15,7 +15,7 @@ voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished',
 for alternative voice backends — on top of the native transport, and is the only class in this
 package that inherits from `discord.py`. Everything below it is this package's own:
 `dev.VoiceConnectionState` (the connection flow, whose decisions are native),
-`dev.DiscordVoiceWebSocket` (the opcode surface the player talks to), `dev.AudioPlayer` (the
+`dev.DiscordVoiceWebSocket` (a handle with `latency` and `close`), `dev.AudioPlayer` (the
 playback clock) and the audio sources (decoding in process with `symphonia`). From `discord.py` we
 *use* the host framework rather than inherit it: the client and its gateway, and the exception
 classes the public API raises.
@@ -209,17 +209,12 @@ raise `TypeError` naming the argument.
 
 ### Opus
 
-```python
-import discord_ext_voice as dev
-
-encoder = dev.opus.Encoder(application='voip', bitrate=96, fec=True)
-packet = encoder.encode(pcm_bytes)                  # 20ms of 48kHz stereo s16 -> one frame
-samples = dev.opus.Decoder().decode(packet)         # -> 3840 bytes of PCM
-```
-
-`dev.opus.Encoder`/`Decoder` are native, so unlike `discord.opus.Encoder` they need no
-`load_opus()` call. The constants (`OPUS_SILENCE`, `APPLICATION_AUDIO`, ...) come from
-`discord.opus`.
+The Opus codec is internal: `play()` encodes PCM sources with it, `send_audio_packet(encode=True)`
+uses the same encoder, and Opus-carrying sources are passed through untouched. There is no
+Python-facing encoder class to configure or create — `play()`'s keyword arguments
+(`application`, `bitrate`, `fec`, `expected_packet_loss`, `bandwidth`, `signal_type`) are the
+configuration, and a bad value raises `ValueError` before playback starts. If you need
+`discord.opus.Encoder` itself, use `discord.opus`.
 
 ### The native handle
 
@@ -262,9 +257,8 @@ caught here, and `tests/test_stream_live.py` plays a real extractor URL end to e
 python/discord_ext_voice/        # thin discord.py extension
 ├── voice_client.py              # VoiceClient: create_connection_state, play, send_audio_packet
 ├── voice_state.py               # VoiceConnectionState: connect/reconnect flow (ours)
-├── gateway.py                   # DiscordVoiceWebSocket: opcodes + speak/close on the native socket
+├── gateway.py                   # DiscordVoiceWebSocket: latency + close on the native socket
 ├── sources.py                   # our AudioSource / PCMAudio / FFmpeg*Audio / volume
-├── opus.py                      # native Encoder/Decoder + discord.opus constants
 └── errors.py                    # native errors + discord.py's, and FFmpegSourceError
 src/                             # the core
 ├── lib.rs                       # module registration and constants
@@ -311,8 +305,8 @@ waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — 
 
 ```bash
 cargo test --lib    # 41 Rust unit tests
-pytest -q           # 183 Python tests, 4 skipped (6 crypto interop tests need PyNaCl; 3 libopus
-                    # oracle tests need DISCORD_EXT_VOICE_OPUS_ORACLE=1; 1 live URL test needs a URL)
+pytest -q           # 161 Python tests, 1 skipped (6 crypto interop tests need PyNaCl; the live URL
+                    # test needs DISCORD_EXT_VOICE_LIVE_URL)
 ```
 
 The Python suite includes:
@@ -332,9 +326,6 @@ The Python suite includes:
   upstream signature change is caught here rather than in a bot;
 * `tests/test_stream_live.py` plays a real extractor URL (with its `http_headers`) through the
   whole stack — opt-in, via `DISCORD_EXT_VOICE_LIVE_URL`, because it needs the network;
-* `tests/test_opus.py` compares the encoder with the system libopus, packet for packet and PCM for
-  PCM — opt-in, via `DISCORD_EXT_VOICE_OPUS_ORACLE=1`, because it only means anything when that
-  libopus is the version `oprs` ports (1.6.1);
 * `tests/test_flow.py` for the native connection flow: the phase round-trip, the waiting
   primitives (including the timeout contract), and that every action Rust can return has a name
   in Python. The transition table itself is unit-tested in `src/flow.rs`.

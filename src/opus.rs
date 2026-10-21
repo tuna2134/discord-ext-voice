@@ -8,8 +8,6 @@
 //! `VoiceClient.play(..., application=..., bitrate=..., fec=..., bandwidth=..., signal_type=...)`
 //! behaves identically to the pure-Python implementation.
 
-use std::sync::Arc;
-
 use oprs::coder::Encoder as RawEncoder;
 use oprs::packet::Packet;
 use oprs::{Application, Bandwidth, Bitrate, Channels, MutSignals, SampleRate, Signal};
@@ -25,25 +23,25 @@ pub const OPUS_SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
 pub const SAMPLING_RATE: u32 = 48_000;
 /// Number of channels Discord voice uses.
 pub const CHANNELS: usize = 2;
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EncoderConfig {
-    pub application: &'static str,
+    pub application: String,
     pub bitrate: u16,
     pub fec: bool,
     pub expected_packet_loss: f64,
-    pub bandwidth: &'static str,
-    pub signal_type: &'static str,
+    pub bandwidth: String,
+    pub signal_type: String,
 }
 
 impl Default for EncoderConfig {
     fn default() -> Self {
         Self {
-            application: "audio",
+            application: "audio".to_owned(),
             bitrate: 128,
             fec: true,
             expected_packet_loss: 0.15,
-            bandwidth: "full",
-            signal_type: "auto",
+            bandwidth: "full".to_owned(),
+            signal_type: "auto".to_owned(),
         }
     }
 }
@@ -63,7 +61,7 @@ impl std::fmt::Debug for OpusEncoder {
 
 impl OpusEncoder {
     pub fn new(config: &EncoderConfig) -> Result<Self, String> {
-        let application = match config.application {
+        let application = match config.application.as_str() {
             "audio" => Application::Audio,
             "voip" => Application::Voip,
             "lowdelay" => Application::LowDelay,
@@ -88,7 +86,7 @@ impl OpusEncoder {
             ));
         }
 
-        let bandwidth = match config.bandwidth {
+        let bandwidth = match config.bandwidth.as_str() {
             "narrow" => Bandwidth::Narrowband,
             "medium" => Bandwidth::Mediumband,
             "wide" => Bandwidth::Wideband,
@@ -101,7 +99,7 @@ impl OpusEncoder {
             }
         };
 
-        let signal = match config.signal_type {
+        let signal = match config.signal_type.as_str() {
             "auto" => Signal::Auto,
             "voice" => Signal::Voice,
             "music" => Signal::Music,
@@ -157,22 +155,11 @@ fn opus_err(err: oprs::Error) -> String {
     format!("Opus error: {err}")
 }
 
-/// Validate encoder parameters the way `discord.opus.Encoder.__init__` does: with
-/// :class:`ValueError` rather than an Opus failure.
-pub fn validate_config(config: &EncoderConfig) -> PyResult<()> {
-    if !(16..=512).contains(&config.bitrate) {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "bitrate must be between 16 and 512, not {}",
-            config.bitrate
-        )));
-    }
-    if !(config.expected_packet_loss > 0.0 && config.expected_packet_loss <= 1.0) {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "expected_packet_loss must be a positive number less than or equal to 1, not {}",
-            config.expected_packet_loss
-        )));
-    }
-    Ok(())
+/// Turn interleaved 16 bit little endian PCM bytes into samples.
+pub fn bytes_to_samples(data: &[u8]) -> Vec<i16> {
+    data.chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect()
 }
 
 /// Decode a raw Opus packet into interleaved 48kHz stereo `i16` samples.
@@ -200,13 +187,6 @@ impl OpusDecoder {
             .map_err(opus_err)?;
         Ok(self.buffer[..written * CHANNELS].to_vec())
     }
-
-    /// Decode a lost packet by asking Opus to interpolate.
-    pub fn decode_plc(&mut self) -> Result<Vec<i16>, String> {
-        let signals = MutSignals::try_from(&mut self.buffer).map_err(opus_err)?;
-        let written = self.inner.decode(None, signals, false).map_err(opus_err)?;
-        Ok(self.buffer[..written * CHANNELS].to_vec())
-    }
 }
 
 #[cfg(test)]
@@ -229,11 +209,11 @@ mod tests {
         assert!(OpusEncoder::new(&config).is_err());
 
         let mut config = EncoderConfig::default();
-        config.bandwidth = "ultra";
+        config.bandwidth = "ultra".to_owned();
         assert!(OpusEncoder::new(&config).is_err());
 
         let mut config = EncoderConfig::default();
-        config.application = "speech";
+        config.application = "speech".to_owned();
         assert!(OpusEncoder::new(&config).is_err());
     }
 
@@ -248,262 +228,5 @@ mod tests {
         let mut decoder = OpusDecoder::new().unwrap();
         let decoded = decoder.decode(&packet).unwrap();
         assert_eq!(decoded.len(), SAMPLES_PER_FRAME * CHANNELS);
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// Python bindings
-// ---------------------------------------------------------------------------------------
-
-use parking_lot::Mutex;
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-
-use crate::errors::OpusError;
-
-fn intern_application(value: &str) -> PyResult<&'static str> {
-    Ok(match value {
-        "audio" => "audio",
-        "voip" => "voip",
-        "lowdelay" => "lowdelay",
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other} is not a valid application setting. Try one of: audiovoip lowdelay"
-            )));
-        }
-    })
-}
-
-fn intern_bandwidth(value: &str) -> PyResult<&'static str> {
-    Ok(match value {
-        "narrow" => "narrow",
-        "medium" => "medium",
-        "wide" => "wide",
-        "superwide" => "superwide",
-        "full" => "full",
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other:?} is not a valid bandwidth setting. Try one of: narrow,medium,wide,superwide,full"
-            )));
-        }
-    })
-}
-
-fn intern_signal(value: &str) -> PyResult<&'static str> {
-    Ok(match value {
-        "auto" => "auto",
-        "voice" => "voice",
-        "music" => "music",
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other:?} is not a valid signal type setting. Try one of: auto,voice,music"
-            )));
-        }
-    })
-}
-
-/// Interleaved little-endian `s16` bytes -> `i16` samples.
-pub fn bytes_to_samples(data: &[u8]) -> Vec<i16> {
-    data.chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect()
-}
-
-/// A standalone Opus encoder, the native counterpart of `discord.opus.Encoder`.
-///
-/// The encoder itself is behind an `Arc` so that the playback thread can share it with this
-/// Python object and encode without taking the GIL (`AudioPlayer` owns a handle to the very same
-/// encoder `VoiceClient.play` created, so both paths always agree on the bitrate and FEC state).
-#[pyclass(module = "discord_ext_voice._native", name = "OpusEncoder")]
-pub struct PyOpusEncoder {
-    inner: Arc<Mutex<OpusEncoder>>,
-}
-
-#[pymethods]
-impl PyOpusEncoder {
-    #[new]
-    #[pyo3(signature = (application="audio", bitrate=128, fec=true, expected_packet_loss=0.15, bandwidth="full", signal_type="auto"))]
-    fn new(
-        application: &str,
-        bitrate: u16,
-        fec: bool,
-        expected_packet_loss: f64,
-        bandwidth: &str,
-        signal_type: &str,
-    ) -> PyResult<Self> {
-        let config = EncoderConfig {
-            application: intern_application(application)?,
-            bitrate,
-            fec,
-            expected_packet_loss,
-            bandwidth: intern_bandwidth(bandwidth)?,
-            signal_type: intern_signal(signal_type)?,
-        };
-        validate_config(&config)?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                OpusEncoder::new(&config).map_err(OpusError::new_err)?,
-            )),
-        })
-    }
-
-    /// Encode 48kHz stereo `s16` PCM bytes into one Opus frame.
-    ///
-    /// `frame_size` matches `discord.opus.Encoder.encode(pcm, frame_size)` and defaults to
-    /// the 960 samples of a 20ms frame.
-    #[pyo3(signature = (pcm, frame_size=SAMPLES_PER_FRAME))]
-    fn encode<'py>(
-        &self,
-        py: Python<'py>,
-        pcm: &[u8],
-        frame_size: usize,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut samples = bytes_to_samples(pcm);
-        samples.truncate(frame_size * CHANNELS);
-        let encoded = self
-            .inner
-            .lock()
-            .encode(&samples)
-            .map_err(OpusError::new_err)?;
-        Ok(PyBytes::new(py, &encoded))
-    }
-
-    fn set_bitrate(&self, kbps: u16) -> PyResult<()> {
-        let bitrate = Bitrate::BitsPerSecond(i32::from(kbps.clamp(16, 512)) * 1024);
-        self.inner
-            .lock()
-            .inner
-            .set_bitrate(bitrate)
-            .map_err(|err| OpusError::new_err(opus_err(err)))
-    }
-
-    fn set_fec(&self, enabled: bool) -> PyResult<()> {
-        self.inner
-            .lock()
-            .inner
-            .set_inband_fec(enabled)
-            .map_err(|err| OpusError::new_err(opus_err(err)))
-    }
-
-    fn set_expected_packet_loss_percent(&self, percentage: f64) -> PyResult<()> {
-        let percent = (percentage * 100.0).clamp(0.0, 100.0) as u8;
-        self.inner
-            .lock()
-            .inner
-            .set_packet_loss_perc(percent)
-            .map_err(|err| OpusError::new_err(opus_err(err)))
-    }
-
-    fn set_bandwidth(&self, bandwidth: &str) -> PyResult<()> {
-        let value = match bandwidth {
-            "narrow" => Bandwidth::Narrowband,
-            "medium" => Bandwidth::Mediumband,
-            "wide" => Bandwidth::Wideband,
-            "superwide" => Bandwidth::Superwideband,
-            "full" => Bandwidth::Fullband,
-            other => {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "{other:?} is not a valid bandwidth setting"
-                )));
-            }
-        };
-        self.inner
-            .lock()
-            .inner
-            .set_bandwidth(value)
-            .map_err(|err| OpusError::new_err(opus_err(err)))
-    }
-
-    fn set_signal_type(&self, signal_type: &str) -> PyResult<()> {
-        let value = match signal_type {
-            "auto" => Signal::Auto,
-            "voice" => Signal::Voice,
-            "music" => Signal::Music,
-            other => {
-                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "{other:?} is not a valid signal type setting"
-                )));
-            }
-        };
-        self.inner
-            .lock()
-            .inner
-            .set_signal(value)
-            .map_err(|err| OpusError::new_err(opus_err(err)))
-    }
-
-    #[classattr]
-    #[allow(clippy::redundant_field_names)]
-    const SAMPLES_PER_FRAME: usize = SAMPLES_PER_FRAME;
-
-    #[classattr]
-    const FRAME_LENGTH: usize = FRAME_LENGTH;
-
-    #[classattr]
-    const SAMPLING_RATE: u32 = SAMPLING_RATE;
-
-    #[classattr]
-    const CHANNELS: usize = CHANNELS;
-
-    #[classattr]
-    const SAMPLE_SIZE: usize = CHANNELS * 2;
-
-    #[classattr]
-    const FRAME_SIZE: usize = SAMPLES_PER_FRAME * CHANNELS * 2;
-
-    fn __repr__(&self) -> String {
-        "<discord_ext_voice.opus.Encoder (pure Rust oprs)>".to_owned()
-    }
-}
-
-impl PyOpusEncoder {
-    /// The shared encoder, for callers on the native side (`AudioPlayer`, `VoiceConnection`)
-    /// that encode without holding the GIL.
-    pub fn handle(&self) -> Arc<Mutex<OpusEncoder>> {
-        Arc::clone(&self.inner)
-    }
-}
-
-/// A standalone Opus decoder.
-#[pyclass(module = "discord_ext_voice._native", name = "OpusDecoder")]
-pub struct PyOpusDecoder {
-    inner: Mutex<OpusDecoder>,
-}
-
-#[pymethods]
-impl PyOpusDecoder {
-    #[new]
-    fn new() -> PyResult<Self> {
-        Ok(Self {
-            inner: Mutex::new(OpusDecoder::new().map_err(OpusError::new_err)?),
-        })
-    }
-
-    /// Decode a raw Opus packet into 48kHz stereo `s16` PCM bytes.
-    fn decode<'py>(&self, py: Python<'py>, packet: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        let samples = self
-            .inner
-            .lock()
-            .decode(packet)
-            .map_err(OpusError::new_err)?;
-        let mut bytes = Vec::with_capacity(samples.len() * 2);
-        for sample in samples {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
-        Ok(PyBytes::new(py, &bytes))
-    }
-
-    /// Conceal a lost packet.
-    fn decode_plc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let samples = self.inner.lock().decode_plc().map_err(OpusError::new_err)?;
-        let mut bytes = Vec::with_capacity(samples.len() * 2);
-        for sample in samples {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
-        Ok(PyBytes::new(py, &bytes))
-    }
-
-    fn __repr__(&self) -> String {
-        "<discord_ext_voice.opus.Decoder (pure Rust oprs)>".to_owned()
     }
 }

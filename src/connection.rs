@@ -401,20 +401,42 @@ impl VoiceConnection {
     // ----------------------------------------------------------------- audio
 
     /// Build, encrypt and send one RTP audio packet.
-    #[pyo3(signature = (data, *, encode=true, encoder=None))]
-    fn send_audio_packet(
+    fn send_audio_packet(&self, data: &[u8], encode: bool) -> PyResult<()> {
+        send_audio_frame(&self.hub, data, encode).map_err(SendError::into_pyerr)
+    }
+
+    /// Configure the encoder `play` uses for PCM sources, and that `send_audio_packet` shares.
+    ///
+    /// These are `discord.py`'s `play` parameters: they are validated here, so a bad one raises
+    /// `ValueError` before playback starts.
+    #[pyo3(signature = (application="audio", bitrate=128, fec=true, expected_packet_loss=0.15, bandwidth="full", signal_type="auto"))]
+    fn set_encoder(
         &self,
-        data: &[u8],
-        encode: bool,
-        encoder: Option<PyRef<'_, crate::opus::PyOpusEncoder>>,
+        application: &str,
+        bitrate: u16,
+        fec: bool,
+        expected_packet_loss: f64,
+        bandwidth: &str,
+        signal_type: &str,
     ) -> PyResult<()> {
-        send_audio_frame(
-            &self.hub,
-            data,
-            encode,
-            encoder.as_ref().map(|encoder| encoder.handle()),
-        )
-        .map_err(SendError::into_pyerr)
+        let config = crate::opus::EncoderConfig {
+            application: application.to_owned(),
+            bitrate,
+            fec,
+            expected_packet_loss,
+            bandwidth: bandwidth.to_owned(),
+            signal_type: signal_type.to_owned(),
+        };
+        let encoder = crate::opus::OpusEncoder::new(&config)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        *self.hub.encoder.lock() = Some(encoder);
+        Ok(())
+    }
+
+    /// Drop the configured encoder: Opus-passthrough sources need none, and the next PCM frame
+    /// falls back to the defaults.
+    fn clear_encoder(&self) {
+        *self.hub.encoder.lock() = None;
     }
 
     /// Decrypt a received RTP payload (for receive-side extensions and tests).
@@ -496,28 +518,15 @@ impl std::fmt::Display for SendError {
 /// `VoiceConnection.send_audio_packet` uses it for a frame a caller sends by hand. The Opus
 /// encode happens *before* the connection lock is taken, so no Python call can run while the
 /// state is locked (see `crate::logging` for why that ordering matters).
-pub fn send_audio_frame(
-    hub: &Arc<Hub>,
-    data: &[u8],
-    encode: bool,
-    encoder: Option<Arc<Mutex<OpusEncoder>>>,
-) -> Result<(), SendError> {
+pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(), SendError> {
     let payload = if encode {
         let samples = crate::opus::bytes_to_samples(data);
-        match encoder {
-            Some(encoder) => encoder
-                .lock()
-                .encode_frame(&samples)
-                .map_err(SendError::Opus)?,
-            None => {
-                let mut slot = hub.encoder.lock();
-                let encoder = slot.get_or_insert_with(|| {
-                    OpusEncoder::new(&EncoderConfig::default())
-                        .expect("the default Opus encoder must build")
-                });
-                encoder.encode_frame(&samples).map_err(SendError::Opus)?
-            }
-        }
+        let mut slot = hub.encoder.lock();
+        let encoder = slot.get_or_insert_with(|| {
+            OpusEncoder::new(&EncoderConfig::default())
+                .expect("the default Opus encoder must build")
+        });
+        encoder.encode_frame(&samples).map_err(SendError::Opus)?
     } else {
         data.to_vec()
     };

@@ -80,9 +80,8 @@ async def test_rtp_packets_are_decryptable_by_pynacl(gateway_factory, mode):
         assert struct.unpack('>I', header[8:12])[0] == SSRC
 
         plaintext = _pynacl_decrypt(mode, bytes(gateway.secret_key), header, body)
-        # The payload must be a real Opus frame that decodes to one 20ms frame.
-        decoder = dev.opus.Decoder()
-        assert len(decoder.decode(plaintext)) == dev.FRAME_SIZE
+        # The payload is one encoded Opus frame, not the source's 20ms block of PCM.
+        assert 0 < len(plaintext) < dev.FRAME_SIZE
     finally:
         await conn.close()
 
@@ -100,7 +99,7 @@ async def test_rtp_packets_encrypted_by_pynacl_are_accepted(gateway_factory, mod
         struct.pack_into('>I', header, 4, 960)
         struct.pack_into('>I', header, 8, SSRC)
 
-        plaintext = dev.opus.Encoder().encode(b'\x00' * dev.FRAME_SIZE)
+        plaintext = dev.OPUS_SILENCE
         body = _pynacl_encrypt(mode, bytes(gateway.secret_key), bytes(header), plaintext, counter=99)
         assert bytes(conn.decrypt_rtp(bytes(header), body)) == plaintext
     finally:

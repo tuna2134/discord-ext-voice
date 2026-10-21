@@ -19,7 +19,7 @@ Voice websocket         ``tokio`` + ``tokio-rustls`` + ``tokio-tungstenite``
 Voice gateway payloads  ``voice-model``
 RTP encryption          ``xsalsa20poly1305`` / ``chacha20poly1305``
 End-to-end encryption   ``davey`` (DAVE / MLS)
-Opus codec              ``oprs`` (pure-Rust libopus)
+Opus codec              ``oprs`` (pure-Rust libopus, used natively)
 Audio sources           :mod:`discord_ext_voice.sources` (no binary, no C library)
 Audio decode/resample   ``symphonia`` + ``rubato``
 Connection flow         :mod:`discord_ext_voice.voice_state` + ``_native.ConnectionFlow``
@@ -30,7 +30,6 @@ Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)
 
 from __future__ import annotations
 
-from . import opus
 from ._native import DAVE_PROTOCOL_VERSION, SUPPORTED_MODES, __version__, probe
 from .errors import (
     AlreadyConnected,
@@ -48,7 +47,7 @@ from .errors import (
     VoiceError,
 )
 from .gateway import DiscordVoiceWebSocket
-from .opus import OPUS_SILENCE
+from ._native import OPUS_SILENCE
 from .player import AudioPlayer
 from .sources import (
     AudioSource,
@@ -62,13 +61,14 @@ from .voice_client import VoiceClient, VoiceProtocol, has_dave, has_nacl
 from .voice_state import ConnectionFlowState, VoiceConnectionState
 
 #: The geometry of one Discord voice frame. Taken from the native encoder so the Python and
-#: Rust sides cannot drift; the test suite asserts they match ``discord.opus.Encoder``.
-SAMPLES_PER_FRAME: int = opus.Encoder.SAMPLES_PER_FRAME
-FRAME_LENGTH: int = opus.Encoder.FRAME_LENGTH
-SAMPLE_SIZE: int = opus.Encoder.SAMPLE_SIZE
-FRAME_SIZE: int = opus.Encoder.FRAME_SIZE
-SAMPLING_RATE: int = opus.Encoder.SAMPLING_RATE
-CHANNELS: int = opus.Encoder.CHANNELS
+#: Read from the native module, so the Rust and Python sides cannot drift (the test suite also
+#: asserts they match ``discord.opus.Encoder``).
+SAMPLES_PER_FRAME: int = _native.SAMPLES_PER_FRAME
+FRAME_LENGTH: int = _native.FRAME_LENGTH
+SAMPLE_SIZE: int = _native.SAMPLE_SIZE
+FRAME_SIZE: int = _native.FRAME_SIZE
+SAMPLING_RATE: int = _native.SAMPLING_RATE
+CHANNELS: int = _native.CHANNELS
 
 __all__ = (
     # clients
@@ -87,7 +87,6 @@ __all__ = (
     'is_audio_source',
     'probe',
     # codec
-    'opus',
     'OPUS_SILENCE',
     'SAMPLES_PER_FRAME',
     'FRAME_LENGTH',

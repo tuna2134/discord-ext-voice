@@ -13,6 +13,7 @@
 //! `discord_ext_voice.player.AudioPlayer` wraps this object; `discord.player` is not imported at
 //! all.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -34,6 +35,13 @@ const SILENCE_FRAMES: usize = 5;
 
 /// How long a disconnected player sleeps between polls of the connection state.
 const RECONNECT_POLL: Duration = Duration::from_millis(50);
+
+/// How many decoded frames the reader may run ahead of the clock.
+///
+/// This is what keeps a streamed source from stuttering: a network read that takes longer than
+/// 20ms is absorbed by the buffer instead of leaving a hole in the audio. One second (50 frames)
+/// is enough for ordinary CDN jitter without adding audible latency.
+const READ_AHEAD_FRAMES: usize = 50;
 
 /// The `SPEAKING` states the player announces.
 const SPEAKING_VOICE: vm::SpeakingState = vm::SpeakingState::MICROPHONE;
@@ -80,21 +88,59 @@ struct Signals {
     restart_clock: bool,
 }
 
-/// Everything the playback thread needs, shared with the Python object.
+/// The source slot, with a generation that changes whenever `set_source` replaces it.
+struct SourceSlot {
+    source: Option<Py<PyAny>>,
+    generation: u64,
+}
+
+/// One decoded frame waiting for the clock, tagged with the source generation it came from.
+struct QueuedFrame {
+    generation: u64,
+    frame: Result<Frame, PlayError>,
+}
+
+/// The read-ahead buffer between the reader thread and the playback clock.
+struct FrameQueue {
+    frames: VecDeque<QueuedFrame>,
+    /// The generation `set_source` last installed. Frames from older generations are dropped.
+    generation: u64,
+    /// The generation whose reader is done, so an empty queue means "end of source" rather than
+    /// "wait for more". Cleared when the source changes.
+    closed: Option<u64>,
+}
+
+/// Everything the playback and reader threads need, shared with the Python object.
 struct PlayerInner {
     hub: Arc<Hub>,
-    /// The source being played. Swapped by `set_source` while the thread runs.
-    source: Mutex<Py<PyAny>>,
+    /// The source being played. Swapped by `set_source` while the threads run.
+    source: Mutex<SourceSlot>,
     /// The callback invoked once, with the error or `None`.
     after: Option<Py<PyAny>>,
     /// How long to wait for a reconnection before giving up.
     timeout: Duration,
     signals: Mutex<Signals>,
     wake: Condvar,
+    /// Decoded frames read ahead of the clock.
+    queue: Mutex<FrameQueue>,
+    /// Signalled when a frame is available or the source ended.
+    frame_ready: Condvar,
+    /// Signalled when the clock consumed a frame, making room for the reader.
+    frame_space: Condvar,
     thread: Mutex<Option<JoinHandle<()>>>,
+    reader: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PlayerInner {
+    /// The current source and its generation, cloned out of the lock so a slow decode never
+    /// blocks `set_source`.
+    fn current_source(&self, py: Python<'_>) -> Option<(Py<PyAny>, u64)> {
+        let slot = self.source.lock();
+        slot.source
+            .as_ref()
+            .map(|source| (source.clone_ref(py), slot.generation))
+    }
+
     fn is_connected(&self) -> bool {
         self.hub.state.lock().phase.is_connected()
     }
@@ -159,12 +205,23 @@ impl PyAudioPlayer {
         Ok(Self {
             inner: Arc::new(PlayerInner {
                 hub: connection.hub(),
-                source: Mutex::new(source),
+                source: Mutex::new(SourceSlot {
+                    source: Some(source),
+                    generation: 1,
+                }),
                 after,
                 timeout: wait_duration(timeout),
                 signals: Mutex::new(Signals::default()),
                 wake: Condvar::new(),
+                queue: Mutex::new(FrameQueue {
+                    frames: VecDeque::new(),
+                    generation: 1,
+                    closed: None,
+                }),
+                frame_ready: Condvar::new(),
+                frame_space: Condvar::new(),
                 thread: Mutex::new(None),
+                reader: Mutex::new(None),
             }),
         })
     }
@@ -192,13 +249,28 @@ impl PyAudioPlayer {
         }
 
         let inner = Arc::clone(&self.inner);
-        let handle = thread::Builder::new()
-            .name(format!(
-                "audio-player:{:x}",
-                Arc::as_ptr(&self.inner) as usize
-            ))
-            .spawn(move || run(inner))
+        let reader_inner = Arc::clone(&self.inner);
+        let address = Arc::as_ptr(&self.inner) as usize;
+        let reader = thread::Builder::new()
+            .name(format!("audio-reader:{address:x}"))
+            .spawn(move || reader_loop(reader_inner))
             .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        *self.inner.reader.lock() = Some(reader);
+
+        let handle = thread::Builder::new()
+            .name(format!("audio-player:{address:x}"))
+            .spawn(move || run(inner))
+            .map_err(|err| {
+                // The reader is already running; tell it to stop instead of leaking it.
+                {
+                    let mut signals = self.inner.signals.lock();
+                    signals.ended = true;
+                }
+                self.inner.wake.notify_all();
+                self.inner.frame_ready.notify_all();
+                self.inner.frame_space.notify_all();
+                pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
+            })?;
         *slot = Some(handle);
         Ok(())
     }
@@ -211,6 +283,8 @@ impl PyAudioPlayer {
             signals.paused = false;
         }
         self.inner.wake.notify_all();
+        self.inner.frame_ready.notify_all();
+        self.inner.frame_space.notify_all();
         self.inner.send_speaking(SPEAKING_NONE);
     }
 
@@ -222,6 +296,7 @@ impl PyAudioPlayer {
             signals.paused = true;
         }
         self.inner.wake.notify_all();
+        self.inner.frame_space.notify_all();
         if update_speaking {
             self.inner.send_speaking(SPEAKING_NONE);
         }
@@ -236,6 +311,7 @@ impl PyAudioPlayer {
             signals.restart_clock = true;
         }
         self.inner.wake.notify_all();
+        self.inner.frame_space.notify_all();
         if update_speaking {
             self.inner.send_speaking(SPEAKING_VOICE);
         }
@@ -268,7 +344,17 @@ impl PyAudioPlayer {
         }
         self.inner.wake.notify_all();
 
-        *self.inner.source.lock() = source;
+        {
+            let mut slot = self.inner.source.lock();
+            slot.source = Some(source);
+            slot.generation = slot.generation.wrapping_add(1);
+            let mut queue = self.inner.queue.lock();
+            queue.generation = slot.generation;
+            queue.frames.clear();
+            queue.closed = None;
+        }
+        self.inner.frame_ready.notify_all();
+        self.inner.frame_space.notify_all();
 
         {
             let mut signals = self.inner.signals.lock();
@@ -280,7 +366,13 @@ impl PyAudioPlayer {
 
     #[getter]
     fn source(&self, py: Python<'_>) -> Py<PyAny> {
-        self.inner.source.lock().clone_ref(py)
+        self.inner
+            .source
+            .lock()
+            .source
+            .as_ref()
+            .map(|source| source.clone_ref(py))
+            .unwrap_or_else(|| py.None())
     }
 
     /// Wait for the playback thread to finish, at most `timeout` seconds.
@@ -299,6 +391,21 @@ impl PyAudioPlayer {
         if let Some(handle) = handle {
             py.detach(move || {
                 let _ = handle.join();
+            });
+        }
+
+        // A reader blocked in a slow network read cannot be interrupted, but once it has finished
+        // its handle should be reaped rather than dropped.
+        let reader = {
+            let mut slot = self.inner.reader.lock();
+            match slot.as_ref() {
+                Some(handle) if handle.is_finished() => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some(reader) = reader {
+            py.detach(move || {
+                let _ = reader.join();
             });
         }
         Ok(())
@@ -384,7 +491,7 @@ fn play(inner: &Arc<PlayerInner>) -> Outcome {
             }
         }
 
-        let Some(frame) = read_frame(inner) else {
+        let Some(frame) = next_frame(inner) else {
             return Outcome::Aborted;
         };
         let frame = match frame {
@@ -465,12 +572,113 @@ struct Frame {
     current_error: Option<PlayError>,
 }
 
-/// Read one frame, or `None` when the interpreter is gone.
-fn read_frame(inner: &Arc<PlayerInner>) -> Option<Result<Frame, PlayError>> {
+/// The reader thread: decode ahead of the clock into [`PlayerInner::queue`].
+///
+/// It stops when the source ends, fails, the player is stopped, or the interpreter goes away.
+/// A source that is swapped while a decode is in flight has its frame dropped by generation.
+fn reader_loop(inner: Arc<PlayerInner>) {
+    loop {
+        let (ended, paused) = {
+            let signals = inner.signals.lock();
+            (signals.ended, signals.paused)
+        };
+        if ended {
+            break;
+        }
+        if paused {
+            // Do not consume a paused source; the buffer stays where it is.
+            let mut signals = inner.signals.lock();
+            while signals.paused && !signals.ended {
+                inner.wake.wait(&mut signals);
+            }
+            continue;
+        }
+
+        let Some(Some((source, generation))) = Python::try_attach(|py| inner.current_source(py))
+        else {
+            break;
+        };
+        let Some(result) = read_frame(&source) else {
+            break;
+        };
+
+        let mut queue = inner.queue.lock();
+        if queue.generation != generation {
+            // The source was replaced while this frame was being decoded.
+            drop(queue);
+            continue;
+        }
+
+        while queue.frames.len() >= READ_AHEAD_FRAMES {
+            if inner.signals.lock().ended {
+                break;
+            }
+            inner.frame_space.wait(&mut queue);
+        }
+
+        if queue.generation != generation || inner.signals.lock().ended {
+            continue;
+        }
+
+        let finished = match &result {
+            Ok(frame) => frame.data.is_empty() || frame.current_error.is_some(),
+            Err(_) => true,
+        };
+        queue.frames.push_back(QueuedFrame {
+            generation,
+            frame: result,
+        });
+        if finished {
+            queue.closed = Some(generation);
+        }
+        let closed = finished;
+        drop(queue);
+        inner.frame_ready.notify_all();
+        if closed {
+            break;
+        }
+    }
+
+    // Wake a playback loop that is waiting for a frame, and make sure "no more frames" is not
+    // mistaken for "the source was replaced".
+    let mut queue = inner.queue.lock();
+    if queue.closed.is_none() {
+        queue.closed = Some(queue.generation);
+    }
+    drop(queue);
+    inner.frame_ready.notify_all();
+}
+
+/// Take the next frame for the clock, waiting for the reader if necessary.
+fn next_frame(inner: &Arc<PlayerInner>) -> Option<Result<Frame, PlayError>> {
+    loop {
+        if inner.signals.lock().ended {
+            return None;
+        }
+
+        let mut queue = inner.queue.lock();
+        while queue
+            .frames
+            .front()
+            .is_some_and(|queued| queued.generation != queue.generation)
+        {
+            queue.frames.pop_front();
+        }
+
+        if let Some(queued) = queue.frames.pop_front() {
+            inner.frame_space.notify_all();
+            return Some(queued.frame);
+        }
+        if queue.closed == Some(queue.generation) {
+            return None;
+        }
+        inner.frame_ready.wait(&mut queue);
+    }
+}
+
+/// Read one frame from `source`, or `None` when the interpreter is gone.
+fn read_frame(source: &Py<PyAny>) -> Option<Result<Frame, PlayError>> {
     Python::try_attach(|py| {
-        // Cloned out of the lock, which is therefore free while `read` runs: `set_source` from
-        // another thread never waits for a slow decode.
-        let source = inner.source.lock().clone_ref(py);
         let source = source.bind(py);
 
         let data = match source.call_method0("read") {
@@ -517,10 +725,36 @@ fn read_current_error(source: &Bound<'_, PyAny>) -> Option<PlayError> {
     })
 }
 
+/// Join the reader thread, but never block the player on a stuck network read.
+///
+/// Returns whether the reader actually finished (and was joined).
+fn stop_reader(inner: &Arc<PlayerInner>) -> bool {
+    let reader = inner.reader.lock().take();
+    let Some(reader) = reader else {
+        return true;
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
+        true
+    } else {
+        false
+    }
+}
+
 /// The `finally` block of `discord.player.AudioPlayer.run`: call `after`, then clean the source
 /// up. The GIL is taken once and dropped again; if the interpreter is already gone there is
 /// nothing left to do.
 fn finish(inner: &Arc<PlayerInner>, outcome: &Outcome) {
+    // The reader may still be in the middle of a `read()` (a network stream, say). Waiting for
+    // it keeps `cleanup()` from racing that decode; if it is stuck on a slow request, let it go
+    // and let the source's own drop release the decoder.
+    let reader_stopped = stop_reader(inner);
+
     let _ = Python::try_attach(|py| {
         let error = match outcome {
             Outcome::Failed(error) => Some(error),
@@ -546,8 +780,18 @@ fn finish(inner: &Arc<PlayerInner>, outcome: &Outcome) {
 
         // `AudioSource.cleanup` has to survive being called twice (our own sources clean up in
         // `__del__` as well), and a foreign source may not have it at all.
-        let source = inner.source.lock().clone_ref(py);
-        if let Err(err) = source.bind(py).call_method0("cleanup")
+        if !reader_stopped {
+            crate::log_debug!("skipping source cleanup: the reader is still decoding");
+            return;
+        }
+        let source = inner
+            .source
+            .lock()
+            .source
+            .as_ref()
+            .map(|source| source.clone_ref(py));
+        if let Some(source) = source
+            && let Err(err) = source.bind(py).call_method0("cleanup")
             && !err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
         {
             crate::log_debug!("calling cleanup on the audio source failed: {err}");

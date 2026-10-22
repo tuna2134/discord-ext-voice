@@ -120,7 +120,7 @@ so there is no aiohttp connection, no keep-alive thread and no frame reader left
 | `PCMAudio` | **ours**: raw PCM from a file object |
 | `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: built on the native readers (`_native.DecodeSource` / `_native.OpusSource`) with `symphonia`, which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
 | `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
-| `AudioPlayer` | **ours**, a thin wrapper over the native thread: 20ms pacing, pause/resume, the silence frames, the `SPEAKING` announcements and the reconnection wait are Rust |
+| `AudioPlayer` | **ours**, a thin wrapper over the native threads: a one-second read-ahead queue, 20ms pacing, pause/resume, the silence frames, the `SPEAKING` announcements and the reconnection wait are Rust |
 
 ## `discord.opus`
 
@@ -198,6 +198,8 @@ else is reachable through the native `VoiceError` hierarchy.
   replaces the package's own. discord.py has no equivalent, because it hands the URL to the
   `ffmpeg` binary.
 * `AudioPlayer.join(timeout=None)` / `is_alive()` — wait for the playback thread from Python.
+* The player reads up to one second ahead of the clock into a native frame queue, so a streamed
+  source whose network read occasionally takes longer than 20ms does not stutter.
 * `voice.native` (same object as `voice._connection`) — the `_native.VoiceConnection`:
   `state`/`phase`/`set_phase`, `joined`, `expecting_disconnect`, `disconnected`,
   `voice_state_update(...)`, `voice_server_update(...)`, `close_action(code, reconnect)`,

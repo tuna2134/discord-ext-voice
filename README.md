@@ -304,11 +304,14 @@ phase itself is the transport's, so there is one state rather than two, and the 
 owns the credentials and the negotiated session as well. The discord.py calls stay in
 `VoiceClient`, never in Rust.
 
-**The playback clock is native.** `discord_ext_voice.AudioPlayer` is a thin wrapper over a Rust
-thread that paces each 20ms frame, feeds silence while paused, announces the `SPEAKING` state and
-waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — `DELAY = 0.02`, the
-`after(error)` callback, and a clock that restarts on `resume` — without importing
-`discord.player`, whose `audioop` dependency would otherwise be pulled in.
+**The playback clock is native.** `discord_ext_voice.AudioPlayer` is a thin wrapper over two Rust
+threads: a reader that decodes up to a second ahead into a frame queue, and a clock that paces each
+20ms frame from that queue, feeds silence while paused, announces the `SPEAKING` state and waits
+for a reconnection. The read-ahead buffer is what keeps a streamed `http(s)` source from
+stuttering when a network read takes longer than one frame; a source that is slower than
+real time on average still underruns, as it must. It keeps `discord.player.AudioPlayer`'s
+semantics — `DELAY = 0.02`, the `after(error)` callback, and a clock that restarts on `resume` —
+without importing `discord.player`, whose `audioop` dependency would otherwise be pulled in.
 
 ## Testing
 

@@ -4,6 +4,7 @@
 //! `VoiceClient` needs from a backend: the connection lifecycle, the RTP encryption path, the
 //! Opus encoder and the DAVE session.
 
+use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -761,21 +762,23 @@ impl std::fmt::Display for SendError {
 /// encode happens *before* the connection lock is taken, so no Python call can run while the
 /// state is locked (see `crate::logging` for why that ordering matters).
 pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(), SendError> {
-    let payload = if encode {
-        let samples = crate::opus::bytes_to_samples(data);
+    let encoded = if encode {
         let mut slot = hub.encoder.lock();
         let encoder = slot.get_or_insert_with(|| {
             OpusEncoder::new(&EncoderConfig::default())
                 .expect("the default Opus encoder must build")
         });
-        encoder.encode_frame(&samples).map_err(SendError::Opus)?
+        Some(encoder.encode_pcm_bytes(data).map_err(SendError::Opus)?)
     } else {
-        data.to_vec()
+        None
     };
+    let payload: &[u8] = encoded.as_deref().unwrap_or(data);
 
-    // Records are collected and emitted after the lock is released: logging needs the GIL,
-    // and a Python thread that holds the GIL may be waiting for this lock.
-    let mut pending: Vec<(&'static str, String)> = Vec::new();
+    // A DAVE failure is rare and worth a warning, but the per-frame trace is not worth an
+    // allocation (or a GIL round trip) on the audio path. Records are emitted after the lock is
+    // released: logging needs the GIL, and a Python thread that holds the GIL may be waiting for
+    // this lock.
+    let mut dave_error: Option<String> = None;
     let (packet, socket) = {
         let mut state = hub.state.lock();
 
@@ -783,20 +786,17 @@ pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(),
             crate::transport::VoiceState::checked_add(u64::from(state.sequence), 1, 65_535) as u16;
 
         let dave_active = state.dave.can_encrypt();
-        let payload = if dave_active {
-            match state.dave.encrypt_opus(&payload) {
-                Ok(Some(encrypted)) => encrypted,
-                Ok(None) => payload,
+        let payload: Cow<'_, [u8]> = if dave_active {
+            match state.dave.encrypt_opus(payload) {
+                Ok(Some(encrypted)) => Cow::Owned(encrypted),
+                Ok(None) => Cow::Borrowed(payload),
                 Err(err) => {
-                    pending.push((
-                        "warning",
-                        format!("DAVE encryption failed, sending plaintext: {err}"),
-                    ));
-                    payload
+                    dave_error = Some(format!("DAVE encryption failed, sending plaintext: {err}"));
+                    Cow::Borrowed(payload)
                 }
             }
         } else {
-            payload
+            Cow::Borrowed(payload)
         };
 
         let mut header = [0u8; 12];
@@ -813,20 +813,8 @@ pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(),
             ))
         })?;
         let packet = encryptor
-            .encrypt(&header, &payload)
+            .encrypt(&header, payload.as_ref())
             .map_err(|err| SendError::Encryption(err.to_string()))?;
-
-        pending.push((
-            "debug",
-            format!(
-                "sending RTP: seq={} ssrc={} {} bytes (opus={}, dave={})",
-                state.sequence,
-                ssrc,
-                packet.len(),
-                if encode { "encoded" } else { "passthrough" },
-                if dave_active { "on" } else { "off" }
-            ),
-        ));
 
         state.timestamp = crate::transport::VoiceState::checked_add(
             u64::from(state.timestamp),
@@ -837,8 +825,8 @@ pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(),
         (packet, state.udp.clone())
     };
 
-    for (level, message) in pending {
-        crate::logging::log(level, &message);
+    if let Some(message) = dave_error {
+        crate::log_warning!("{message}");
     }
 
     let Some(socket) = socket else {

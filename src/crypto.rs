@@ -15,6 +15,7 @@
 // one of them, so a method call resolves to the right one.
 use chacha20poly1305::aead::AeadInOut as _;
 use chacha20poly1305::aead::KeyInit as _;
+use chacha20poly1305::aead::inout::InOutBuf;
 use chacha20poly1305::{Key as ChachaKey, XChaCha20Poly1305, XNonce};
 use rand::Rng;
 use xsalsa20poly1305::AeadInPlace as _;
@@ -121,20 +122,28 @@ impl PacketEncryptor {
     /// `header` must be the 12 byte RTP header, `data` the (already DAVE-encrypted, if
     /// applicable) Opus frame.
     pub fn encrypt(&mut self, header: &[u8], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        // Build the final datagram (header + payload + tag + optional nonce) in one allocation
+        // and encrypt the payload in place. The previous implementation copied the payload into
+        // a scratch `Vec` and then copied it again into the output — twice the bandwidth of the
+        // packet on the 20ms audio path.
         match self.mode {
             Mode::AeadXChaCha20Poly1305Rtpsize => {
                 let nonce = self.next_counter();
                 let mut full_nonce = [0u8; 24];
                 full_nonce[..4].copy_from_slice(&nonce.to_be_bytes());
 
-                let mut buffer = data.to_vec();
-                self.chacha
-                    .encrypt_in_place(&XNonce::from(full_nonce), header, &mut buffer)
-                    .map_err(|_| CryptoError::Encrypt)?;
-
-                let mut out = Vec::with_capacity(header.len() + buffer.len() + 4);
+                let mut out = Vec::with_capacity(header.len() + data.len() + 16 + 4);
                 out.extend_from_slice(header);
-                out.extend_from_slice(&buffer);
+                out.extend_from_slice(data);
+                let tag = self
+                    .chacha
+                    .encrypt_inout_detached(
+                        &XNonce::from(full_nonce),
+                        header,
+                        InOutBuf::from(&mut out[header.len()..]),
+                    )
+                    .map_err(|_| CryptoError::Encrypt)?;
+                out.extend_from_slice(tag.as_slice());
                 out.extend_from_slice(&full_nonce[..4]);
                 Ok(out)
             }
@@ -143,14 +152,21 @@ impl PacketEncryptor {
                 let mut full_nonce = [0u8; 24];
                 full_nonce[..4].copy_from_slice(&nonce.to_be_bytes());
 
-                let mut buffer = data.to_vec();
-                self.salsa
-                    .encrypt_in_place(SalsaNonce::from_slice(&full_nonce), b"", &mut buffer)
-                    .map_err(|_| CryptoError::Encrypt)?;
-
-                let mut out = Vec::with_capacity(header.len() + buffer.len() + 4);
+                // NaCl `secretbox` puts the 16-byte authenticator *before* the ciphertext
+                // (unlike the AEAD convention), which is what discord.py transmits.
+                let mut out = Vec::with_capacity(header.len() + 16 + data.len() + 4);
                 out.extend_from_slice(header);
-                out.extend_from_slice(&buffer);
+                out.extend_from_slice(&[0u8; 16]);
+                out.extend_from_slice(data);
+                let tag = self
+                    .salsa
+                    .encrypt_in_place_detached(
+                        SalsaNonce::from_slice(&full_nonce),
+                        b"",
+                        &mut out[header.len() + 16..],
+                    )
+                    .map_err(|_| CryptoError::Encrypt)?;
+                out[header.len()..header.len() + 16].copy_from_slice(tag.as_slice());
                 out.extend_from_slice(&full_nonce[..4]);
                 Ok(out)
             }
@@ -158,14 +174,19 @@ impl PacketEncryptor {
                 let mut full_nonce = [0u8; 24];
                 rand::rng().fill_bytes(&mut full_nonce);
 
-                let mut buffer = data.to_vec();
-                self.salsa
-                    .encrypt_in_place(SalsaNonce::from_slice(&full_nonce), b"", &mut buffer)
-                    .map_err(|_| CryptoError::Encrypt)?;
-
-                let mut out = Vec::with_capacity(header.len() + buffer.len() + 24);
+                let mut out = Vec::with_capacity(header.len() + 16 + data.len() + 24);
                 out.extend_from_slice(header);
-                out.extend_from_slice(&buffer);
+                out.extend_from_slice(&[0u8; 16]);
+                out.extend_from_slice(data);
+                let tag = self
+                    .salsa
+                    .encrypt_in_place_detached(
+                        SalsaNonce::from_slice(&full_nonce),
+                        b"",
+                        &mut out[header.len() + 16..],
+                    )
+                    .map_err(|_| CryptoError::Encrypt)?;
+                out[header.len()..header.len() + 16].copy_from_slice(tag.as_slice());
                 out.extend_from_slice(&full_nonce);
                 Ok(out)
             }
@@ -175,14 +196,19 @@ impl PacketEncryptor {
                 let len = header.len().min(12);
                 full_nonce[..len].copy_from_slice(&header[..len]);
 
-                let mut buffer = data.to_vec();
-                self.salsa
-                    .encrypt_in_place(SalsaNonce::from_slice(&full_nonce), b"", &mut buffer)
-                    .map_err(|_| CryptoError::Encrypt)?;
-
-                let mut out = Vec::with_capacity(header.len() + buffer.len());
+                let mut out = Vec::with_capacity(header.len() + 16 + data.len());
                 out.extend_from_slice(header);
-                out.extend_from_slice(&buffer);
+                out.extend_from_slice(&[0u8; 16]);
+                out.extend_from_slice(data);
+                let tag = self
+                    .salsa
+                    .encrypt_in_place_detached(
+                        SalsaNonce::from_slice(&full_nonce),
+                        b"",
+                        &mut out[header.len() + 16..],
+                    )
+                    .map_err(|_| CryptoError::Encrypt)?;
+                out[header.len()..header.len() + 16].copy_from_slice(tag.as_slice());
                 Ok(out)
             }
         }

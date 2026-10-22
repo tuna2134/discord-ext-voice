@@ -91,3 +91,13 @@ rand = "0.10"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# `maturin develop` builds the dev profile, and almost all of the runtime cost is inside
+# dependencies (the ChaCha/XSalsa ciphers and the pure-Rust Opus codec). Optimize those even in
+# development so interactive playback is usable, while keeping this crate's debug assertions and
+# symbols for the code being worked on.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

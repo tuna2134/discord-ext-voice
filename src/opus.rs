@@ -49,6 +49,9 @@ impl Default for EncoderConfig {
 pub struct OpusEncoder {
     inner: RawEncoder,
     buffer: Vec<u8>,
+    /// Reused interleaved samples, so encoding a PCM frame does not allocate a new `Vec<i16>`
+    /// every 20ms.
+    samples: Vec<i16>,
 }
 
 impl std::fmt::Debug for OpusEncoder {
@@ -129,6 +132,7 @@ impl OpusEncoder {
             // Opus never produces more than 1275 bytes per frame (120ms), 4000 is a safe
             // upper bound for a 20ms stereo frame at 512kbps.
             buffer: vec![0u8; 4000],
+            samples: Vec::with_capacity(SAMPLES_PER_FRAME * CHANNELS),
         })
     }
 
@@ -149,17 +153,34 @@ impl OpusEncoder {
         };
         self.encode(slice)
     }
+
+    /// Encode one 20ms frame of interleaved 16 bit little endian PCM.
+    ///
+    /// The sample conversion reuses a buffer owned by the encoder: the player hits this every
+    /// 20ms, and allocating a fresh `Vec<i16>` for each frame was pure overhead.
+    pub fn encode_pcm_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.samples.clear();
+        self.samples.extend(
+            data.chunks_exact(2)
+                .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]])),
+        );
+
+        let wanted = SAMPLES_PER_FRAME * CHANNELS;
+        let samples = if self.samples.len() > wanted {
+            &self.samples[..wanted]
+        } else {
+            &self.samples
+        };
+        let written = self
+            .inner
+            .encode(samples, &mut self.buffer)
+            .map_err(opus_err)?;
+        Ok(self.buffer[..written].to_vec())
+    }
 }
 
 fn opus_err(err: oprs::Error) -> String {
     format!("Opus error: {err}")
-}
-
-/// Turn interleaved 16 bit little endian PCM bytes into samples.
-pub fn bytes_to_samples(data: &[u8]) -> Vec<i16> {
-    data.chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect()
 }
 
 /// Decode a raw Opus packet into interleaved 48kHz stereo `i16` samples.

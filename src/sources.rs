@@ -93,9 +93,19 @@ impl PcmAudio {
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let data = self.stream.bind(py).call_method1("read", (FRAME_BYTES,))?;
+
+        // A `BytesIO`/buffered file returns `bytes`; hand that object on instead of copying it.
+        if let Ok(bytes) = data.cast::<PyBytes>() {
+            return if bytes.as_bytes().len() == FRAME_BYTES {
+                Ok(bytes.clone())
+            } else {
+                // A partial frame is not sendable, and discord.py's player reads that as the end.
+                Ok(PyBytes::new(py, b""))
+            };
+        }
+
         let data = data.extract::<Vec<u8>>()?;
         if data.len() != FRAME_BYTES {
-            // A partial frame is not sendable, and discord.py's player reads that as the end.
             return Ok(PyBytes::new(py, b""));
         }
         Ok(PyBytes::new(py, &data))
@@ -318,8 +328,18 @@ impl PcmVolumeTransformer {
             ));
         };
         let data = original.bind(py).call_method0("read")?;
+        let volume = *self.volume.lock();
+
+        // At 100% the transformation is the identity: hand the source's own `bytes` object on
+        // instead of copying it into a new one. This is the common case for `!play`.
+        if volume == 1.0
+            && let Ok(bytes) = data.cast::<PyBytes>()
+        {
+            return Ok(bytes.clone());
+        }
+
         let data = data.extract::<Vec<u8>>()?;
-        let volume = self.volume.lock().min(2.0) as f32;
+        let volume = volume.min(2.0) as f32;
         Ok(PyBytes::new(py, &scale_pcm_s16(&data, volume)))
     }
 

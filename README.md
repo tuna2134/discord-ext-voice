@@ -313,6 +313,25 @@ real time on average still underruns, as it must. It keeps `discord.player.Audio
 semantics — `DELAY = 0.02`, the `after(error)` callback, and a clock that restarts on `resume` —
 without importing `discord.player`, whose `audioop` dependency would otherwise be pulled in.
 
+### Performance notes
+
+The 20ms audio path was written to stay allocation-light:
+
+* disabled log records cost one atomic level check, not a `format!` plus a GIL round trip (the
+  effective Python level is re-read every two seconds, so `setLevel` still works at runtime);
+* RTP encryption builds the final datagram once and encrypts the payload in place, instead of
+  copying the payload into a scratch buffer and then into the output;
+* PCM-to-Opus conversion reuses a sample buffer owned by the encoder, and a
+  `PCMVolumeTransformer` at 100% hands the source's `bytes` object straight through;
+* the player's read-ahead thread decodes up to one second ahead, so a network read slower than
+  20ms is absorbed by the queue instead of becoming a gap.
+
+On the development machine used here, a passthrough frame costs about **7.5µs** and a PCM frame
+about **1.4ms** (Opus in-band FEC dominates; that is still under 7% of one core at 50 frames per
+second). `maturin develop` builds the dev profile, so `Cargo.toml` optimizes dependencies there
+too — otherwise the debug build makes the pure-Rust ciphers an order of magnitude slower than the
+release wheel.
+
 ## Testing
 
 ```bash

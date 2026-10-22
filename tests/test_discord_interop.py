@@ -8,6 +8,7 @@ passes ``discord.py``'s own ``isinstance`` check and the documented exception ty
 from __future__ import annotations
 
 import inspect
+import io
 
 import pytest
 
@@ -157,14 +158,15 @@ def test_audio_sources_are_this_packages_own():
         assert ours is not getattr(discord.player, name), f'{name} must be ours'
         assert ours.__module__ == 'discord_ext_voice._native'
 
-    # A source with the same three methods is still accepted, which is what makes a
-    # `discord.AudioSource` subclass playable.
+    # Only native sources are accepted. A `discord.AudioSource` subclass is implemented in
+    # Python, so it is rejected rather than read through the Rust data path.
     class External(discord.AudioSource):
         def read(self) -> bytes:
             return b''
 
-    assert dev.is_audio_source(External()) is True
+    assert dev.is_audio_source(External()) is False
     assert dev.is_audio_source(b'not a source') is False
+    assert dev.is_audio_source(dev.PCMAudio(io.BytesIO(b''))) is True
 
 
 def test_discord_voice_protocol_contract_methods_exist():
@@ -173,7 +175,7 @@ def test_discord_voice_protocol_contract_methods_exist():
 
 
 def test_audio_source_still_works_alongside_discord():
-    """`discord.AudioSource` subclasses must be accepted by `play`."""
+    """A `discord.AudioSource` itself still works; only native sources are playable here."""
     assert hasattr(discord, 'AudioSource')
 
     class External(discord.AudioSource):
@@ -182,3 +184,4 @@ def test_audio_source_still_works_alongside_discord():
 
     source = External()
     assert source.is_opus() is False
+    assert dev.is_audio_source(source) is False

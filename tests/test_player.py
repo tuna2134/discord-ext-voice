@@ -8,6 +8,7 @@ pin that behaviour; the broader end-to-end flow lives in ``test_voice_client.py`
 from __future__ import annotations
 
 import asyncio
+import io
 import time
 from typing import Any, Callable
 
@@ -22,10 +23,11 @@ pytestmark = pytest.mark.asyncio
 LOUD_FRAME = bytes(range(256)) * 15
 
 
-class CountingSource(dev.AudioSource):
-    """A source that hands out whole frames and records what the player did to it."""
+class CountingSource(dev.PCMAudio):
+    """A native source that hands out whole frames and records what the player did to it."""
 
     def __init__(self, frames: int = 3) -> None:
+        super().__init__(io.BytesIO(b''))
         self.frames = frames
         self.reads = 0
         self.cleanups = 0
@@ -130,10 +132,11 @@ async def test_a_failing_source_is_reported_to_after(gateway_factory):
         await voice.disconnect()
 
 
-class StallingSource(dev.AudioSource):
-    """A source whose first read never returns in time, like a dead HTTP stream."""
+class StallingSource(dev.PCMAudio):
+    """A native source whose first read never returns in time, like a dead HTTP stream."""
 
     def __init__(self, delay: float = 1.0) -> None:
+        super().__init__(io.BytesIO(b''))
         self.delay = delay
         self.cleanups = 0
 

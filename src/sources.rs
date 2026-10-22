@@ -20,7 +20,8 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
+use pyo3::PyClass;
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pyclass_init::PyClassInitializer;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString, PyTuple};
@@ -104,7 +105,38 @@ impl PcmAudio {
         *slf.stream.lock() = Some(stream);
     }
 
+    /// Marks a source whose implementation is native; `is_audio_source` and `play()` require
+    /// this (Python subclasses inherit it unless they start from `AudioSource` directly).
+    #[classattr]
+    const NATIVE_AUDIO_SOURCE: bool = true;
+
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.read_native(py)
+    }
+
+    fn is_opus(&self) -> bool {
+        self.is_opus_native()
+    }
+
+    fn cleanup(&self, py: Python<'_>) {
+        self.cleanup_native(py);
+    }
+
+    fn __repr__(&self) -> String {
+        "<discord_ext_voice.PCMAudio>".to_owned()
+    }
+}
+
+impl PcmAudio {
+    fn is_opus_native(&self) -> bool {
+        false
+    }
+
+    fn cleanup_native(&self, _py: Python<'_>) {}
+
+    /// The native implementation of `read`, used directly by `PCMVolumeTransformer` when the
+    /// wrapped source is one of ours (the Python method would only add a dispatch).
+    fn read_native<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let stream = self
             .stream
             .lock()
@@ -130,16 +162,6 @@ impl PcmAudio {
             return Ok(PyBytes::new(py, b""));
         }
         Ok(PyBytes::new(py, &data))
-    }
-
-    fn is_opus(&self) -> bool {
-        false
-    }
-
-    fn cleanup(&self) {}
-
-    fn __repr__(&self) -> String {
-        "<discord_ext_voice.PCMAudio>".to_owned()
     }
 }
 
@@ -181,6 +203,9 @@ impl FfmpegPcmAudio {
         *slf.reader.lock() = Some(reader);
         Ok(())
     }
+
+    #[classattr]
+    const NATIVE_AUDIO_SOURCE: bool = true;
 
     /// Open a source without blocking the event loop.
     ///
@@ -226,23 +251,15 @@ impl FfmpegPcmAudio {
     }
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let mut reader = self.reader.lock();
-        match reader.as_mut() {
-            Some(reader) => reader.read(py),
-            None => Err(PyValueError::new_err("the source has not been initialized")),
-        }
+        self.read_native(py)
     }
 
     fn is_opus(&self) -> bool {
-        false
+        self.is_opus_native()
     }
 
     fn cleanup(&self, py: Python<'_>) {
-        py.detach(|| {
-            if let Some(reader) = self.reader.lock().as_mut() {
-                reader.cleanup();
-            }
-        });
+        self.cleanup_native(py);
     }
 
     fn __repr__(&self) -> String {
@@ -289,6 +306,9 @@ impl FfmpegOpusAudio {
         Ok(())
     }
 
+    #[classattr]
+    const NATIVE_AUDIO_SOURCE: bool = true;
+
     /// Open an Opus/PCM source without blocking the event loop.
     ///
     /// See :meth:`FFmpegPCMAudio.open`.
@@ -331,27 +351,15 @@ impl FfmpegOpusAudio {
     }
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let mut reader = self.reader.lock();
-        match reader.as_mut() {
-            Some(reader) => reader.read(py),
-            None => Err(PyValueError::new_err("the source has not been initialized")),
-        }
+        self.read_native(py)
     }
 
     fn is_opus(&self) -> bool {
-        self.reader
-            .lock()
-            .as_ref()
-            .map(Reader::is_opus)
-            .unwrap_or(false)
+        self.is_opus_native()
     }
 
     fn cleanup(&self, py: Python<'_>) {
-        py.detach(|| {
-            if let Some(reader) = self.reader.lock().as_mut() {
-                reader.cleanup();
-            }
-        });
+        self.cleanup_native(py);
     }
 
     /// The codec name the demuxer reports, or `None` when the input cannot be read.
@@ -399,11 +407,59 @@ impl FfmpegOpusAudio {
     }
 }
 
+impl FfmpegPcmAudio {
+    fn read_native<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let mut reader = self.reader.lock();
+        match reader.as_mut() {
+            Some(reader) => reader.read(py),
+            None => Err(PyValueError::new_err("the source has not been initialized")),
+        }
+    }
+
+    fn is_opus_native(&self) -> bool {
+        false
+    }
+
+    fn cleanup_native(&self, py: Python<'_>) {
+        py.detach(|| {
+            if let Some(reader) = self.reader.lock().as_mut() {
+                reader.cleanup();
+            }
+        });
+    }
+}
+
 impl Drop for FfmpegPcmAudio {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.lock().as_mut() {
             reader.cleanup();
         }
+    }
+}
+
+impl FfmpegOpusAudio {
+    fn read_native<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let mut reader = self.reader.lock();
+        match reader.as_mut() {
+            Some(reader) => reader.read(py),
+            None => Err(PyValueError::new_err("the source has not been initialized")),
+        }
+    }
+
+    fn is_opus_native(&self) -> bool {
+        self.reader
+            .lock()
+            .as_ref()
+            .map(Reader::is_opus)
+            .unwrap_or(false)
+    }
+
+    fn cleanup_native(&self, py: Python<'_>) {
+        py.detach(|| {
+            if let Some(reader) = self.reader.lock().as_mut() {
+                reader.cleanup();
+            }
+        });
     }
 }
 
@@ -417,10 +473,12 @@ impl Drop for FfmpegOpusAudio {
 
 /// A volume transformer for PCM sources, replacing `audioop.mul`.
 ///
-/// It is a standalone native class rather than an `AudioSource` subclass: Python subclasses it
-/// (discord.py's own `yt-dlp` example does) and passes its own constructor arguments, so the
-/// native `tp_new` has to accept and ignore them, with the actual initialisation happening in
-/// the `__init__` the subclass calls through `super().__init__(source, volume)`.
+/// This is a native `#[pyclass]`: the scaling itself is [`scale_pcm_s16`], and the wrapped
+/// source is held as a `Py<PyAny>` only because it may be a user's Python source.
+///
+/// Python subclasses it (discord.py's own `yt-dlp` example does) and passes its own constructor
+/// arguments, so the native `tp_new` accepts and ignores them; the actual initialisation happens
+/// in the Rust `__init__` that the subclass calls through `super().__init__(source, volume)`.
 #[pyclass(
     module = "discord_ext_voice._native",
     name = "PCMVolumeTransformer",
@@ -458,14 +516,16 @@ impl PcmVolumeTransformer {
         volume: f64,
     ) -> PyResult<()> {
         let bound = original.bind(py);
-        if !is_audio_source(bound) {
+        // This transformer is a Rust data path: the wrapped source has to be one of the native
+        // source types, so `read`/`is_opus`/`cleanup` never cross into Python.
+        let Some(opus) = native_is_opus(py, bound) else {
             let name = bound.get_type().name()?;
             return Err(PyTypeError::new_err(format!(
-                "expected AudioSource not {name}."
+                "PCMVolumeTransformer requires a native audio source (PCMAudio, FFmpegPCMAudio, \
+                 FFmpegOpusAudio or another PCMVolumeTransformer), not {name}"
             )));
-        }
-
-        if bound.call_method0("is_opus")?.is_truthy()? {
+        };
+        if opus {
             return Err(discord_client_exception(
                 py,
                 "AudioSource must not be Opus encoded.",
@@ -476,6 +536,9 @@ impl PcmVolumeTransformer {
         *slf.volume.lock() = volume.max(0.0);
         Ok(())
     }
+
+    #[classattr]
+    const NATIVE_AUDIO_SOURCE: bool = true;
 
     /// The wrapped source, as discord.py's `PCMVolumeTransformer.original` attribute.
     #[getter]
@@ -498,46 +561,15 @@ impl PcmVolumeTransformer {
     }
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let original = self
-            .original
-            .lock()
-            .as_ref()
-            .map(|source| source.clone_ref(py));
-        let Some(original) = original else {
-            return Err(PyValueError::new_err(
-                "PCMVolumeTransformer has not been initialized with a source",
-            ));
-        };
-        let data = original.bind(py).call_method0("read")?;
-        let volume = *self.volume.lock();
-
-        // At 100% the transformation is the identity: hand the source's own `bytes` object on
-        // instead of copying it into a new one. This is the common case for `!play`.
-        if volume == 1.0
-            && let Ok(bytes) = data.cast::<PyBytes>()
-        {
-            return Ok(bytes.clone());
-        }
-
-        let data = data.extract::<Vec<u8>>()?;
-        let volume = volume.min(2.0) as f32;
-        Ok(PyBytes::new(py, &scale_pcm_s16(&data, volume)))
+        self.read_native(py)
     }
 
     fn is_opus(&self) -> bool {
-        false
+        self.is_opus_native()
     }
 
     fn cleanup(&self, py: Python<'_>) {
-        // A foreign source may not implement cleanup; the wrapper forwards it when it does.
-        let original = self
-            .original
-            .lock()
-            .as_ref()
-            .map(|source| source.clone_ref(py));
-        if let Some(original) = original {
-            let _ = original.bind(py).call_method0("cleanup").map(|_| ());
-        }
+        self.cleanup_native(py);
     }
 
     fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
@@ -558,12 +590,144 @@ impl PcmVolumeTransformer {
     }
 }
 
+impl PcmVolumeTransformer {
+    fn is_opus_native(&self) -> bool {
+        false
+    }
+
+    fn cleanup_native(&self, py: Python<'_>) {
+        let original = self
+            .original
+            .lock()
+            .as_ref()
+            .map(|source| source.clone_ref(py));
+        if let Some(original) = original {
+            // The constructor guarantees a native source, so this never needs Python.
+            if native_cleanup(py, original.bind(py)).is_none() {
+                crate::log_debug!("the wrapped source is not a native audio source");
+            }
+        }
+    }
+
+    fn read_native<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let original = self
+            .original
+            .lock()
+            .as_ref()
+            .map(|source| source.clone_ref(py));
+        let Some(original) = original else {
+            return Err(PyValueError::new_err(
+                "PCMVolumeTransformer has not been initialized with a source",
+            ));
+        };
+
+        // Dispatch to the native `read` when the wrapped source is exactly one of ours. A
+        // Python subclass may override `read`, so only an exact type takes the fast path.
+        let result = native_read(py, original.bind(py)).ok_or_else(|| {
+            PyRuntimeError::new_err("the wrapped source is not a native audio source")
+        })?;
+        let data = result?.into_any();
+
+        let volume = *self.volume.lock();
+        // At 100% the transformation is the identity: hand the source's own `bytes` object on
+        // instead of copying it into a new one. This is the common case for `!play`.
+        if volume == 1.0
+            && let Ok(bytes) = data.cast::<PyBytes>()
+        {
+            return Ok(bytes.clone());
+        }
+
+        if let Ok(bytes) = data.cast::<PyBytes>() {
+            let volume = volume.min(2.0) as f32;
+            return Ok(PyBytes::new(py, &scale_pcm_s16(bytes.as_bytes(), volume)));
+        }
+
+        let data = data.extract::<Vec<u8>>()?;
+        let volume = volume.min(2.0) as f32;
+        Ok(PyBytes::new(py, &scale_pcm_s16(&data, volume)))
+    }
+}
+
+/// Whether `source` inherits `T`'s implementation of `method` unchanged.
+///
+/// A Python subclass of a native source is still native as long as it does not override the
+/// data-path method; the example bundles a `PCMVolumeTransformer` subclass that only adds
+/// metadata. An override is left on the Python path.
+fn inherits_method<T: PyClass>(py: Python<'_>, source: &Bound<'_, PyAny>, method: &str) -> bool {
+    if !source.is_instance_of::<T>() {
+        return false;
+    }
+    let (Ok(effective), Ok(base)) = (
+        source.get_type().getattr(method),
+        py.get_type::<T>().getattr(method),
+    ) else {
+        return false;
+    };
+    effective.is(&base)
+}
+
+/// Call the native `read` of a native source type (or a subclass that inherits `read`).
+pub(crate) fn native_read<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+) -> Option<PyResult<Bound<'py, PyBytes>>> {
+    macro_rules! dispatch {
+        ($ty:ty) => {
+            if inherits_method::<$ty>(py, source, "read") {
+                return Some(source.cast::<$ty>().ok()?.borrow().read_native(py));
+            }
+        };
+    }
+    dispatch!(PcmAudio);
+    dispatch!(FfmpegPcmAudio);
+    dispatch!(FfmpegOpusAudio);
+    dispatch!(PcmVolumeTransformer);
+    None
+}
+
+/// Call the native `is_opus` of a native source type (or a subclass that inherits it).
+pub(crate) fn native_is_opus(py: Python<'_>, source: &Bound<'_, PyAny>) -> Option<bool> {
+    macro_rules! dispatch {
+        ($ty:ty) => {
+            if inherits_method::<$ty>(py, source, "is_opus") {
+                return Some(source.cast::<$ty>().ok()?.borrow().is_opus_native());
+            }
+        };
+    }
+    dispatch!(PcmAudio);
+    dispatch!(FfmpegPcmAudio);
+    dispatch!(FfmpegOpusAudio);
+    dispatch!(PcmVolumeTransformer);
+    None
+}
+
+/// Call the native `cleanup` of a native source type (or a subclass that inherits it).
+pub(crate) fn native_cleanup(py: Python<'_>, source: &Bound<'_, PyAny>) -> Option<()> {
+    macro_rules! dispatch {
+        ($ty:ty) => {
+            if inherits_method::<$ty>(py, source, "cleanup") {
+                source.cast::<$ty>().ok()?.borrow().cleanup_native(py);
+                return Some(());
+            }
+        };
+    }
+    dispatch!(PcmAudio);
+    dispatch!(FfmpegPcmAudio);
+    dispatch!(FfmpegOpusAudio);
+    dispatch!(PcmVolumeTransformer);
+    None
+}
+
 impl Drop for PcmVolumeTransformer {
     fn drop(&mut self) {
-        // Forward the cleanup a Python source expects, as `AudioSource.__del__` used to.
         let original = self.original.get_mut().take();
         if let Some(original) = original {
-            let _ = Python::try_attach(|py| original.bind(py).call_method0("cleanup").map(|_| ()));
+            // The wrapped source is native by construction, so this does not enter Python.
+            let _ = Python::try_attach(|py| {
+                if native_cleanup(py, original.bind(py)).is_none() {
+                    crate::log_debug!("the wrapped source is not a native audio source");
+                }
+            });
         }
     }
 }
@@ -599,20 +763,17 @@ pub fn probe_async<'py>(
     })
 }
 
-/// Whether `candidate` can be played: one of our sources, or anything with `read` and
-/// `is_opus`.
+/// Whether `candidate` is a native audio source that `play()` accepts.
+///
+/// The marker is a class attribute on the concrete native sources, so a Python subclass of
+/// `PCMAudio` / `FFmpegPCMAudio` / `FFmpegOpusAudio` / `PCMVolumeTransformer` inherits it, while a
+/// plain `AudioSource` subclass (an implementation written in Python) does not.
 #[pyfunction]
 pub fn is_audio_source(candidate: &Bound<'_, PyAny>) -> bool {
-    if candidate.is_instance_of::<AudioSource>() {
-        return true;
-    }
-    let has = |name: &str| {
-        candidate
-            .getattr(name)
-            .map(|attribute| attribute.is_callable())
-            .unwrap_or(false)
-    };
-    has("read") && has("is_opus")
+    candidate
+        .getattr("NATIVE_AUDIO_SOURCE")
+        .and_then(|marker| marker.is_truthy())
+        .unwrap_or(false)
 }
 
 /// The reader behind an [`FfmpegPcmAudio`] or [`FfmpegOpusAudio`].

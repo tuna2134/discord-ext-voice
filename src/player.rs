@@ -26,6 +26,7 @@ use voice_model as vm;
 
 use crate::connection::{self, SendError, VoiceConnection};
 use crate::errors::FFmpegSourceError;
+use crate::sources::{native_cleanup, native_is_opus, native_read};
 use crate::transport::{self, Hub, wait_duration};
 
 /// The gap between two frames. `discord.player.AudioPlayer.DELAY` is the same number, derived
@@ -762,9 +763,18 @@ fn read_frame(source: &Py<PyAny>, opus: bool) -> Option<Result<Frame, PlayError>
     Python::try_attach(|py| {
         let source = source.bind(py);
 
-        let data = match source.call_method0("read") {
-            Ok(data) => data,
-            Err(err) => return Err(PlayError::from_pyerr(py, err)),
+        // Native sources are read without going through Python method dispatch: the player is
+        // the last place a Rust source would otherwise re-enter the interpreter.
+        let data = if let Some(result) = native_read(py, source) {
+            match result {
+                Ok(data) => data.into_any(),
+                Err(err) => return Err(PlayError::from_pyerr(py, err)),
+            }
+        } else {
+            match source.call_method0("read") {
+                Ok(data) => data,
+                Err(err) => return Err(PlayError::from_pyerr(py, err)),
+            }
         };
         let data = match data.extract::<Vec<u8>>() {
             Ok(data) => data,
@@ -788,8 +798,11 @@ fn read_frame(source: &Py<PyAny>, opus: bool) -> Option<Result<Frame, PlayError>
 /// `source.is_opus()`, cached per source generation by the reader.
 fn read_is_opus(source: &Py<PyAny>) -> bool {
     Python::try_attach(|py| {
+        let source = source.bind(py);
+        if let Some(opus) = native_is_opus(py, source) {
+            return opus;
+        }
         source
-            .bind(py)
             .call_method0("is_opus")
             .and_then(|value| value.is_truthy())
             .unwrap_or(false)
@@ -842,11 +855,15 @@ fn cleanup_source(inner: &Arc<PlayerInner>, py: Python<'_>) {
         .source
         .as_ref()
         .map(|source| source.clone_ref(py));
-    if let Some(source) = source
-        && let Err(err) = source.bind(py).call_method0("cleanup")
-        && !err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
-    {
-        crate::log_debug!("calling cleanup on the audio source failed: {err}");
+    if let Some(source) = source {
+        if native_cleanup(py, source.bind(py)).is_some() {
+            return;
+        }
+        if let Err(err) = source.bind(py).call_method0("cleanup")
+            && !err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+        {
+            crate::log_debug!("calling cleanup on the audio source failed: {err}");
+        }
     }
 }
 

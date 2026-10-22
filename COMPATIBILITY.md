@@ -116,10 +116,10 @@ so there is no aiohttp connection, no keep-alive thread and no frame reader left
 
 | Class | Source |
 | --- | --- |
-| `AudioSource` | **ours** (`src/sources.rs`), a native base class that Python may subclass; `is_audio_source(x)` accepts it, or any object with the same `read`/`is_opus`/`cleanup` methods |
+| `AudioSource` | **ours** (`src/sources.rs`), a native base class that Python may subclass; `is_audio_source(x)` is true only for the concrete native sources (or Python subclasses of them), not for a source implemented from scratch in Python |
 | `PCMAudio` | **ours**: raw PCM from a file object |
 | `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: built on the native readers (`_native.DecodeSource` / `_native.OpusSource`) with `symphonia`, which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
-| `PCMVolumeTransformer` | **ours**: the native `_native.scale_pcm`, so `audioop` is not needed |
+| `PCMVolumeTransformer` | **ours** (`src/sources.rs`): a native `#[pyclass]`; `read`/`is_opus`/`cleanup` and the `_native.scale_pcm` scaling stay in Rust. It accepts only native sources; a Python `AudioSource` is a `TypeError` |
 | `AudioPlayer` | **ours**, a thin wrapper over the native threads: a one-second read-ahead queue, 20ms pacing, pause/resume, the silence frames, the `SPEAKING` announcements and the reconnection wait are Rust |
 
 ## `discord.opus`
@@ -172,7 +172,11 @@ else is reachable through the native `VoiceError` hierarchy.
    silently registering a callback that would never fire.
 7. **There is no `socket` attribute to poke.** Rust owns the UDP socket; use
    `voice.native` (for example `voice.native.send_packet(...)`) instead.
-8. **Nothing inherits from `discord.py` except `VoiceClient`.** `VoiceConnection`,
+8. **Only native sources are playable.** `play()` rejects an `AudioSource`/`discord.AudioSource`
+   implementation written in Python; the playback path never calls Python `read` for a source it
+   accepts. Use `PCMAudio`, `FFmpegPCMAudio`, `FFmpegOpusAudio` or `PCMVolumeTransformer` (or
+   subclass one of those).
+9. **Nothing inherits from `discord.py` except `VoiceClient`.** `VoiceConnection`,
    `DiscordVoiceWebSocket`, the audio sources and the player are this package's own classes, so
    an `isinstance` check against discord.py's equivalents is `False` (the *behaviour* is the
    same, and the enums keep discord.py's names and values). `dev.AudioPlayer` is not a

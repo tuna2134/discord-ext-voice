@@ -213,10 +213,18 @@ bound to the client that asked for it. A `User-Agent` there replaces this packag
 headers for a local file or a file object is a `TypeError`, since nothing would send them.
 
 `dev.AudioSource` is this package's own native base class, and nothing here inherits from
-discord.py: a source only has to provide `read`/`is_opus`/`cleanup`, which is also what makes a
-user's own `discord.AudioSource` (or duck-typed equivalent) playable — `dev.is_audio_source(x)`
-answers that question. Native sources are subclassable from Python (the `yt-dlp` example does
-exactly that with `PCMVolumeTransformer`). discord.py's FFmpeg-CLI arguments —
+discord.py. Native sources are subclassable from Python (the `yt-dlp` example does exactly that
+with `PCMVolumeTransformer`), but a source written *from scratch* in Python — an
+`AudioSource`/`discord.AudioSource` subclass that implements `read` itself — is not accepted by
+`play()`: the playback pipeline is native-only. `dev.is_audio_source(x)` answers whether a source
+is one of the native types (or a Python subclass of one).
+
+`PCMVolumeTransformer` itself is a Rust `#[pyclass]`, and the whole data path — `read`,
+`is_opus`, `cleanup`, the sample scaling and the player's dispatch — stays in Rust. It accepts
+only native sources (`PCMAudio`, `FFmpegPCMAudio`, `FFmpegOpusAudio`, or another
+`PCMVolumeTransformer`); a Python `AudioSource` is rejected with a `TypeError`, because wrapping
+it would mean calling Python from the Rust data path. The player has the same native-only rule:
+`play()` rejects a source that is not a subclass of one of the native source classes. discord.py's FFmpeg-CLI arguments —
 `before_options`, `options`, `executable`, `pipe`, `stderr`, `force_cli` — do not exist here and
 raise `TypeError` naming the argument.
 
@@ -360,7 +368,7 @@ release wheel.
 
 ```bash
 cargo test --lib    # 42 Rust unit tests (1 ignored: it needs the network)
-pytest -q           # 168 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
+pytest -q           # 169 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
                     # test needs DISCORD_EXT_VOICE_LIVE_URL)
 ```
 

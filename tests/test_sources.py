@@ -354,22 +354,30 @@ def test_volume_transformer_can_be_subclassed_with_extra_arguments():
     assert len(transformed.read()) == dev.FRAME_SIZE
 
 
-def test_volume_transformer_forwards_cleanup():
-    """Cleanup is forwarded to the wrapped source."""
-    cleaned: list[bool] = []
+def test_volume_transformer_rejects_a_python_source():
+    """Only native sources are accepted: the transformer never calls Python `read`."""
 
     class Source(dev.AudioSource):
         def read(self) -> bytes:
             return b'\x00' * dev.FRAME_SIZE
 
         def cleanup(self) -> None:
-            cleaned.append(True)
+            pass
 
-    transformer = dev.PCMVolumeTransformer(Source(), 0.5)
-    assert isinstance(transformer, dev.AudioSource)
-    assert transformer.original.read() == b'\x00' * dev.FRAME_SIZE
-    transformer.cleanup()
-    assert cleaned == [True]
+    with pytest.raises(TypeError, match='native audio source'):
+        dev.PCMVolumeTransformer(Source(), 0.5)
+
+
+def test_volume_transformer_wraps_another_native_transformer():
+    inner = dev.PCMVolumeTransformer(
+        dev.PCMAudio(io.BytesIO(b'\x10\x00' * (dev.FRAME_SIZE // 2))), 1.0
+    )
+    outer = dev.PCMVolumeTransformer(inner, 1.0)
+    try:
+        assert outer.original is inner
+        assert outer.read()[:2] == b'\x10\x00'
+    finally:
+        outer.cleanup()
 
 
 def test_volume_transformer_of_silence_stays_empty():

@@ -130,6 +130,41 @@ async def test_a_failing_source_is_reported_to_after(gateway_factory):
         await voice.disconnect()
 
 
+class StallingSource(dev.AudioSource):
+    """A source whose first read never returns in time, like a dead HTTP stream."""
+
+    def __init__(self, delay: float = 1.0) -> None:
+        self.delay = delay
+        self.cleanups = 0
+
+    def read(self) -> bytes:
+        time.sleep(self.delay)
+        return b''
+
+    def cleanup(self) -> None:
+        self.cleanups += 1
+
+
+async def test_a_stalled_source_is_reported_to_after(gateway_factory):
+    """The player must not wait forever for a source that stopped producing frames."""
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    source = StallingSource(delay=1.0)
+    after, done, errors = completion_recorder()
+    dev.set_read_stall_timeout(0.2)
+    try:
+        voice.play(source, after=after)
+        await asyncio.wait_for(done.wait(), timeout=5.0)
+        assert len(errors) == 1
+        assert isinstance(errors[0], dev.FFmpegSourceError)
+        assert 'stalled' in str(errors[0])
+    finally:
+        dev.set_read_stall_timeout(30.0)
+        await voice.disconnect()
+
+
 async def test_frames_are_paced_at_the_frame_delay(gateway_factory):
     """The player must not dump a source as fast as it can read it."""
     gateway = await gateway_factory()

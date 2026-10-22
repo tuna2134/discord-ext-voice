@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,7 @@ use pyo3::prelude::*;
 use voice_model as vm;
 
 use crate::connection::{self, SendError, VoiceConnection};
+use crate::errors::FFmpegSourceError;
 use crate::transport::{self, Hub, wait_duration};
 
 /// The gap between two frames. `discord.player.AudioPlayer.DELAY` is the same number, derived
@@ -36,12 +38,52 @@ const SILENCE_FRAMES: usize = 5;
 /// How long a disconnected player sleeps between polls of the connection state.
 const RECONNECT_POLL: Duration = Duration::from_millis(50);
 
+/// The default read-ahead window: one second (50 frames).
+const DEFAULT_READ_AHEAD_FRAMES: usize = 50;
+
 /// How many decoded frames the reader may run ahead of the clock.
 ///
 /// This is what keeps a streamed source from stuttering: a network read that takes longer than
-/// 20ms is absorbed by the buffer instead of leaving a hole in the audio. One second (50 frames)
-/// is enough for ordinary CDN jitter without adding audible latency.
-const READ_AHEAD_FRAMES: usize = 50;
+/// 20ms is absorbed by the buffer instead of leaving a hole in the audio. It is adjustable from
+/// Python through [`set_read_ahead`].
+static READ_AHEAD_FRAMES: AtomicUsize = AtomicUsize::new(DEFAULT_READ_AHEAD_FRAMES);
+
+/// How long the clock waits for one frame before giving up on a stalled source. `0` disables it.
+static STALL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
+
+/// Set the read-ahead window, in seconds of audio (clamped to 20ms .. 20s).
+#[pyfunction]
+pub fn set_read_ahead(seconds: f64) {
+    let frames = if seconds.is_finite() && seconds > 0.0 {
+        (seconds / FRAME_DELAY).round() as usize
+    } else {
+        DEFAULT_READ_AHEAD_FRAMES
+    };
+    READ_AHEAD_FRAMES.store(frames.clamp(1, 1000), Ordering::Relaxed);
+}
+
+/// Set the no-data timeout for one frame, in seconds (`0` disables it).
+///
+/// A source that stops producing frames (a dead HTTP stream, a buggy decoder) would otherwise
+/// block playback forever; the player reports it through `after` instead.
+#[pyfunction]
+pub fn set_read_stall_timeout(seconds: f64) {
+    let millis = if seconds.is_finite() && seconds > 0.0 {
+        (seconds * 1000.0).min(24.0 * 60.0 * 60.0 * 1000.0) as u64
+    } else {
+        0
+    };
+    STALL_TIMEOUT_MS.store(millis, Ordering::Relaxed);
+}
+
+fn read_ahead_frames() -> usize {
+    READ_AHEAD_FRAMES.load(Ordering::Relaxed)
+}
+
+fn stall_timeout() -> Option<Duration> {
+    let millis = STALL_TIMEOUT_MS.load(Ordering::Relaxed);
+    (millis > 0).then(|| Duration::from_millis(millis))
+}
 
 /// The `SPEAKING` states the player announces.
 const SPEAKING_VOICE: vm::SpeakingState = vm::SpeakingState::MICROPHONE;
@@ -129,6 +171,9 @@ struct PlayerInner {
     frame_space: Condvar,
     thread: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Set when `finish` could not stop the reader: the reader cleans the source up on its way
+    /// out instead.
+    cleanup_pending: AtomicBool,
 }
 
 impl PlayerInner {
@@ -222,6 +267,7 @@ impl PyAudioPlayer {
                 frame_space: Condvar::new(),
                 thread: Mutex::new(None),
                 reader: Mutex::new(None),
+                cleanup_pending: AtomicBool::new(false),
             }),
         })
     }
@@ -577,6 +623,7 @@ struct Frame {
 /// It stops when the source ends, fails, the player is stopped, or the interpreter goes away.
 /// A source that is swapped while a decode is in flight has its frame dropped by generation.
 fn reader_loop(inner: Arc<PlayerInner>) {
+    let mut cached_opus: Option<(u64, bool)> = None;
     loop {
         let (ended, paused) = {
             let signals = inner.signals.lock();
@@ -598,7 +645,15 @@ fn reader_loop(inner: Arc<PlayerInner>) {
         else {
             break;
         };
-        let Some(result) = read_frame(&source) else {
+        let opus = match cached_opus {
+            Some((generation_cached, opus)) if generation_cached == generation => opus,
+            _ => {
+                let opus = read_is_opus(&source);
+                cached_opus = Some((generation, opus));
+                opus
+            }
+        };
+        let Some(result) = read_frame(&source, opus) else {
             break;
         };
 
@@ -609,7 +664,7 @@ fn reader_loop(inner: Arc<PlayerInner>) {
             continue;
         }
 
-        while queue.frames.len() >= READ_AHEAD_FRAMES {
+        while queue.frames.len() >= read_ahead_frames() {
             if inner.signals.lock().ended {
                 break;
             }
@@ -647,10 +702,16 @@ fn reader_loop(inner: Arc<PlayerInner>) {
     }
     drop(queue);
     inner.frame_ready.notify_all();
+
+    if inner.cleanup_pending.swap(false, Ordering::AcqRel) {
+        let _ = Python::try_attach(|py| cleanup_source(&inner, py));
+    }
 }
 
 /// Take the next frame for the clock, waiting for the reader if necessary.
 fn next_frame(inner: &Arc<PlayerInner>) -> Option<Result<Frame, PlayError>> {
+    let deadline = stall_timeout().map(|timeout| Instant::now() + timeout);
+
     loop {
         if inner.signals.lock().ended {
             return None;
@@ -672,12 +733,32 @@ fn next_frame(inner: &Arc<PlayerInner>) -> Option<Result<Frame, PlayError>> {
         if queue.closed == Some(queue.generation) {
             return None;
         }
-        inner.frame_ready.wait(&mut queue);
+
+        match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return stall_error();
+                }
+                inner.frame_ready.wait_for(&mut queue, remaining);
+            }
+            None => inner.frame_ready.wait(&mut queue),
+        }
     }
 }
 
+/// The error reported to `after` when the reader stops producing frames.
+fn stall_error() -> Option<Result<Frame, PlayError>> {
+    Python::try_attach(|py| {
+        let error = FFmpegSourceError::new_err(
+            "timed out waiting for audio data from the source (the stream may have stalled)",
+        );
+        Err(PlayError::from_pyerr(py, error))
+    })
+}
+
 /// Read one frame from `source`, or `None` when the interpreter is gone.
-fn read_frame(source: &Py<PyAny>) -> Option<Result<Frame, PlayError>> {
+fn read_frame(source: &Py<PyAny>, opus: bool) -> Option<Result<Frame, PlayError>> {
     Python::try_attach(|py| {
         let source = source.bind(py);
 
@@ -689,11 +770,6 @@ fn read_frame(source: &Py<PyAny>) -> Option<Result<Frame, PlayError>> {
             Ok(data) => data,
             Err(err) => return Err(PlayError::from_pyerr(py, err)),
         };
-
-        let opus = source
-            .call_method0("is_opus")
-            .and_then(|value| value.is_truthy())
-            .unwrap_or(false);
 
         let current_error = if data.is_empty() {
             read_current_error(source)
@@ -707,6 +783,18 @@ fn read_frame(source: &Py<PyAny>) -> Option<Result<Frame, PlayError>> {
             current_error,
         })
     })
+}
+
+/// `source.is_opus()`, cached per source generation by the reader.
+fn read_is_opus(source: &Py<PyAny>) -> bool {
+    Python::try_attach(|py| {
+        source
+            .bind(py)
+            .call_method0("is_opus")
+            .and_then(|value| value.is_truthy())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// `getattr(source, '_current_error', None)`, as an exception instance.
@@ -746,6 +834,22 @@ fn stop_reader(inner: &Arc<PlayerInner>) -> bool {
     }
 }
 
+/// Call `cleanup()` on the source, ignoring a source that does not implement it.
+fn cleanup_source(inner: &Arc<PlayerInner>, py: Python<'_>) {
+    let source = inner
+        .source
+        .lock()
+        .source
+        .as_ref()
+        .map(|source| source.clone_ref(py));
+    if let Some(source) = source
+        && let Err(err) = source.bind(py).call_method0("cleanup")
+        && !err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+    {
+        crate::log_debug!("calling cleanup on the audio source failed: {err}");
+    }
+}
+
 /// The `finally` block of `discord.player.AudioPlayer.run`: call `after`, then clean the source
 /// up. The GIL is taken once and dropped again; if the interpreter is already gone there is
 /// nothing left to do.
@@ -781,21 +885,12 @@ fn finish(inner: &Arc<PlayerInner>, outcome: &Outcome) {
         // `AudioSource.cleanup` has to survive being called twice (our own sources clean up in
         // `__del__` as well), and a foreign source may not have it at all.
         if !reader_stopped {
-            crate::log_debug!("skipping source cleanup: the reader is still decoding");
+            // The reader is still blocked in `read()`. It takes over the cleanup when it returns.
+            inner.cleanup_pending.store(true, Ordering::Release);
+            crate::log_debug!("deferring source cleanup to the reader");
             return;
         }
-        let source = inner
-            .source
-            .lock()
-            .source
-            .as_ref()
-            .map(|source| source.clone_ref(py));
-        if let Some(source) = source
-            && let Err(err) = source.bind(py).call_method0("cleanup")
-            && !err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
-        {
-            crate::log_debug!("calling cleanup on the audio source failed: {err}");
-        }
+        cleanup_source(inner, py);
     });
 }
 

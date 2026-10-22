@@ -78,6 +78,8 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
     module.add_function(wrap_pyfunction!(source::scale_pcm, module)?)?;
     module.add_function(wrap_pyfunction!(flow::retry_wait, module)?)?;
+    module.add_function(wrap_pyfunction!(player::set_read_ahead, module)?)?;
+    module.add_function(wrap_pyfunction!(player::set_read_stall_timeout, module)?)?;
 
     // Constants the Python layer reads.
     module.add("OPUS_SILENCE", PyBytes::new(py, &opus::OPUS_SILENCE))?;

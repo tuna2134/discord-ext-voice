@@ -65,7 +65,10 @@ class YTDLSource(dev.PCMVolumeTransformer):
         # to the client that asked for it: pass the extractor's own headers along, or the CDN
         # answers 403. A downloaded file is read from disk and needs none.
         headers = data.get('http_headers') if stream else None
-        return cls(dev.FFmpegPCMAudio(filename, headers=headers), data=data)
+        # `open()` does the network probe on a native worker, so the bot's event loop keeps
+        # running while a CDN is contacted; the synchronous constructor would block it.
+        source = await dev.FFmpegPCMAudio.open(filename, headers=headers)
+        return cls(source, data=data)
 
 
 class Music(commands.Cog):

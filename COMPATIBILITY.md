@@ -198,6 +198,13 @@ else is reachable through the native `VoiceError` hierarchy.
   replaces the package's own. discord.py has no equivalent, because it hands the URL to the
   `ffmpeg` binary.
 * `AudioPlayer.join(timeout=None)` / `is_alive()` — wait for the playback thread from Python.
+* `await FFmpegPCMAudio.open(source, ...)` / `await FFmpegOpusAudio.open(source, ...)` — open a
+  source (including an `http(s)` URL) without blocking the event loop during the probe.
+* `set_read_ahead(seconds)` / `set_read_stall_timeout(seconds)` — tune the native read-ahead
+  window (default 1s) and the no-data timeout (default 30s; `0` disables it).
+* `voice.fec` / `voice.expected_packet_loss` — per-client defaults for `play()`'s Opus encoder
+  parameters. In-band FEC is the dominant encoding cost; discord.py's `0.15` default costs about
+  1.2ms per 20ms frame, while `0.02` costs about 0.22ms.
 * The player reads up to one second ahead of the clock into a native frame queue, so a streamed
   source whose network read occasionally takes longer than 20ms does not stutter.
 * `voice.native` (same object as `voice._connection`) — the `_native.VoiceConnection`:

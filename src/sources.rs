@@ -81,18 +81,39 @@ impl AudioSource {
     subclass
 )]
 pub struct PcmAudio {
-    stream: Py<PyAny>,
+    stream: Mutex<Option<Py<PyAny>>>,
 }
 
 #[pymethods]
 impl PcmAudio {
+    /// Allocate empty; `__init__` fills it in, so a Python subclass may pass arguments of its
+    /// own without the base `tp_new` rejecting them.
     #[new]
-    fn new(stream: Py<PyAny>) -> PyClassInitializer<Self> {
-        PyClassInitializer::from(AudioSource).add_subclass(Self { stream })
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(stream)")]
+    fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(AudioSource).add_subclass(Self {
+            stream: Mutex::new(None),
+        })
+    }
+
+    #[pyo3(signature = (stream))]
+    fn __init__(slf: PyClassGuardMut<'_, Self>, stream: Py<PyAny>) {
+        *slf.stream.lock() = Some(stream);
     }
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let data = self.stream.bind(py).call_method1("read", (FRAME_BYTES,))?;
+        let stream = self
+            .stream
+            .lock()
+            .as_ref()
+            .map(|stream| stream.clone_ref(py));
+        let Some(stream) = stream else {
+            return Ok(PyBytes::new(py, b""));
+        };
+        let data = stream.bind(py).call_method1("read", (FRAME_BYTES,))?;
 
         // A `BytesIO`/buffered file returns `bytes`; hand that object on instead of copying it.
         if let Ok(bytes) = data.cast::<PyBytes>() {
@@ -130,29 +151,86 @@ impl PcmAudio {
     subclass
 )]
 pub struct FfmpegPcmAudio {
-    reader: Mutex<Reader>,
+    reader: Mutex<Option<Reader>>,
 }
 
 #[pymethods]
 impl FfmpegPcmAudio {
     #[new]
-    #[pyo3(signature = (source, *, seek=None, headers=None, **options))]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(source, *, seek=None, headers=None, **options)")]
     fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(AudioSource).add_subclass(Self {
+            reader: Mutex::new(None),
+        })
+    }
+
+    #[pyo3(signature = (source, *, seek=None, headers=None, **options))]
+    fn __init__(
+        slf: PyClassGuardMut<'_, Self>,
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         seek: Option<Py<PyAny>>,
         headers: Option<Py<PyAny>>,
         options: Option<Bound<'_, PyDict>>,
-    ) -> PyResult<PyClassInitializer<Self>> {
+    ) -> PyResult<()> {
         reject_cli_options(options)?;
         let reader = build_reader(py, source, seek, headers, false)?;
-        Ok(PyClassInitializer::from(AudioSource).add_subclass(Self {
-            reader: Mutex::new(reader),
-        }))
+        *slf.reader.lock() = Some(reader);
+        Ok(())
+    }
+
+    /// Open a source without blocking the event loop.
+    ///
+    /// The constructor (``FFmpegPCMAudio(url)``) probes the input synchronously, which for an
+    /// ``http(s)`` URL can take seconds. This classmethod does the same work in a native future,
+    /// so a bot command can ``await`` it.
+    #[staticmethod]
+    #[pyo3(signature = (source, *, seek=None, headers=None, **options))]
+    fn open<'py>(
+        py: Python<'py>,
+        source: Py<PyAny>,
+        seek: Option<Py<PyAny>>,
+        headers: Option<Py<PyAny>>,
+        options: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        reject_cli_options(options)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // The blocking HTTP client must not be created or dropped on a tokio worker: it
+            // builds (and then drops) its own runtime, which panics in an async context. A
+            // blocking pool thread is the right place for the probe.
+            let reader = tokio::task::spawn_blocking(move || {
+                Python::try_attach(|py| build_reader(py, source.bind(py), seek, headers, false))
+                    .unwrap_or_else(|| {
+                        Err(FFmpegSourceError::new_err(
+                            "the interpreter is shutting down",
+                        ))
+                    })
+            })
+            .await
+            .map_err(|err| FFmpegSourceError::new_err(err.to_string()))??;
+            Python::attach(|py| {
+                Ok::<_, PyErr>(
+                    Py::new(
+                        py,
+                        PyClassInitializer::from(AudioSource).add_subclass(Self {
+                            reader: Mutex::new(Some(reader)),
+                        }),
+                    )?
+                    .into_any(),
+                )
+            })
+        })
     }
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        self.reader.lock().read(py)
+        let mut reader = self.reader.lock();
+        match reader.as_mut() {
+            Some(reader) => reader.read(py),
+            None => Err(PyValueError::new_err("the source has not been initialized")),
+        }
     }
 
     fn is_opus(&self) -> bool {
@@ -160,7 +238,11 @@ impl FfmpegPcmAudio {
     }
 
     fn cleanup(&self, py: Python<'_>) {
-        py.detach(|| self.reader.lock().cleanup());
+        py.detach(|| {
+            if let Some(reader) = self.reader.lock().as_mut() {
+                reader.cleanup();
+            }
+        });
     }
 
     fn __repr__(&self) -> String {
@@ -176,37 +258,100 @@ impl FfmpegPcmAudio {
     subclass
 )]
 pub struct FfmpegOpusAudio {
-    reader: Mutex<Reader>,
+    reader: Mutex<Option<Reader>>,
 }
 
 #[pymethods]
 impl FfmpegOpusAudio {
     #[new]
-    #[pyo3(signature = (source, *, seek=None, headers=None, **options))]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(source, *, seek=None, headers=None, **options)")]
     fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(AudioSource).add_subclass(Self {
+            reader: Mutex::new(None),
+        })
+    }
+
+    #[pyo3(signature = (source, *, seek=None, headers=None, **options))]
+    fn __init__(
+        slf: PyClassGuardMut<'_, Self>,
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         seek: Option<Py<PyAny>>,
         headers: Option<Py<PyAny>>,
         options: Option<Bound<'_, PyDict>>,
-    ) -> PyResult<PyClassInitializer<Self>> {
+    ) -> PyResult<()> {
         reject_cli_options(options)?;
         let reader = build_reader(py, source, seek, headers, true)?;
-        Ok(PyClassInitializer::from(AudioSource).add_subclass(Self {
-            reader: Mutex::new(reader),
-        }))
+        *slf.reader.lock() = Some(reader);
+        Ok(())
+    }
+
+    /// Open an Opus/PCM source without blocking the event loop.
+    ///
+    /// See :meth:`FFmpegPCMAudio.open`.
+    #[staticmethod]
+    #[pyo3(signature = (source, *, seek=None, headers=None, **options))]
+    fn open<'py>(
+        py: Python<'py>,
+        source: Py<PyAny>,
+        seek: Option<Py<PyAny>>,
+        headers: Option<Py<PyAny>>,
+        options: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        reject_cli_options(options)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // The blocking HTTP client must not be created or dropped on a tokio worker: it
+            // builds (and then drops) its own runtime, which panics in an async context. A
+            // blocking pool thread is the right place for the probe.
+            let reader = tokio::task::spawn_blocking(move || {
+                Python::try_attach(|py| build_reader(py, source.bind(py), seek, headers, true))
+                    .unwrap_or_else(|| {
+                        Err(FFmpegSourceError::new_err(
+                            "the interpreter is shutting down",
+                        ))
+                    })
+            })
+            .await
+            .map_err(|err| FFmpegSourceError::new_err(err.to_string()))??;
+            Python::attach(|py| {
+                Ok::<_, PyErr>(
+                    Py::new(
+                        py,
+                        PyClassInitializer::from(AudioSource).add_subclass(Self {
+                            reader: Mutex::new(Some(reader)),
+                        }),
+                    )?
+                    .into_any(),
+                )
+            })
+        })
     }
 
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        self.reader.lock().read(py)
+        let mut reader = self.reader.lock();
+        match reader.as_mut() {
+            Some(reader) => reader.read(py),
+            None => Err(PyValueError::new_err("the source has not been initialized")),
+        }
     }
 
     fn is_opus(&self) -> bool {
-        self.reader.lock().is_opus()
+        self.reader
+            .lock()
+            .as_ref()
+            .map(Reader::is_opus)
+            .unwrap_or(false)
     }
 
     fn cleanup(&self, py: Python<'_>) {
-        py.detach(|| self.reader.lock().cleanup());
+        py.detach(|| {
+            if let Some(reader) = self.reader.lock().as_mut() {
+                reader.cleanup();
+            }
+        });
     }
 
     /// The codec name the demuxer reports, or `None` when the input cannot be read.
@@ -243,13 +388,17 @@ impl FfmpegOpusAudio {
 
 impl Drop for FfmpegPcmAudio {
     fn drop(&mut self) {
-        self.reader.lock().cleanup();
+        if let Some(reader) = self.reader.lock().as_mut() {
+            reader.cleanup();
+        }
     }
 }
 
 impl Drop for FfmpegOpusAudio {
     fn drop(&mut self) {
-        self.reader.lock().cleanup();
+        if let Some(reader) = self.reader.lock().as_mut() {
+            reader.cleanup();
+        }
     }
 }
 

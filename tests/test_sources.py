@@ -127,6 +127,40 @@ def test_ffmpeg_pcm_audio_seeks_natively(sine_wav: Path):
     assert trimmed_bytes == pytest.approx(full_bytes / 2, abs=dev.FRAME_SIZE * 2)
 
 
+async def test_ffmpeg_pcm_audio_opens_asynchronously(sine_wav: Path):
+    """An `http(s)` constructor would block the event loop; `open()` is the awaitable form."""
+    source = await dev.FFmpegPCMAudio.open(str(sine_wav))
+    try:
+        assert len(source.read()) == dev.FRAME_SIZE
+    finally:
+        source.cleanup()
+
+
+async def test_ffmpeg_opus_audio_opens_asynchronously(opus_file: Path):
+    source = await dev.FFmpegOpusAudio.open(str(opus_file))
+    try:
+        assert source.is_opus() is True
+        assert len(source.read()) > 0
+    finally:
+        source.cleanup()
+
+
+def test_ffmpeg_pcm_audio_can_be_subclassed_with_extra_arguments(sine_wav: Path):
+    """The base `tp_new` accepts what a subclass adds; `__init__` does the real work."""
+
+    class Subclass(dev.FFmpegPCMAudio):
+        def __init__(self, source, *, extra: str) -> None:
+            super().__init__(source)
+            self.extra = extra
+
+    source = Subclass(str(sine_wav), extra='metadata')
+    try:
+        assert source.extra == 'metadata'
+        assert len(source.read()) == dev.FRAME_SIZE
+    finally:
+        source.cleanup()
+
+
 def test_ffmpeg_pcm_audio_reads_from_a_file_object(sine_wav: Path):
     with open(sine_wav, 'rb') as handle:
         source = dev.FFmpegPCMAudio(handle)

@@ -51,9 +51,18 @@ from ._native import (
     __version__,
     is_audio_source,
     probe,
+    set_read_ahead,
+    set_read_stall_timeout,
 )
 from .player import AudioPlayer
-from .voice_client import VoiceClient, VoiceProtocol, has_dave, has_nacl
+from .voice_client import (
+    DEFAULT_EXPECTED_PACKET_LOSS,
+    DEFAULT_FEC,
+    VoiceClient,
+    VoiceProtocol,
+    has_dave,
+    has_nacl,
+)
 
 #: The geometry of one Discord voice frame. Read from the native module, so the Rust and Python
 #: sides cannot drift (the test suite also asserts they match ``discord.opus.Encoder``).
@@ -84,6 +93,8 @@ __all__ = (
     'PCMVolumeTransformer',
     'is_audio_source',
     'probe',
+    'set_read_ahead',
+    'set_read_stall_timeout',
     # codec
     'OPUS_SILENCE',
     'SAMPLES_PER_FRAME',
@@ -97,6 +108,8 @@ __all__ = (
     'MAX_ATTEMPTS',
     'has_nacl',
     'has_dave',
+    'DEFAULT_FEC',
+    'DEFAULT_EXPECTED_PACKET_LOSS',
     # errors
     'VoiceError',
     'ClientException',

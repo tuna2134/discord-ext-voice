@@ -284,9 +284,21 @@ pub struct Hub {
     pub state: Mutex<VoiceState>,
     pub notify: Notify,
     pub ws_tx: Mutex<Option<mpsc::UnboundedSender<WsCommand>>>,
+    /// The queue to the single UDP sender task. One task preserves packet order even when the
+    /// socket is briefly busy; the previous design spawned a task per packet.
+    pub udp_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// The encoder used when a caller sends PCM without passing one of its own. Shared with the
     /// playback thread, which encodes through the same handle.
     pub encoder: Mutex<Option<crate::opus::OpusEncoder>>,
+}
+
+/// The result of queueing a datagram for the UDP sender task.
+pub enum UdpSend {
+    Sent,
+    /// The bounded queue is full: the packet was dropped.
+    Full,
+    /// The connection is not (or no longer) up.
+    Closed,
 }
 
 impl Hub {
@@ -295,6 +307,7 @@ impl Hub {
             state: Mutex::new(VoiceState::new(guild_id, user_id, channel_id)),
             notify: Notify::new(),
             ws_tx: Mutex::new(None),
+            udp_tx: Mutex::new(None),
             encoder: Mutex::new(None),
         })
     }
@@ -327,6 +340,19 @@ impl Hub {
         }
     }
 
+    /// Queue a datagram for the voice UDP sender task.
+    pub fn queue_udp(&self, packet: Vec<u8>) -> UdpSend {
+        let slot = self.udp_tx.lock();
+        let Some(tx) = slot.as_ref() else {
+            return UdpSend::Closed;
+        };
+        match tx.try_send(packet) {
+            Ok(()) => UdpSend::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => UdpSend::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => UdpSend::Closed,
+        }
+    }
+
     /// Queue a websocket frame. Returns `false` when the socket is gone.
     pub fn send(&self, command: WsCommand) -> bool {
         match self.ws_tx.lock().as_ref() {
@@ -346,7 +372,11 @@ impl Hub {
             state.close_code = code;
             state.close_reason = reason;
             state.phase = Phase::Disconnected;
+            state.udp = None;
         }
+        // Dropping the sender lets the UDP task drain and exit; a stale task must not keep
+        // sending on the old socket after a reconnect.
+        self.udp_tx.lock().take();
         self.bump();
     }
 }
@@ -975,6 +1005,18 @@ async fn handle_ready(
     })?;
     let socket = Arc::new(socket);
 
+    // One ordered sender task for RTP. A bounded queue drops under extreme backpressure rather
+    // than spawning a task per packet or reordering them.
+    let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(512);
+    let send_socket = Arc::clone(&socket);
+    tokio::spawn(async move {
+        while let Some(packet) = udp_rx.recv().await {
+            if let Err(err) = send_socket.send(&packet).await {
+                log_debug!("a voice packet has been dropped: {err}");
+            }
+        }
+    });
+
     // 2. IP discovery, so Discord learns our public address.
     let (ip, port) = discover_ip(&socket, ready.ssrc).await?;
     log_debug!("ip discovery result: {ip}:{port}");
@@ -1008,6 +1050,9 @@ async fn handle_ready(
         state.udp_target = Some(target);
         state.phase = Phase::GotIpDiscovery;
     }
+    // Only publish the sender once the session is usable: an error below drops `udp_tx`, which
+    // ends the task we just spawned.
+    *hub.udp_tx.lock() = Some(udp_tx);
     hub.bump();
 
     // 4. SELECT_PROTOCOL.

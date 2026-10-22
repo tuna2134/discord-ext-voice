@@ -183,6 +183,10 @@ dev.FFmpegPCMAudio('song.mp3', seek=30.0)      # start 30s in (what `-ss 30` use
 dev.FFmpegPCMAudio(open('song.mp3', 'rb'))     # a seekable file object works too
 dev.FFmpegPCMAudio('https://example.com/a.mp3')  # streamed with reqwest, no download step
 dev.FFmpegOpusAudio('voice.ogg')               # Opus packets passed through untouched
+
+# In an async command, open a URL without blocking the event loop while it is probed:
+source = await dev.FFmpegPCMAudio.open(url, headers=info['http_headers'])
+
 dev.PCMVolumeTransformer(dev.FFmpegPCMAudio('song.mp3'), 0.5)
 
 # A URL an extractor produced: send the headers it handed out with it.
@@ -196,6 +200,10 @@ server supports them (otherwise the request is restarted and the offset skipped)
 that dies or is cut short mid-stream — a throttling CDN closing an idle one, which is routine for
 a long stream — is picked up again from the byte it reached instead of looking like the end of the
 file, which is how the demuxer would read it.
+
+The synchronous constructor probes the input before returning, which for an `http(s)` URL means
+the event loop waits for the CDN. `await FFmpegPCMAudio.open(...)` (and the Opus equivalent) does
+the probe in a native future, so a bot command can keep serving other events while that happens.
 
 `headers=` sends extra HTTP headers with every request the reader makes (the first fetch and any
 `Range` a seek issues). Extractors hand those out with the URLs they produce — `yt-dlp`'s
@@ -315,7 +323,7 @@ without importing `discord.player`, whose `audioop` dependency would otherwise b
 
 ### Performance notes
 
-The 20ms audio path was written to stay allocation-light:
+The 20ms audio path was written to stay allocation-light and to survive a bad network:
 
 * disabled log records cost one atomic level check, not a `format!` plus a GIL round trip (the
   effective Python level is re-read every two seconds, so `setLevel` still works at runtime);
@@ -324,11 +332,23 @@ The 20ms audio path was written to stay allocation-light:
 * PCM-to-Opus conversion reuses a sample buffer owned by the encoder, and a
   `PCMVolumeTransformer` at 100% hands the source's `bytes` object straight through;
 * the player's read-ahead thread decodes up to one second ahead, so a network read slower than
-  20ms is absorbed by the queue instead of becoming a gap.
+  20ms is absorbed by the queue instead of becoming a gap;
+* one bounded UDP sender task preserves packet order (a slow send is dropped rather than
+  reordered), and a source that stops producing frames fails through `after` after 30 seconds
+  instead of wedging the player.
 
-On the development machine used here, a passthrough frame costs about **7.5µs** and a PCM frame
-about **1.4ms** (Opus in-band FEC dominates; that is still under 7% of one core at 50 frames per
-second). `maturin develop` builds the dev profile, so `Cargo.toml` optimizes dependencies there
+`dev.set_read_ahead(seconds)` resizes the decoder queue (default one second) and
+`dev.set_read_stall_timeout(seconds)` changes the no-data timeout (`0` disables it).
+
+On the development machine used here, a passthrough frame costs about **2.5µs** and a PCM frame
+about **1.4ms**. The Opus encode dominates, and almost all of that is in-band FEC:
+`play(..., expected_packet_loss=0.15)` (discord.py's default) costs ~1.2ms/frame, while
+`expected_packet_loss=0.02` costs ~0.22ms and `fec=False` is similar. Lower values trade
+packet-loss resilience for CPU; the default is kept for compatibility. Set
+`voice.expected_packet_loss = 0.02` (and/or `voice.fec = False`) once per client to change the
+default for every subsequent `play()`.
+
+`maturin develop` builds the dev profile, so `Cargo.toml` optimizes dependencies there
 too — otherwise the debug build makes the pure-Rust ciphers an order of magnitude slower than the
 release wheel.
 
@@ -336,7 +356,7 @@ release wheel.
 
 ```bash
 cargo test --lib    # 42 Rust unit tests (1 ignored: it needs the network)
-pytest -q           # 160 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
+pytest -q           # 166 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
                     # test needs DISCORD_EXT_VOICE_LIVE_URL)
 ```
 

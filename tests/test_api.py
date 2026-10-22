@@ -120,6 +120,16 @@ def test_exception_types_line_up_with_discord():
     assert not issubclass(dev.FFmpegSourceError, discord.ClientException)
 
 
+def test_playback_tuning_is_exposed():
+    assert dev.DEFAULT_FEC is True
+    assert dev.DEFAULT_EXPECTED_PACKET_LOSS == 0.15
+    assert dev.VoiceClient.fec is True
+    assert dev.VoiceClient.expected_packet_loss == 0.15
+    # The native player's read-ahead window and no-data timeout are adjustable.
+    assert callable(dev.set_read_ahead)
+    assert callable(dev.set_read_stall_timeout)
+
+
 def test_connection_flow_state_values():
     # The flow enum is ours, with discord.py's names and values so the numbers keep matching.
     assert [state.name for state in dev.ConnectionFlowState] == [

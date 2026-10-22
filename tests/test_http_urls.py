@@ -58,6 +58,17 @@ def test_http_url_probe(sine_wav, http_server):
 # ---------------------------------------------------------------------------- seeking
 
 
+async def test_http_url_opens_asynchronously(sine_wav, http_server):
+    """The async factory probes on a blocking thread; a tokio worker would panic on reqwest's
+    blocking client runtime."""
+    base = http_server(sine_wav.parent)
+    source = await dev.FFmpegPCMAudio.open(f'{base}/{sine_wav.name}')
+    try:
+        assert len(source.read()) == dev.FRAME_SIZE
+    finally:
+        source.cleanup()
+
+
 def test_http_url_seeks(sine_wav, http_server):
     base = http_server(sine_wav.parent)
     url = f'{base}/{sine_wav.name}'

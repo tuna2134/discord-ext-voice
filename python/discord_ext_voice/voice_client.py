@@ -62,6 +62,13 @@ has_dave: bool = True
 #: The connection flow phases, in discord.py's names and order.
 ConnectionFlowState = _native.ConnectionFlowState
 
+#: Defaults used by :meth:`VoiceClient.play` for PCM sources. They mirror discord.py, where
+#: `expected_packet_loss=0.15` makes Opus spend most of its CPU on in-band FEC. A bot that
+#: plays many streams can trade packet-loss resilience for CPU by setting e.g.
+#: ``voice.expected_packet_loss = 0.02`` (or ``voice.fec = False``) once per client.
+DEFAULT_FEC: bool = True
+DEFAULT_EXPECTED_PACKET_LOSS: float = 0.15
+
 
 class VoiceClient(VoiceProtocol):
     """Represents a Discord voice connection backed by the native transport.
@@ -77,6 +84,11 @@ class VoiceClient(VoiceProtocol):
     #: The encryption modes this backend advertises. Taken from discord.py's list so the two can
     #: never disagree; the test suite also asserts the native list matches it.
     supported_modes: Tuple[str, ...] = tuple(_native.SUPPORTED_MODES)
+
+    #: Opus encoder defaults for PCM sources. Set them on an instance to change the cost/quality
+    #: tradeoff for that voice client; ``expected_packet_loss`` has the largest effect.
+    fec: bool = DEFAULT_FEC
+    expected_packet_loss: float = DEFAULT_EXPECTED_PACKET_LOSS
 
     def __init__(self, client: Any, channel: Any) -> None:
         super().__init__(client, channel)
@@ -672,8 +684,8 @@ class VoiceClient(VoiceProtocol):
         after: Optional[Callable[[Optional[Exception]], Any]] = None,
         application: str = 'audio',
         bitrate: int = 128,
-        fec: bool = True,
-        expected_packet_loss: float = 0.15,
+        fec: Optional[bool] = None,
+        expected_packet_loss: Optional[float] = None,
         bandwidth: str = 'full',
         signal_type: str = 'auto',
     ) -> None:
@@ -682,12 +694,23 @@ class VoiceClient(VoiceProtocol):
         The finalizer ``after`` is called after the source has been exhausted or an error
         occurred. The encoder parameters are only used for PCM based sources; the native player
         validates them and raises :class:`ValueError` for a bad value.
+
+        ``fec`` and ``expected_packet_loss`` default to this client's attributes (which start as
+        :data:`DEFAULT_FEC` / :data:`DEFAULT_EXPECTED_PACKET_LOSS`, discord.py's values). In-band
+        FEC is by far the most expensive part of Opus encoding: at 15% packet loss a 20ms frame
+        costs about 1.2ms, at 2% about 0.22ms. Lower it when playing many streams and the network
+        is reliable; ``fec=False`` also works but gives up loss resilience entirely.
         """
         if not self.is_connected():
             raise ClientException('Not connected to voice.')
 
         if self.is_playing():
             raise ClientException('Already playing audio.')
+
+        if fec is None:
+            fec = self.fec
+        if expected_packet_loss is None:
+            expected_packet_loss = self.expected_packet_loss
 
         # Any `discord.AudioSource` (or duck-typed equivalent) is accepted, not only the sources
         # this package ships, so a user's own source keeps working.

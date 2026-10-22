@@ -154,11 +154,12 @@ impl OpusEncoder {
         self.encode(slice)
     }
 
-    /// Encode one 20ms frame of interleaved 16 bit little endian PCM.
+    /// Encode one 20ms frame of interleaved 16 bit little endian PCM into the encoder's own
+    /// output buffer.
     ///
-    /// The sample conversion reuses a buffer owned by the encoder: the player hits this every
-    /// 20ms, and allocating a fresh `Vec<i16>` for each frame was pure overhead.
-    pub fn encode_pcm_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    /// The sample conversion reuses a buffer owned by the encoder too: the player hits this every
+    /// 20ms, and allocating fresh buffers for each frame was pure overhead.
+    pub fn encode_pcm_ref(&mut self, data: &[u8]) -> Result<&[u8], String> {
         self.samples.clear();
         self.samples.extend(
             data.chunks_exact(2)
@@ -175,7 +176,13 @@ impl OpusEncoder {
             .inner
             .encode(samples, &mut self.buffer)
             .map_err(opus_err)?;
-        Ok(self.buffer[..written].to_vec())
+        Ok(&self.buffer[..written])
+    }
+
+    /// Encode one 20ms frame of PCM into a fresh `Vec`, for callers that cannot use the borrowed
+    /// buffer.
+    pub fn encode_pcm_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(self.encode_pcm_ref(data)?.to_vec())
     }
 }
 

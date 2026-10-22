@@ -5,14 +5,12 @@
 //! Opus encoder and the DAVE session.
 
 use std::borrow::Cow;
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyTuple};
-use tokio::net::UdpSocket;
 
 use crate::crypto::Mode;
 use crate::dave::Outgoing;
@@ -23,24 +21,8 @@ use crate::errors::{
 };
 use crate::flow::{Backoff, Flow};
 use crate::opus::{EncoderConfig, OpusEncoder, SAMPLES_PER_FRAME};
-use crate::transport::{self, Hub, Phase, Session, WsCommand};
+use crate::transport::{self, Hub, Phase, Session, UdpSend, WsCommand};
 use crate::{log_debug, log_info};
-
-/// Send a UDP datagram without ever blocking the GIL.
-fn send_datagram(socket: &Arc<UdpSocket>, packet: Vec<u8>) {
-    match socket.try_send(&packet) {
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            let socket = socket.clone();
-            pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-                if let Err(err) = socket.send(&packet).await {
-                    log_debug!("a voice packet has been dropped: {err}");
-                }
-            });
-        }
-        Err(err) => log_debug!("a voice packet has been dropped: {err}"),
-    }
-}
 
 /// A Discord voice connection implemented natively.
 ///
@@ -492,14 +474,12 @@ impl VoiceConnection {
 
     /// Send a raw UDP packet. Mostly useful for tests and future receive-side work.
     fn send_packet(&self, packet: &[u8]) -> PyResult<()> {
-        let socket = self.hub.state.lock().udp.clone();
-        let Some(socket) = socket else {
-            return Err(NotConnected::new_err(
+        match self.hub.queue_udp(packet.to_vec()) {
+            UdpSend::Sent | UdpSend::Full => Ok(()),
+            UdpSend::Closed => Err(NotConnected::new_err(
                 "the voice UDP socket is not connected",
-            ));
-        };
-        send_datagram(&socket, packet.to_vec());
-        Ok(())
+            )),
+        }
     }
 
     // ----------------------------------------------------------------- handshake
@@ -762,24 +742,27 @@ impl std::fmt::Display for SendError {
 /// encode happens *before* the connection lock is taken, so no Python call can run while the
 /// state is locked (see `crate::logging` for why that ordering matters).
 pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(), SendError> {
-    let encoded = if encode {
-        let mut slot = hub.encoder.lock();
-        let encoder = slot.get_or_insert_with(|| {
-            OpusEncoder::new(&EncoderConfig::default())
-                .expect("the default Opus encoder must build")
-        });
-        Some(encoder.encode_pcm_bytes(data).map_err(SendError::Opus)?)
-    } else {
-        None
+    // The encoder stays locked until the packet has been encrypted: its output buffer is reused
+    // for every frame, so `payload` borrows it instead of copying it into a fresh `Vec`.
+    let mut encoder_slot = encode.then(|| hub.encoder.lock());
+    let encoded: Option<&[u8]> = match encoder_slot.as_mut() {
+        Some(slot) => {
+            let encoder = slot.get_or_insert_with(|| {
+                OpusEncoder::new(&EncoderConfig::default())
+                    .expect("the default Opus encoder must build")
+            });
+            Some(encoder.encode_pcm_ref(data).map_err(SendError::Opus)?)
+        }
+        None => None,
     };
-    let payload: &[u8] = encoded.as_deref().unwrap_or(data);
+    let payload: &[u8] = encoded.unwrap_or(data);
 
     // A DAVE failure is rare and worth a warning, but the per-frame trace is not worth an
     // allocation (or a GIL round trip) on the audio path. Records are emitted after the lock is
     // released: logging needs the GIL, and a Python thread that holds the GIL may be waiting for
     // this lock.
     let mut dave_error: Option<String> = None;
-    let (packet, socket) = {
+    let packet = {
         let mut state = hub.state.lock();
 
         state.sequence =
@@ -822,18 +805,21 @@ pub fn send_audio_frame(hub: &Arc<Hub>, data: &[u8], encode: bool) -> Result<(),
             u64::from(u32::MAX),
         ) as u32;
 
-        (packet, state.udp.clone())
+        packet
     };
 
     if let Some(message) = dave_error {
         crate::log_warning!("{message}");
     }
 
-    let Some(socket) = socket else {
-        return Err(SendError::NotConnected(
+    match hub.queue_udp(packet) {
+        UdpSend::Sent => Ok(()),
+        UdpSend::Full => {
+            log_debug!("a voice packet has been dropped (the send queue is full)");
+            Ok(())
+        }
+        UdpSend::Closed => Err(SendError::NotConnected(
             "the voice UDP socket is not connected".to_owned(),
-        ));
-    };
-    send_datagram(&socket, packet);
-    Ok(())
+        )),
+    }
 }

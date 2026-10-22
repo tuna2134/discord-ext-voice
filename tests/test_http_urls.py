@@ -58,6 +58,15 @@ def test_http_url_probe(sine_wav, http_server):
 # ---------------------------------------------------------------------------- seeking
 
 
+async def test_http_url_probes_asynchronously(sine_wav, http_server):
+    base = http_server(sine_wav.parent)
+    codec, sample_rate, channels, duration = await dev.probe_async(f'{base}/{sine_wav.name}')
+    assert codec == 'pcm_s16le'
+    assert sample_rate == 48000
+    assert channels == 2
+    assert duration == pytest.approx(0.5, abs=0.1)
+
+
 async def test_http_url_opens_asynchronously(sine_wav, http_server):
     """The async factory probes on a blocking thread; a tokio worker would panic on reqwest's
     blocking client runtime."""

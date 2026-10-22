@@ -367,17 +367,30 @@ impl FfmpegOpusAudio {
     /// Returns `(codec, bitrate)`. There is no `ffprobe` process and no single bitrate in a
     /// transport stream, so the bitrate is always `None`.
     #[staticmethod]
-    fn probe<'py>(py: Python<'py>, source: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (source, headers=None))]
+    fn probe<'py>(
+        py: Python<'py>,
+        source: Py<PyAny>,
+        headers: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let headers = validate_headers(py, source.bind(py), headers)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Python::attach(|py| {
-                let input = source::open_input(source.bind(py), &Default::default())
-                    .map_err(FFmpegSourceError::new_err)?;
-                let codec = py
-                    .detach(|| probe_source(input))
-                    .map_err(FFmpegSourceError::new_err)?
-                    .map(|probe| probe.0);
-                Ok::<_, PyErr>((codec, Option::<u32>::None))
+            let probe = tokio::task::spawn_blocking(move || {
+                Python::try_attach(|py| {
+                    let input = source::open_input(source.bind(py), &headers)
+                        .map_err(FFmpegSourceError::new_err)?;
+                    py.detach(|| probe_source(input))
+                        .map_err(FFmpegSourceError::new_err)
+                })
+                .unwrap_or_else(|| {
+                    Err(FFmpegSourceError::new_err(
+                        "the interpreter is shutting down",
+                    ))
+                })
             })
+            .await
+            .map_err(|err| FFmpegSourceError::new_err(err.to_string()))??;
+            Ok::<_, PyErr>((probe.map(|probe| probe.0), Option::<u32>::None))
         })
     }
 
@@ -411,6 +424,7 @@ impl Drop for FfmpegOpusAudio {
 #[pyclass(
     module = "discord_ext_voice._native",
     name = "PCMVolumeTransformer",
+    extends = AudioSource,
     subclass,
     dict
 )]
@@ -425,16 +439,24 @@ impl PcmVolumeTransformer {
     /// may pass arguments of its own (`data=...` in the yt-dlp example) that this class must
     /// not reject.
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs))]
-    fn new(_args: Bound<'_, PyTuple>, _kwargs: Option<Bound<'_, PyDict>>) -> Self {
-        Self {
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(original, volume=1.0)")]
+    fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(AudioSource).add_subclass(Self {
             original: Mutex::new(None),
             volume: Mutex::new(1.0),
-        }
+        })
     }
 
     #[pyo3(signature = (original, volume=1.0))]
-    fn __init__(&mut self, py: Python<'_>, original: Py<PyAny>, volume: f64) -> PyResult<()> {
+    fn __init__(
+        slf: PyClassGuardMut<'_, Self>,
+        py: Python<'_>,
+        original: Py<PyAny>,
+        volume: f64,
+    ) -> PyResult<()> {
         let bound = original.bind(py);
         if !is_audio_source(bound) {
             let name = bound.get_type().name()?;
@@ -450,9 +472,19 @@ impl PcmVolumeTransformer {
             ));
         }
 
-        *self.original.lock() = Some(original);
-        *self.volume.lock() = volume.max(0.0);
+        *slf.original.lock() = Some(original);
+        *slf.volume.lock() = volume.max(0.0);
         Ok(())
+    }
+
+    /// The wrapped source, as discord.py's `PCMVolumeTransformer.original` attribute.
+    #[getter]
+    fn original(&self, py: Python<'_>) -> Py<PyAny> {
+        self.original
+            .lock()
+            .as_ref()
+            .map(|source| source.clone_ref(py))
+            .unwrap_or_else(|| py.None())
     }
 
     #[getter]
@@ -534,6 +566,37 @@ impl Drop for PcmVolumeTransformer {
             let _ = Python::try_attach(|py| original.bind(py).call_method0("cleanup").map(|_| ()));
         }
     }
+}
+
+/// Probe a source without blocking the event loop.
+///
+/// Same result as the synchronous :func:`discord_ext_voice.probe`, but the demuxer runs on a
+/// blocking thread. Useful before ``voice.play()`` when the input is an ``http(s)`` URL.
+#[pyfunction]
+#[pyo3(signature = (source, headers=None))]
+pub fn probe_async<'py>(
+    py: Python<'py>,
+    source: Py<PyAny>,
+    headers: Option<Py<PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let headers = validate_headers(py, source.bind(py), headers)?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio::task::spawn_blocking(move || {
+            Python::try_attach(|py| {
+                let input = source::open_input(source.bind(py), &headers)
+                    .map_err(FFmpegSourceError::new_err)?;
+                py.detach(|| probe_source(input))
+                    .map_err(FFmpegSourceError::new_err)
+            })
+            .unwrap_or_else(|| {
+                Err(FFmpegSourceError::new_err(
+                    "the interpreter is shutting down",
+                ))
+            })
+        })
+        .await
+        .map_err(|err| FFmpegSourceError::new_err(err.to_string()))?
+    })
 }
 
 /// Whether `candidate` can be played: one of our sources, or anything with `read` and

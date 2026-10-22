@@ -84,7 +84,8 @@ async def on_message(message: discord.Message) -> None:
         await message.reply(
             f'connected={voice.is_connected()} playing={voice.is_playing()} '
             f'phase={native.phase} source={voice.source!r}\n'
-            f'mode={native.mode} ssrc={native.ssrc} latency={native.latency:.3f}s\n'
+            f'mode={native.mode} ssrc={native.ssrc} latency={native.latency:.3f}s '
+            f'dropped={native.dropped_packets}\n'
             f'dave: version={native.dave_protocol_version} '
             f'session={native.has_dave_session()} can_encrypt={native.can_encrypt}'
         )

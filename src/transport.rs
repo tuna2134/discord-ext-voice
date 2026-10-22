@@ -17,6 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -287,6 +288,9 @@ pub struct Hub {
     /// The queue to the single UDP sender task. One task preserves packet order even when the
     /// socket is briefly busy; the previous design spawned a task per packet.
     pub udp_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// Packets dropped because the send queue was full or the socket rejected them. Useful when
+    /// diagnosing choppy audio on a congested link.
+    pub dropped_packets: AtomicU64,
     /// The encoder used when a caller sends PCM without passing one of its own. Shared with the
     /// playback thread, which encodes through the same handle.
     pub encoder: Mutex<Option<crate::opus::OpusEncoder>>,
@@ -308,6 +312,7 @@ impl Hub {
             notify: Notify::new(),
             ws_tx: Mutex::new(None),
             udp_tx: Mutex::new(None),
+            dropped_packets: AtomicU64::new(0),
             encoder: Mutex::new(None),
         })
     }
@@ -348,7 +353,10 @@ impl Hub {
         };
         match tx.try_send(packet) {
             Ok(()) => UdpSend::Sent,
-            Err(mpsc::error::TrySendError::Full(_)) => UdpSend::Full,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                UdpSend::Full
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => UdpSend::Closed,
         }
     }
@@ -1009,9 +1017,11 @@ async fn handle_ready(
     // than spawning a task per packet or reordering them.
     let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(512);
     let send_socket = Arc::clone(&socket);
+    let send_hub = Arc::clone(hub);
     tokio::spawn(async move {
         while let Some(packet) = udp_rx.recv().await {
             if let Err(err) = send_socket.send(&packet).await {
+                send_hub.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 log_debug!("a voice packet has been dropped: {err}");
             }
         }

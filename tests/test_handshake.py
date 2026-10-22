@@ -34,6 +34,7 @@ async def test_handshake_completes(gateway_factory):
         assert conn.voice_port == gateway._udp_port
         assert len(conn.secret_key) == 32
         assert conn.phase == 8
+        assert conn.dropped_packets == 0
     finally:
         await conn.close()
 

@@ -126,6 +126,7 @@ def test_playback_tuning_is_exposed():
     assert dev.VoiceClient.fec is True
     assert dev.VoiceClient.expected_packet_loss == 0.15
     # The native player's read-ahead window and no-data timeout are adjustable.
+    assert callable(dev.probe_async)
     assert callable(dev.set_read_ahead)
     assert callable(dev.set_read_stall_timeout)
 

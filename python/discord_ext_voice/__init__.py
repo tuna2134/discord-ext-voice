@@ -51,6 +51,7 @@ from ._native import (
     __version__,
     is_audio_source,
     probe,
+    probe_async,
     set_read_ahead,
     set_read_stall_timeout,
 )
@@ -93,6 +94,7 @@ __all__ = (
     'PCMVolumeTransformer',
     'is_audio_source',
     'probe',
+    'probe_async',
     'set_read_ahead',
     'set_read_stall_timeout',
     # codec

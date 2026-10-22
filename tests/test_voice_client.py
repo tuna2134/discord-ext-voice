@@ -143,6 +143,17 @@ async def test_connect_establishes_the_native_session(gateway_factory):
         await voice.disconnect()
 
 
+async def test_connect_while_connected_is_rejected(gateway_factory):
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+    try:
+        with pytest.raises(dev.ClientException):
+            await voice.connect(timeout=1.0, reconnect=False)
+    finally:
+        await voice.disconnect()
+
+
 async def test_connect_asks_the_guild_to_change_voice_state(gateway_factory):
     gateway = await gateway_factory()
     client, channel = await make_client(gateway)

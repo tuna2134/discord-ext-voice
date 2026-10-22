@@ -75,6 +75,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<player::PyAudioPlayer>()?;
 
     module.add_function(wrap_pyfunction!(sources::is_audio_source, module)?)?;
+    module.add_function(wrap_pyfunction!(sources::probe_async, module)?)?;
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
     module.add_function(wrap_pyfunction!(source::scale_pcm, module)?)?;
     module.add_function(wrap_pyfunction!(flow::retry_wait, module)?)?;

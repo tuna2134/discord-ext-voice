@@ -204,6 +204,7 @@ file, which is how the demuxer would read it.
 The synchronous constructor probes the input before returning, which for an `http(s)` URL means
 the event loop waits for the CDN. `await FFmpegPCMAudio.open(...)` (and the Opus equivalent) does
 the probe in a native future, so a bot command can keep serving other events while that happens.
+`await dev.probe_async(url)` is the same for a codec/duration probe.
 
 `headers=` sends extra HTTP headers with every request the reader makes (the first fetch and any
 `Range` a seek issues). Extractors hand those out with the URLs they produce — `yt-dlp`'s
@@ -337,6 +338,9 @@ The 20ms audio path was written to stay allocation-light and to survive a bad ne
   reordered), and a source that stops producing frames fails through `after` after 30 seconds
   instead of wedging the player.
 
+`voice.native.dropped_packets` counts packets the UDP send queue dropped, which is the first
+thing to check if audio is choppy while the player is not reporting errors.
+
 `dev.set_read_ahead(seconds)` resizes the decoder queue (default one second) and
 `dev.set_read_stall_timeout(seconds)` changes the no-data timeout (`0` disables it).
 
@@ -356,7 +360,7 @@ release wheel.
 
 ```bash
 cargo test --lib    # 42 Rust unit tests (1 ignored: it needs the network)
-pytest -q           # 166 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
+pytest -q           # 168 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
                     # test needs DISCORD_EXT_VOICE_LIVE_URL)
 ```
 

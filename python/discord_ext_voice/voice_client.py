@@ -94,6 +94,9 @@ class VoiceClient(VoiceProtocol):
         super().__init__(client, channel)
         state = client._connection
         self.loop = state.loop
+        #: The guild is cached: once Discord removes us, `channel` can become `None`, but the
+        #: gateway still has to be told to leave (and logs still name the guild).
+        self._guild = getattr(channel, 'guild', None)
         self._state = state
         self._player: Optional[AudioPlayer] = None
         #: The websocket facade; Rust owns the socket behind it.
@@ -127,7 +130,8 @@ class VoiceClient(VoiceProtocol):
     @property
     def guild(self) -> Any:
         """:class:`discord.Guild`: The guild we're connected to."""
-        return self.channel.guild
+        channel = self.channel
+        return channel.guild if channel is not None else self._guild
 
     @property
     def user(self) -> Any:
@@ -290,6 +294,9 @@ class VoiceClient(VoiceProtocol):
 
         Connects to voice and completes the handshake.
         """
+        if self.is_connected():
+            raise ClientException('Already connected to voice.')
+
         self._timeout = timeout
         self._reconnect = reconnect
         self._self_deaf = self_deaf
@@ -410,7 +417,18 @@ class VoiceClient(VoiceProtocol):
         _log.info('Disconnecting from voice (force=%s)', force)
         await self._disconnect(force=force, wait=True)
         self.cleanup()
+        self._cancel_tasks()
         _log.info('Disconnected from voice')
+
+    def _cancel_tasks(self) -> None:
+        """Cancel the connector and poller, unless this coroutine is one of them."""
+        current = asyncio.current_task()
+        if self._connector is not None and self._connector is not current:
+            self._connector.cancel()
+            self._connector = None
+        if self._runner is not None and self._runner is not current:
+            self._runner.cancel()
+            self._runner = None
 
     async def _disconnect(
         self, *, force: bool = True, cleanup: bool = True, wait: bool = False

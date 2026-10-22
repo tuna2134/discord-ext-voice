@@ -186,7 +186,7 @@ else is reachable through the native `VoiceError` hierarchy.
   `latency`, `average_latency`, `seq_ack`, `ssrc`, `ip`/`port`/`voice_port`, `mode`,
   `secret_key`, `dave_protocol_version`, `can_encrypt`, `has_dave_session`,
   `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `close_reason`,
-  `wait_closed`, ...
+  `dropped_packets`, `wait_closed`, ...
 * `FFmpegPCMAudio(source, seek=...)` / `FFmpegOpusAudio(source, seek=...)` — the native `-ss`,
   implemented by seeking the demuxer and rebuilding the decoder.
 * A dropped `http(s)` stream is resumed from the byte it reached (a `Range` request, or a
@@ -200,6 +200,8 @@ else is reachable through the native `VoiceError` hierarchy.
 * `AudioPlayer.join(timeout=None)` / `is_alive()` — wait for the playback thread from Python.
 * `await FFmpegPCMAudio.open(source, ...)` / `await FFmpegOpusAudio.open(source, ...)` — open a
   source (including an `http(s)` URL) without blocking the event loop during the probe.
+* `await probe_async(source, headers=None)` — the awaitable form of `probe`, for URL probes in
+  an async command.
 * `set_read_ahead(seconds)` / `set_read_stall_timeout(seconds)` — tune the native read-ahead
   window (default 1s) and the no-data timeout (default 30s; `0` disables it).
 * `voice.fec` / `voice.expected_packet_loss` — per-client defaults for `play()`'s Opus encoder

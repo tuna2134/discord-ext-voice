@@ -358,6 +358,14 @@ impl VoiceConnection {
         self.hub.state.lock().average_latency()
     }
 
+    /// Packets dropped by the UDP send queue (congestion or a closed socket).
+    #[getter]
+    fn dropped_packets(&self) -> u64 {
+        self.hub
+            .dropped_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[getter]
     fn seq_ack(&self) -> i32 {
         self.hub.state.lock().seq_ack

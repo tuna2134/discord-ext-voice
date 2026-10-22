@@ -366,6 +366,8 @@ def test_volume_transformer_forwards_cleanup():
             cleaned.append(True)
 
     transformer = dev.PCMVolumeTransformer(Source(), 0.5)
+    assert isinstance(transformer, dev.AudioSource)
+    assert transformer.original.read() == b'\x00' * dev.FRAME_SIZE
     transformer.cleanup()
     assert cleaned == [True]
 

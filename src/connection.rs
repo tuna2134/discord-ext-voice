@@ -10,15 +10,17 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyTuple};
 use tokio::net::UdpSocket;
 
 use crate::crypto::Mode;
 use crate::dave::Outgoing;
+use crate::enums;
 use crate::errors::{
     AlreadyConnected, ConnectionClosedError, DaveError, EncryptionError, HandshakeError,
     NotConnected, OpusError,
 };
-use crate::flow::{Backoff, PyConnectionFlow};
+use crate::flow::{Backoff, Flow};
 use crate::opus::{EncoderConfig, OpusEncoder, SAMPLES_PER_FRAME};
 use crate::transport::{self, Hub, Phase, Session, WsCommand};
 use crate::{log_debug, log_info};
@@ -100,21 +102,36 @@ impl VoiceConnection {
     }
 
     /// Store the `token`/`endpoint`/`guild_id` from a `VOICE_SERVER_UPDATE` payload.
-    fn set_server_info(&self, server_id: u64, token: Option<String>, endpoint: Option<String>) {
-        {
+    ///
+    /// Returns whether anything changed, which is what the flow uses to tell a repeated update
+    /// from a move to a different voice server.
+    fn set_server_info(
+        &self,
+        server_id: u64,
+        token: Option<String>,
+        endpoint: Option<String>,
+    ) -> bool {
+        let endpoint = endpoint.map(|endpoint| {
+            // `wss://` is implicit, but a `ws://` prefix is meaningful: it asks for a plaintext
+            // websocket (used by locally hosted gateways and the test suite).
+            endpoint
+                .strip_prefix("wss://")
+                .unwrap_or(&endpoint)
+                .to_owned()
+        });
+
+        let changed = {
             let mut state = self.hub.state.lock();
+            let changed = state.server_id != Some(server_id)
+                || state.token != token
+                || state.endpoint != endpoint;
             state.server_id = Some(server_id);
             state.token = token;
-            // `wss://` is implicit, but a `ws://` prefix is meaningful: it asks for a
-            // plaintext websocket (used by locally hosted gateways and the test suite).
-            state.endpoint = endpoint.map(|endpoint| {
-                endpoint
-                    .strip_prefix("wss://")
-                    .unwrap_or(&endpoint)
-                    .to_owned()
-            });
-        }
+            state.endpoint = endpoint;
+            changed
+        };
         self.hub.bump();
+        changed
     }
 
     // ----------------------------------------------------------------- connection state
@@ -124,23 +141,228 @@ impl VoiceConnection {
         self.hub.state.lock().phase as u8
     }
 
-    fn set_phase(&self, phase: u8) -> PyResult<()> {
+    fn set_phase(&self, phase: u8) -> PyResult<u8> {
         crate::flow::set_phase(&self.hub, phase).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "{phase} is not a valid connection flow state"
             ))
-        })?;
-        Ok(())
+        })
     }
 
     fn is_connected(&self) -> bool {
         self.hub.state.lock().phase.is_connected()
     }
 
-    /// The connection flow: the decisions the Python `VoiceConnectionState` dispatches on.
+    // ----------------------------------------------------------------- flow state
+
+    /// The flow phase as a [`ConnectionFlowState`](crate::enums) member.
     #[getter]
-    fn flow(&self) -> PyConnectionFlow {
-        PyConnectionFlow::new(Arc::clone(&self.hub), Arc::clone(&self.backoff))
+    fn state(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        enums::member(py, &enums::FLOW_STATE, self.hub.state.lock().phase.as_u8())
+    }
+
+    #[setter]
+    fn set_state(&self, value: u8) -> PyResult<()> {
+        self.set_phase(value).map(|_| ())
+    }
+
+    /// Whether the main gateway still has us in a channel.
+    #[getter]
+    fn joined(&self) -> bool {
+        self.hub.state.lock().joined
+    }
+
+    #[setter]
+    fn set_joined(&self, joined: bool) {
+        self.hub.state.lock().joined = joined;
+    }
+
+    /// Whether a leave request is in flight.
+    #[getter]
+    fn expecting_disconnect(&self) -> bool {
+        self.hub.state.lock().expecting_disconnect
+    }
+
+    #[setter]
+    fn set_expecting_disconnect(&self, expecting: bool) {
+        self.hub.state.lock().expecting_disconnect = expecting;
+    }
+
+    /// Whether the gateway has confirmed that we are out of the channel.
+    #[getter]
+    fn disconnected(&self) -> bool {
+        self.hub.state.lock().disconnected
+    }
+
+    #[setter]
+    fn set_disconnected(&self, disconnected: bool) {
+        self.hub.state.lock().disconnected = disconnected;
+    }
+
+    /// The RTP encryption modes this build supports, most preferred first.
+    #[getter]
+    fn supported_modes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, supported_modes())
+    }
+
+    /// The DAVE protocol version this build advertises.
+    #[getter]
+    fn max_dave_protocol_version(&self) -> u16 {
+        self.hub.state.lock().max_dave_protocol_version
+    }
+
+    /// The native DAVE session, when one exists (`None` while E2EE is off).
+    #[getter]
+    fn dave_session(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if !slf.hub.state.lock().dave.has_session() {
+            return Ok(None);
+        }
+        Ok(Some(slf.into_pyobject(py)?.into_any().unbind()))
+    }
+
+    /// This connection, which is also the connection state.
+    #[getter]
+    fn native(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(slf.into_pyobject(py)?.into_any().unbind())
+    }
+
+    /// The `session_id` from the last `VOICE_STATE_UPDATE`.
+    #[getter]
+    fn session_id(&self) -> Option<String> {
+        self.hub.state.lock().session_id.clone()
+    }
+
+    /// The voice endpoint (with the `wss://` scheme stripped), once known.
+    #[getter]
+    fn endpoint(&self) -> Option<String> {
+        self.hub.state.lock().endpoint.clone()
+    }
+
+    // ----------------------------------------------------------------- flow decisions
+
+    /// Handle a `VOICE_STATE_UPDATE` for our own user.
+    fn voice_state_update(
+        &self,
+        py: Python<'_>,
+        channel_id: Option<u64>,
+        current_channel_id: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        let action = {
+            let mut state = self.hub.state.lock();
+            Flow::voice_state_update(&mut state, channel_id, current_channel_id)
+        };
+        self.hub.bump();
+        enums::member(py, &enums::VOICE_STATE_ACTION, action as u8)
+    }
+
+    /// Handle a `VOICE_SERVER_UPDATE`.
+    ///
+    /// `changed` is whether the credentials differ from the ones already stored, which is what
+    /// tells a repeat apart from a genuine move.
+    fn voice_server_update(
+        &self,
+        py: Python<'_>,
+        has_endpoint: bool,
+        has_token: bool,
+        changed: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let action = {
+            let mut state = self.hub.state.lock();
+            Flow::voice_server_update(&mut state, has_endpoint, has_token, changed)
+        };
+        self.hub.bump();
+        enums::member(py, &enums::VOICE_SERVER_ACTION, action as u8)
+    }
+
+    /// Record that a join request went out.
+    fn note_attempt(&self) {
+        {
+            let mut state = self.hub.state.lock();
+            Flow::note_attempt(&mut state);
+        }
+        self.hub.bump();
+    }
+
+    /// What the websocket poller does with a close code.
+    fn close_action(&self, py: Python<'_>, code: u16, reconnect: bool) -> PyResult<Py<PyAny>> {
+        let action = {
+            let state = self.hub.state.lock();
+            Flow::close_action(&state, code, reconnect)
+        };
+        enums::member(py, &enums::CLOSE_ACTION, action as u8)
+    }
+
+    /// How long attempt `attempt` (zero based) waits before trying again.
+    #[staticmethod]
+    fn retry_wait(attempt: usize) -> f64 {
+        Flow::retry_wait(attempt)
+    }
+
+    /// The jittered reconnect delay for the next attempt.
+    fn reconnect_delay(&self) -> f64 {
+        self.backoff.lock().delay()
+    }
+
+    /// Restart the backoff sequence, as a fresh poller does.
+    fn reset_backoff(&self) {
+        self.backoff.lock().reset();
+    }
+
+    // ----------------------------------------------------------------- waiting
+
+    /// Wait until the flow reaches one of `states`, or `timeout` elapses.
+    ///
+    /// Returns whether the state was reached; the caller raises `asyncio.TimeoutError`, so the
+    /// timeout is the caller's to report.
+    #[pyo3(signature = (states, timeout=None))]
+    fn wait_for_state<'py>(
+        &self,
+        py: Python<'py>,
+        states: Vec<u8>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut wanted = Vec::with_capacity(states.len());
+        for value in states {
+            let Some(phase) = transport::Phase::from_u8(value) else {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{value} is not a connection flow state (0-8)"
+                )));
+            };
+            wanted.push(phase);
+        }
+
+        let hub = Arc::clone(&self.hub);
+        let timeout = timeout.map(transport::wait_duration);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(hub
+                .wait_for(timeout, |state| wanted.contains(&state.phase))
+                .await)
+        })
+    }
+
+    /// Block until the flow reaches `connected`, or `timeout` elapses.
+    #[pyo3(signature = (timeout=None))]
+    fn wait_connected(&self, py: Python<'_>, timeout: Option<f64>) -> bool {
+        let hub = Arc::clone(&self.hub);
+        let deadline =
+            timeout.map(|seconds| std::time::Instant::now() + transport::wait_duration(seconds));
+        py.detach(move || {
+            loop {
+                let connected = hub.state.lock().phase.is_connected();
+                if connected
+                    || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    return connected;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    }
+
+    /// Alias of [`wait_connected`](Self::wait_connected).
+    #[pyo3(signature = (timeout=None))]
+    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> bool {
+        self.wait_connected(py, timeout)
     }
 
     #[getter]
@@ -214,6 +436,7 @@ impl VoiceConnection {
         self.hub.state.lock().dave.protocol_version()
     }
 
+    #[getter]
     fn can_encrypt(&self) -> bool {
         self.hub.state.lock().dave.can_encrypt()
     }
@@ -375,17 +598,7 @@ impl VoiceConnection {
     /// Close the websocket and mark the connection as finished.
     #[pyo3(signature = (code=None))]
     fn close<'py>(&self, py: Python<'py>, code: Option<u16>) -> PyResult<Bound<'py, PyAny>> {
-        let hub = self.hub.clone();
-        let session = self.session.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let taken = session.lock().take();
-            if let Some(session) = taken {
-                session.shutdown(code, String::new()).await;
-            }
-            hub.finish(code, String::new());
-            Ok(())
-        })
+        self.close_future(py, code)
     }
 
     /// Await the websocket close and return `(code, reason)`.
@@ -469,6 +682,35 @@ impl VoiceConnection {
     /// the connection state without going through Python.
     pub fn hub(&self) -> Arc<Hub> {
         Arc::clone(&self.hub)
+    }
+
+    /// Close the websocket, for [`VoiceConnection::close`] and the websocket facade.
+    pub(crate) fn close_future<'py>(
+        &self,
+        py: Python<'py>,
+        code: Option<u16>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let hub = Arc::clone(&self.hub);
+        let session = Arc::clone(&self.session);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let taken = session.lock().take();
+            if let Some(session) = taken {
+                session.shutdown(code, String::new()).await;
+            }
+            hub.finish(code, String::new());
+            Ok(())
+        })
+    }
+
+    /// The heartbeat round trip, for the websocket facade.
+    pub(crate) fn current_latency(&self) -> f64 {
+        self.hub.state.lock().latency
+    }
+
+    /// The websocket close code, for the websocket facade.
+    pub(crate) fn close_code_raw(&self) -> Option<u16> {
+        self.hub.state.lock().close_code
     }
 }
 

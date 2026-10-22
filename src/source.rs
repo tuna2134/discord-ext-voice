@@ -1,5 +1,7 @@
-//! In-process audio decoding, demuxing and resampling, exposed to Python as `AudioSource`
-//! compatible objects.
+//! In-process audio decoding, demuxing and resampling. The Python-facing source classes
+//! (`AudioSource`, `FFmpegPCMAudio`, ...) live in [`crate::sources`]; this module provides the
+//! readers behind them, and exposes those readers as `_native.DecodeSource`/`OpusSource` for
+//! code that wants to drive a demuxer directly.
 //!
 //! Nothing here needs FFmpeg: containers and codecs come from `symphonia` (pure Rust), the
 //! sample-rate conversion that `libswresample` used to do comes from `rubato`, and Opus — the one
@@ -388,7 +390,7 @@ impl Seek for PyFile {
 ///
 /// Raises `ValueError` for a name or value HTTP cannot carry, naming the offending header, so a
 /// typo in `headers=` is reported before any connection is attempted.
-fn parse_headers(headers: Option<HashMap<String, String>>) -> PyResult<HeaderMap> {
+pub(crate) fn parse_headers(headers: Option<HashMap<String, String>>) -> PyResult<HeaderMap> {
     let Some(headers) = headers else {
         return Ok(HeaderMap::new());
     };
@@ -416,7 +418,7 @@ fn parse_headers(headers: Option<HashMap<String, String>>) -> PyResult<HeaderMap
 /// the probing happens in [`probe_input`], which the callers run without the GIL.
 ///
 /// `headers` apply to an HTTP(S) input; a path or a file object ignores them.
-fn open_input(source: &Bound<'_, PyAny>, headers: &HeaderMap) -> Result<Input, String> {
+pub(crate) fn open_input(source: &Bound<'_, PyAny>, headers: &HeaderMap) -> Result<Input, String> {
     if let Ok(text) = source.extract::<String>() {
         if text.starts_with("http://") || text.starts_with("https://") {
             log_info!("streaming {text} over HTTP");
@@ -640,7 +642,7 @@ pub struct DecodeSource {
 unsafe impl Send for DecodeSource {}
 
 impl DecodeSource {
-    fn open(input: Input) -> Result<Self, String> {
+    pub(crate) fn open(input: Input) -> Result<Self, String> {
         let seekable = input.seekable();
         let (format, track) = probe_input(input)?;
         let decoder = TrackDecoder::new(&track.params)?;
@@ -870,7 +872,7 @@ impl DecodeSource {
         }
     }
 
-    fn read_frame(&mut self) -> Result<Vec<u8>, String> {
+    pub(crate) fn read_frame(&mut self) -> Result<Vec<u8>, String> {
         if self.finished && self.pending.is_empty() {
             return Ok(Vec::new());
         }
@@ -895,7 +897,7 @@ impl DecodeSource {
     }
 
     /// Restart the stream `seconds` from its beginning.
-    fn seek(&mut self, seconds: f64) -> Result<(), String> {
+    pub(crate) fn seek(&mut self, seconds: f64) -> Result<(), String> {
         let micros = seek_micros(seconds)?;
         if !self.seekable {
             return Err(not_seekable(seconds));
@@ -925,6 +927,14 @@ impl DecodeSource {
         log_debug!("seeked the audio source to {seconds}s");
         Ok(())
     }
+
+    /// Release the decoder, demuxer and buffered audio. Idempotent.
+    pub(crate) fn cleanup(&mut self) {
+        self.finished = true;
+        self.pending.clear();
+        self.staging.clear();
+        self.pipeline = Pipeline::Direct;
+    }
 }
 
 /// A pass-through source that yields the raw Opus packets of an already-encoded stream.
@@ -936,7 +946,7 @@ pub struct OpusSource {
 }
 
 impl OpusSource {
-    fn open(input: Input) -> Result<Self, String> {
+    pub(crate) fn open(input: Input) -> Result<Self, String> {
         let seekable = input.seekable();
         let (format, track) = probe_input(input)?;
         if track.params.codec != CODEC_ID_OPUS {
@@ -955,7 +965,7 @@ impl OpusSource {
         })
     }
 
-    fn read_packet(&mut self) -> Result<Vec<u8>, String> {
+    pub(crate) fn read_packet(&mut self) -> Result<Vec<u8>, String> {
         if self.finished {
             return Ok(Vec::new());
         }
@@ -978,7 +988,7 @@ impl OpusSource {
         }
     }
 
-    fn seek(&mut self, seconds: f64) -> Result<(), String> {
+    pub(crate) fn seek(&mut self, seconds: f64) -> Result<(), String> {
         let micros = seek_micros(seconds)?;
         if !self.seekable {
             return Err(not_seekable(seconds));
@@ -1000,6 +1010,11 @@ impl OpusSource {
         self.finished = false;
         log_debug!("seeked the Opus source to {seconds}s");
         Ok(())
+    }
+
+    /// Release the demuxer and its buffers. Idempotent.
+    pub(crate) fn cleanup(&mut self) {
+        self.finished = true;
     }
 }
 
@@ -1108,17 +1123,9 @@ impl PyDecodeSource {
         false
     }
 
-    /// Release the decoder, demuxer and any FFmpeg resources immediately.
+    /// Release the decoder, demuxer and buffered audio immediately.
     fn cleanup(&self, py: Python<'_>) {
-        py.detach(|| {
-            let mut guard = self.inner.lock();
-            guard.finished = true;
-            guard.pending.clear();
-            guard.staging.clear();
-            // Drop the resampler and the decoder with it: cleanup is what a source does when it
-            // is finished with.
-            guard.pipeline = Pipeline::Direct;
-        });
+        py.detach(|| self.inner.lock().cleanup());
     }
 
     fn __repr__(&self) -> String {
@@ -1167,9 +1174,7 @@ impl PyOpusSource {
     }
 
     fn cleanup(&self, py: Python<'_>) {
-        py.detach(|| {
-            self.inner.lock().finished = true;
-        });
+        py.detach(|| self.inner.lock().cleanup());
     }
 
     fn __repr__(&self) -> String {

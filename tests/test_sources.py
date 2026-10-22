@@ -299,6 +299,27 @@ def test_volume_transformer_rejects_a_non_source():
         dev.PCMVolumeTransformer(b'not a source')  # type: ignore[arg-type]
 
 
+def test_volume_transformer_can_be_subclassed_with_extra_arguments():
+    """A subclass may add its own constructor arguments, as the yt-dlp example does.
+
+    Python calls the base `tp_new` with every argument first, so the native class has to accept
+    what the subclass adds; the initialisation happens through `super().__init__(source, volume)`.
+    """
+
+    class Subclass(dev.PCMVolumeTransformer):
+        def __init__(self, source, *, data, volume: float = 0.5) -> None:
+            super().__init__(source, volume)
+            self.data = data
+
+    original = dev.PCMAudio(io.BytesIO(b'\x00' * (dev.FRAME_SIZE * 2)))
+    transformed = Subclass(original, data={'title': 'a song'}, volume=0.5)
+
+    assert transformed.data == {'title': 'a song'}
+    assert transformed.volume == 0.5
+    assert dev.is_audio_source(transformed) is True
+    assert len(transformed.read()) == dev.FRAME_SIZE
+
+
 def test_volume_transformer_forwards_cleanup():
     """Cleanup is forwarded to the wrapped source."""
     cleaned: list[bool] = []

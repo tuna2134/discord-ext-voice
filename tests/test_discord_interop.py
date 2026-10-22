@@ -58,7 +58,7 @@ def test_voice_client_does_not_require_pynacl_or_davey(monkeypatch):
         guild = types.SimpleNamespace(id=111)
 
     voice = dev.VoiceClient(_Client(), _Channel())
-    assert voice._connection.native is not None
+    assert voice.native is not None
     assert voice.native.is_connected() is False
     assert voice.is_playing() is False
     assert asyncio.iscoroutinefunction(voice.connect)
@@ -81,12 +81,12 @@ def test_voice_websocket_is_this_packages_own():
     import discord.gateway
 
     assert not issubclass(dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket)
-    assert dev.DiscordVoiceWebSocket.__module__ == 'discord_ext_voice.gateway'
+    assert dev.DiscordVoiceWebSocket.__module__ == 'discord_ext_voice._native'
 
     # Only the two members the Python layer still needs are left.
     ours = dev.DiscordVoiceWebSocket
     assert callable(ours.close)
-    assert isinstance(ours.latency, property)
+    assert hasattr(ours, 'latency')
 
 
 def test_nothing_of_discord_pys_implementation_is_reused():
@@ -155,7 +155,7 @@ def test_audio_sources_are_this_packages_own():
     for name in ('AudioSource', 'PCMAudio', 'FFmpegPCMAudio', 'FFmpegOpusAudio', 'PCMVolumeTransformer'):
         ours = getattr(dev, name)
         assert ours is not getattr(discord.player, name), f'{name} must be ours'
-        assert ours.__module__ == 'discord_ext_voice.sources'
+        assert ours.__module__ == 'discord_ext_voice._native'
 
     # A source with the same three methods is still accepted, which is what makes a
     # `discord.AudioSource` subclass playable.

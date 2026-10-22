@@ -75,8 +75,9 @@ def test_audio_player_signature_matches_discord_py():
 def test_ffmpeg_sources_have_a_native_signature():
     """The sources take the media plus `seek`; the FFmpeg CLI arguments are gone."""
     for cls in (dev.FFmpegPCMAudio, dev.FFmpegOpusAudio):
-        parameters = inspect.signature(cls.__init__).parameters
-        assert list(parameters)[:2] == ['self', 'source']
+        # The native `tp_new` carries the text signature, so the class itself is inspected.
+        parameters = inspect.signature(cls).parameters
+        assert list(parameters)[0] == 'source'
         assert parameters['seek'].kind is inspect.Parameter.KEYWORD_ONLY
         assert parameters['seek'].default is None
         # Anything else (before_options, options, executable, ...) is rejected, which is what
@@ -91,8 +92,8 @@ def test_sources_are_this_packages_own():
     import discord.player
 
     for cls in (dev.AudioSource, dev.PCMAudio, dev.FFmpegPCMAudio, dev.FFmpegOpusAudio):
-        assert cls.__module__ == 'discord_ext_voice.sources'
-    assert dev.PCMVolumeTransformer.__module__ == 'discord_ext_voice.sources'
+        assert cls.__module__ == 'discord_ext_voice._native'
+    assert dev.PCMVolumeTransformer.__module__ == 'discord_ext_voice._native'
     # Nothing in the package inherits from discord.py; only the method contract is shared, which
     # is what keeps a foreign source usable.
     for name in ('AudioSource', 'PCMAudio', 'FFmpegPCMAudio', 'FFmpegOpusAudio'):

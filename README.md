@@ -1,7 +1,8 @@
 # discord-ext-voice
 
 A Rust voice backend for [`discord.py`](https://github.com/Rapptz/discord.py). The public
-`VoiceClient` is discord.py's own, so the API is not *compatible* with it — it **is** it.
+`VoiceClient` exposes discord.py's voice-client API — implemented on discord.py's own
+`VoiceProtocol` extension point, so a bot changes the class it connects with and nothing else.
 
 ```python
 import discord
@@ -13,12 +14,12 @@ voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished',
 
 `dev.VoiceClient` implements `discord.VoiceProtocol` — discord.py's documented extension point
 for alternative voice backends — on top of the native transport, and is the only class in this
-package that inherits from `discord.py`. Everything below it is this package's own:
-`dev.VoiceConnectionState` (the connection flow, whose decisions are native),
-`dev.DiscordVoiceWebSocket` (a handle with `latency` and `close`), `dev.AudioPlayer` (the
-playback clock) and the audio sources (decoding in process with `symphonia`). From `discord.py` we
-*use* the host framework rather than inherit it: the client and its gateway, and the exception
-classes the public API raises.
+package that inherits from `discord.py`. Only one other thing is Python: `dev.AudioPlayer`, a thin
+wrapper over the native playback thread. Everything else is Rust, including
+`dev.VoiceConnectionState` (the connection state and flow), `dev.DiscordVoiceWebSocket` (the
+websocket facade), the audio sources and the exception types. From `discord.py` we *use* the host
+framework rather than inherit it: the client and its gateway, and the exception classes the public
+API raises.
 
 Everything that must be native is native — and that is the whole voice protocol:
 
@@ -34,11 +35,12 @@ Everything that must be native is native — and that is the whole voice protoco
 | Python bindings | Rust: `pyo3` + `pyo3-async-runtimes`, built with `maturin` |
 | PyNaCl, Python `davey` | **not needed** — the encryption and the MLS session are native |
 | Client API (`play`, `pause`, `source`, ...) | This package, implementing `discord.VoiceProtocol` |
-| Connection flow, reconnect policy | Rust: `_native.ConnectionFlow` (phases, close codes, retries, backoff), driven by `discord_ext_voice.voice_state` |
-| Audio sources (decode, resample, volume) | This package: `discord_ext_voice.sources` on `symphonia` / `rubato` / `oprs` |
+| Connection state and flow, reconnect policy | Rust: `_native.VoiceConnection` + `flow.rs` (phases, close codes, retries, backoff) |
+| Audio sources (decode, resample, volume) | Rust: `sources.rs` on `symphonia` / `rubato` / `oprs` |
 | `http(s)` inputs | `reqwest` (rustls, no OpenSSL), streamed straight into the decoder |
-| Playback clock (the player thread) | Rust: `discord_ext_voice.player` (20ms pacing, silence, speaking) |
-| Voice gateway opcodes and frame surface | This package: `discord_ext_voice.gateway` (Discord's opcode values) |
+| Playback clock (the player thread) | Rust: `player.rs`; `player.py` is only a wrapper |
+| Voice gateway opcodes and frame surface | Rust: `transport.rs` |
+| `discord.py` calls (join/leave/move) | `voice_client.py`: `Guild.change_voice_state`, then the event goes to Rust |
 | `ffmpeg` subprocess | **not used** — no binary, no pipe, no process to reap |
 
 ## Why
@@ -47,8 +49,8 @@ Everything that must be native is native — and that is the whole voice protoco
   `aead_xchacha20_poly1305_rtpsize` are implemented natively, including the incrementing nonce
   behaviour discord.py relies on. The test suite decrypts every mode with PyNaCl to prove
   byte-level compatibility.
-* **No FFmpeg, in any form.** The audio sources are this package's own
-  (`discord_ext_voice.sources`): `symphonia` demuxes and decodes in process, `rubato` converts
+* **No FFmpeg, in any form.** The audio sources are this package's own (native
+  `_native.FFmpegPCMAudio`/`FFmpegOpusAudio`): `symphonia` demuxes and decodes in process, `rubato` converts
   the sample rate, `oprs` (libopus 1.6.1, ported to pure Rust) handles Opus — which symphonia has
   no decoder for — and `seek=` replaces `-ss`. No `ffmpeg` binary, no C library, no child process:
   the extension links nothing but libc.
@@ -57,11 +59,12 @@ Everything that must be native is native — and that is the whole voice protoco
   and paces it against a native 20ms clock.
 * **DAVE end-to-end encryption** is handled entirely in Rust with `davey`: MLS key packages,
   commit/welcome processing, epoch transitions and the passthrough windows.
-* **A thin Python layer.** The Python side holds the awaits and the discord.py-compatible
-  surface, not the decisions: the connection flow's state machine, close-code policy, retry
-  spacing and reconnect backoff are all in `_native.ConnectionFlow`, and Python dispatches on the
-  action it returns. The one thing discord.py provides is what a bot already drives: the client,
-  the main gateway, and the `VoiceProtocol` extension point `VoiceClient` implements.
+* **A thin Python layer.** Only `VoiceClient` and `AudioPlayer` are Python. `VoiceClient` holds
+  the one thing Rust cannot: the `discord.py` boundary. Joining, leaving and moving are
+  `Guild.change_voice_state` calls made there, and the resulting gateway events are handed to the
+  native connection; the flow state machine, close-code policy, retry spacing and reconnect
+  backoff all live in Rust. The one thing discord.py provides is what a bot already drives: the
+  client, the main gateway, and the `VoiceProtocol` extension point `VoiceClient` implements.
 
 ## Requirements
 
@@ -163,8 +166,8 @@ accepts it because it implements `discord.VoiceProtocol`.
 
 ### Audio sources
 
-Every source is implemented in this package ([`discord_ext_voice.sources`](python/discord_ext_voice/sources.py))
-and decodes in process with `symphonia` — no FFmpeg, no binary:
+Every source is implemented in this package (`src/sources.rs`, exposed through `_native`) and
+decodes in process with `symphonia` — no FFmpeg, no binary:
 
 | Class | Behaviour |
 | --- | --- |
@@ -200,10 +203,11 @@ file, which is how the demuxer would read it.
 bound to the client that asked for it. A `User-Agent` there replaces this package's own; passing
 headers for a local file or a file object is a `TypeError`, since nothing would send them.
 
-`dev.AudioSource` is this package's own base class, and nothing here inherits from discord.py: a
-source only has to provide `read`/`is_opus`/`cleanup`, which is also what makes a user's own
-`discord.AudioSource` (or duck-typed equivalent) playable — `dev.is_audio_source(x)` answers that
-question. discord.py's FFmpeg-CLI arguments —
+`dev.AudioSource` is this package's own native base class, and nothing here inherits from
+discord.py: a source only has to provide `read`/`is_opus`/`cleanup`, which is also what makes a
+user's own `discord.AudioSource` (or duck-typed equivalent) playable — `dev.is_audio_source(x)`
+answers that question. Native sources are subclassable from Python (the `yt-dlp` example does
+exactly that with `PCMVolumeTransformer`). discord.py's FFmpeg-CLI arguments —
 `before_options`, `options`, `executable`, `pipe`, `stderr`, `force_cli` — do not exist here and
 raise `TypeError` naming the argument.
 
@@ -254,20 +258,23 @@ caught here, and `tests/test_stream_live.py` plays a real extractor URL end to e
 ## Architecture
 
 ```
-python/discord_ext_voice/        # thin discord.py extension
-├── voice_client.py              # VoiceClient: create_connection_state, play, send_audio_packet
-├── voice_state.py               # VoiceConnectionState: connect/reconnect flow (ours)
-├── gateway.py                   # DiscordVoiceWebSocket: latency + close on the native socket
-├── sources.py                   # our AudioSource / PCMAudio / FFmpeg*Audio / volume
-└── errors.py                    # native errors + discord.py's, and FFmpegSourceError
+python/discord_ext_voice/        # the whole Python surface
+├── __init__.py                  # re-exports the native names
+├── voice_client.py              # VoiceClient: the discord.py boundary + flow orchestration
+└── player.py                    # AudioPlayer: a wrapper over the native playback thread
 src/                             # the core
 ├── lib.rs                       # module registration and constants
-├── connection.rs                # the VoiceConnection pyclass
+├── connection.rs                # VoiceConnection: transport + flow + negotiated state
+├── flow.rs                      # phases, close codes, retry spacing, reconnect backoff
+├── gateway.rs                   # DiscordVoiceWebSocket: latency + close
+├── enums.rs                     # the IntEnums Python dispatches on
 ├── transport.rs                 # websocket + UDP actor, heartbeat, IP discovery
 ├── crypto.rs                    # the four RTP encryption modes
 ├── dave.rs                      # DAVE/MLS session and transition state machine
 ├── opus.rs                      # Opus encode/decode (oprs)
-└── source.rs                    # audio sources: symphonia decoding, files, objects, http(s)
+├── player.rs                    # the playback clock
+├── source.rs                    # demuxing/decoding: symphonia, files, objects, http(s)
+└── sources.rs                   # AudioSource / PCMAudio / FFmpeg*Audio / volume
 ```
 
 ### Design notes
@@ -289,11 +296,13 @@ has no decoder for — go to `oprs`, the same pure-Rust libopus port the encoder
 44.1kHz MP3 is therefore resampled in process, and a WebM/Opus stream (what a YouTube URL
 gives) is demuxed by symphonia and decoded by libopus.
 
-**The connection flow's decisions are native.** `discord_ext_voice.voice_state` awaits what only
-Python can await (discord.py's `Guild.change_voice_state`, the native handshake, the websocket
-close) and asks `_native.ConnectionFlow` what to do: which gateway event moves the phase where,
-what a close code means (1000/4014/4015/4021/4022/other), how long a retry waits and how long a
-reconnect backs off. The phase itself is the transport's, so there is one state rather than two.
+**The connection flow's decisions are native.** `VoiceClient` awaits what only Python can await —
+discord.py's `Guild.change_voice_state` — and asks the native connection what the event means:
+which gateway event moves the phase where, what a close code means
+(1000/4014/4015/4021/4022/other), how long a retry waits and how long a reconnect backs off. The
+phase itself is the transport's, so there is one state rather than two, and the native connection
+owns the credentials and the negotiated session as well. The discord.py calls stay in
+`VoiceClient`, never in Rust.
 
 **The playback clock is native.** `discord_ext_voice.AudioPlayer` is a thin wrapper over a Rust
 thread that paces each 20ms frame, feeds silence while paused, announces the `SPEAKING` state and
@@ -304,8 +313,8 @@ waits for a reconnection. It keeps `discord.player.AudioPlayer`'s semantics — 
 ## Testing
 
 ```bash
-cargo test --lib    # 41 Rust unit tests
-pytest -q           # 161 Python tests, 1 skipped (6 crypto interop tests need PyNaCl; the live URL
+cargo test --lib    # 42 Rust unit tests (1 ignored: it needs the network)
+pytest -q           # 160 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
                     # test needs DISCORD_EXT_VOICE_LIVE_URL)
 ```
 
@@ -332,7 +341,7 @@ The Python suite includes:
 
 ## Limitations
 
-* **Receiving audio is not implemented.** `VoiceConnectionState.add_socket_listener` raises
+* **Receiving audio is not implemented.** `VoiceClient.add_socket_listener` raises
   `NotImplementedError`, matching the scope of discord.py's own voice support (the sending
   side); the `voice_recv` use case is not covered.
 * **`before_options`/`options` are gone** (they raise `TypeError`): FFmpeg CLI grammar cannot

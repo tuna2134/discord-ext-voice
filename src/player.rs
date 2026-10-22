@@ -332,12 +332,16 @@ fn run(inner: Arc<PlayerInner>) {
 
     match &outcome {
         Outcome::Exhausted => {
+            crate::log_info!("playback finished: source exhausted");
             if inner.is_connected() {
                 inner.send_silence(SILENCE_FRAMES);
             }
         }
-        Outcome::Failed(_) => inner.send_speaking(SPEAKING_NONE),
-        Outcome::Aborted => {}
+        Outcome::Failed(error) => {
+            crate::log_error!("playback failed: {}", error.message);
+            inner.send_speaking(SPEAKING_NONE);
+        }
+        Outcome::Aborted => crate::log_info!("playback aborted"),
     }
 
     finish(&inner, &outcome);
@@ -346,6 +350,7 @@ fn run(inner: Arc<PlayerInner>) {
 fn play(inner: &Arc<PlayerInner>) -> Outcome {
     let mut started = Instant::now();
     let mut loops: u64 = 0;
+    let mut sent: u64 = 0;
 
     inner.send_speaking(SPEAKING_VOICE);
 
@@ -419,6 +424,17 @@ fn play(inner: &Arc<PlayerInner>) -> Outcome {
             };
             return Outcome::Failed(error);
         }
+
+        // One line per playback is worth its noise: it separates "the player never got a frame"
+        // from "frames are going out but the other side hears nothing".
+        if sent == 0 {
+            crate::log_info!(
+                "playback: first audio frame sent (opus={}, {} bytes)",
+                frame.opus,
+                frame.data.len()
+            );
+        }
+        sent = sent.saturating_add(1);
 
         loops += 1;
         let next = started + Duration::from_secs_f64(FRAME_DELAY * loops as f64);

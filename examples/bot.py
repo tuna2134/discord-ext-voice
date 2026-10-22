@@ -18,7 +18,7 @@ import discord
 
 import discord_ext_voice as dev
 
-# logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 TOKEN = os.environ.get('DISCORD_TOKEN')
 FILE = sys.argv[1] if len(sys.argv) > 1 else 'song.mp3'
 
@@ -86,7 +86,7 @@ async def on_message(message: discord.Message) -> None:
             f'phase={native.phase} source={voice.source!r}\n'
             f'mode={native.mode} ssrc={native.ssrc} latency={native.latency:.3f}s\n'
             f'dave: version={native.dave_protocol_version} '
-            f'session={native.has_dave_session()} can_encrypt={native.can_encrypt()}'
+            f'session={native.has_dave_session()} can_encrypt={native.can_encrypt}'
         )
 
     elif message.content == '!leave':

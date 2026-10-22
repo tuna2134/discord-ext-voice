@@ -66,9 +66,19 @@ create_exception!(
     FFmpegError,
     VoiceError,
     "Raised when an audio source could not be opened, demuxed or decoded.
-    ///
-    /// The name is kept from the days when decoding went through FFmpeg: it is what
-    /// `discord.py` users expect to catch, and it still covers every decoding failure."
+
+    The name is kept from the days when decoding went through FFmpeg: it is what
+    `discord.py` users expect to catch, and it still covers every decoding failure."
+);
+create_exception!(
+    _native,
+    FFmpegSourceError,
+    FFmpegError,
+    "Raised when an audio source could not be opened, decoded or seeked while it was being
+    constructed.
+
+    `discord.py` only surfaces a decoding failure once its `ffmpeg` process exits; here the
+    source fails fast, at construction time."
 );
 
 #[derive(Debug, thiserror::Error)]

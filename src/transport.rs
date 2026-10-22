@@ -212,6 +212,8 @@ pub struct VoiceState {
     /// Whether a leave request is in flight, so a `channel_id: None` update is expected rather
     /// than a sign that Discord moved us.
     pub expecting_disconnect: bool,
+    /// The gateway told us we are out of the channel (`VOICE_STATE_UPDATE` with no channel).
+    pub disconnected: bool,
     pub latency: f64,
     pub recent_latencies: VecDeque<f64>,
     pub pending_heartbeats: HashMap<u64, std::time::Instant>,
@@ -249,6 +251,7 @@ impl VoiceState {
             phase: Phase::Disconnected,
             joined: false,
             expecting_disconnect: false,
+            disconnected: false,
             latency: f64::INFINITY,
             recent_latencies: VecDeque::new(),
             pending_heartbeats: HashMap::new(),

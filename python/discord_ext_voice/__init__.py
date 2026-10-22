@@ -8,61 +8,55 @@ Quick start::
     voice = await channel.connect(cls=dev.VoiceClient)
     voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('done', error))
 
-The Python layer is a thin extension of ``discord.py``: :class:`VoiceClient` implements
-``discord.VoiceProtocol`` and is hosted by discord.py's connection machinery. Everything
-voice-specific is this package's own and happens in Rust:
-
-======================  ==========================================================
-Concern                 Rust crate
-======================  ==========================================================
-Voice websocket         ``tokio`` + ``tokio-rustls`` + ``tokio-tungstenite``
-Voice gateway payloads  ``voice-model``
-RTP encryption          ``xsalsa20poly1305`` / ``chacha20poly1305``
-End-to-end encryption   ``davey`` (DAVE / MLS)
-Opus codec              ``oprs`` (pure-Rust libopus, used natively)
-Audio sources           :mod:`discord_ext_voice.sources` (no binary, no C library)
-Audio decode/resample   ``symphonia`` + ``rubato``
-Connection flow         :mod:`discord_ext_voice.voice_state` + ``_native.ConnectionFlow``
-Playback clock          :mod:`discord_ext_voice.player` (own thread)
-Python bindings         ``pyo3`` + ``pyo3-async-runtimes`` (maturin)
-======================  ==========================================================
+Only two things are Python: :class:`VoiceClient` (the ``discord.py`` boundary and the
+orchestration of the connection flow) and :class:`AudioPlayer` (a thin wrapper over the native
+playback thread). Everything else — the websocket, the transport, the RTP encryption, the
+DAVE/MLS session, the Opus codec, the audio sources, the flow state machine and the connection
+state itself — is Rust, exposed through ``discord_ext_voice._native``.
 """
 
 from __future__ import annotations
 
-from ._native import DAVE_PROTOCOL_VERSION, SUPPORTED_MODES, __version__, probe
-from .errors import (
+from discord.errors import ClientException, ConnectionClosed
+
+from . import _native
+from ._native import (
+    DAVE_PROTOCOL_VERSION,
+    MAX_ATTEMPTS,
+    OPUS_SILENCE,
+    SUPPORTED_MODES,
     AlreadyConnected,
-    ClientException,
-    ConnectionClosed,
+    AudioSource,
+    CloseAction,
     ConnectionClosedError,
+    ConnectionFlowState,
     DaveError,
+    DiscordVoiceWebSocket,
     EncryptionError,
     FFmpegError,
+    FFmpegOpusAudio,
+    FFmpegPCMAudio,
     FFmpegSourceError,
     HandshakeError,
     NotConnected,
     OpusError,
-    ProtocolError,
-    VoiceError,
-)
-from .gateway import DiscordVoiceWebSocket
-from ._native import OPUS_SILENCE
-from .player import AudioPlayer
-from .sources import (
-    AudioSource,
-    FFmpegOpusAudio,
-    FFmpegPCMAudio,
     PCMAudio,
     PCMVolumeTransformer,
+    ProtocolError,
+    VoiceConnection,
+    VoiceConnectionState,
+    VoiceError,
+    VoiceServerAction,
+    VoiceStateAction,
+    __version__,
     is_audio_source,
+    probe,
 )
+from .player import AudioPlayer
 from .voice_client import VoiceClient, VoiceProtocol, has_dave, has_nacl
-from .voice_state import ConnectionFlowState, VoiceConnectionState
 
-#: The geometry of one Discord voice frame. Taken from the native encoder so the Python and
-#: Read from the native module, so the Rust and Python sides cannot drift (the test suite also
-#: asserts they match ``discord.opus.Encoder``).
+#: The geometry of one Discord voice frame. Read from the native module, so the Rust and Python
+#: sides cannot drift (the test suite also asserts they match ``discord.opus.Encoder``).
 SAMPLES_PER_FRAME: int = _native.SAMPLES_PER_FRAME
 FRAME_LENGTH: int = _native.FRAME_LENGTH
 SAMPLE_SIZE: int = _native.SAMPLE_SIZE
@@ -74,8 +68,12 @@ __all__ = (
     # clients
     'VoiceClient',
     'VoiceProtocol',
+    'VoiceConnection',
     'VoiceConnectionState',
     'ConnectionFlowState',
+    'VoiceStateAction',
+    'VoiceServerAction',
+    'CloseAction',
     'DiscordVoiceWebSocket',
     # audio
     'AudioPlayer',
@@ -96,6 +94,7 @@ __all__ = (
     'CHANNELS',
     'DAVE_PROTOCOL_VERSION',
     'SUPPORTED_MODES',
+    'MAX_ATTEMPTS',
     'has_nacl',
     'has_dave',
     # errors

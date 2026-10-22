@@ -160,7 +160,7 @@ async def test_native_connection_is_exposed(gateway_factory):
     client, channel = await make_client(gateway)
     voice = await join(client, channel)
     try:
-        assert voice.native is voice._connection.native
+        assert voice.native is voice._connection
         assert voice.native.is_connected() is True
         assert voice._connection.supported_modes == dev.VoiceClient.supported_modes
         assert voice._connection.max_dave_protocol_version == dev.DAVE_PROTOCOL_VERSION
@@ -185,7 +185,7 @@ async def test_handshake_close_is_translated_to_discord_connection_closed(gatewa
             await voice.connect(timeout=10.0, reconnect=False)
 
         assert info.value.code == 4006
-        assert voice._connection.native.close_code == 4006
+        assert voice._connection.close_code == 4006
         assert voice.is_connected() is False
     finally:
         await voice.disconnect()
@@ -194,7 +194,7 @@ async def test_handshake_close_is_translated_to_discord_connection_closed(gatewa
 async def test_connect_times_out_waiting_for_the_gateway(gateway_factory):
     """A gateway that never sends the voice updates must time out, not hang.
 
-    This is the native flow wait (`ConnectionFlow.wait_for_state`): the timeout has to reach
+    This is the native flow wait (`VoiceConnection.wait_for_state`): the timeout has to reach
     `_wrap_connect` as an `asyncio.TimeoutError`, and the cancelled wait must not leave the flow
     wedged.
     """
@@ -380,6 +380,19 @@ async def test_source_setter_swaps_the_stream(gateway_factory):
             voice.source = 'nope'  # type: ignore[assignment]
     finally:
         await voice.disconnect()
+
+
+async def test_an_external_disconnect_is_followed(gateway_factory):
+    """A `VOICE_STATE_UPDATE` with no channel means Discord removed us: stop and clean up."""
+    gateway = await gateway_factory()
+    client, channel = await make_client(gateway)
+    voice = await join(client, channel)
+
+    await voice.on_voice_state_update({'channel_id': None})
+
+    assert voice.is_connected() is False
+    assert voice.is_playing() is False
+    assert client._connection._get_voice_client(KEY) is None
 
 
 async def test_disconnect_while_playing(gateway_factory):

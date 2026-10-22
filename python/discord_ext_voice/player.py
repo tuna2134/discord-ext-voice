@@ -13,12 +13,14 @@ player can be constructed the same way as discord.py's.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 from . import _native
-from .sources import AT, is_audio_source
+from ._native import is_audio_source
 
 __all__ = ('AudioPlayer',)
+
+AT = TypeVar('AT')
 
 
 class AudioPlayer:

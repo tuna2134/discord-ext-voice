@@ -130,7 +130,6 @@ impl DaveState {
     /// (Re)create the MLS session for the current protocol version and return the
     /// `dave_mls_key_package` (opcode 26) frame that must be sent to Discord.
     ///
-    /// Mirrors `VoiceConnectionState.reinit_dave_session`.
     pub fn reinit(&mut self) -> Result<Vec<Outgoing>, crate::errors::DaveFailure> {
         let mut outgoing = Vec::new();
 

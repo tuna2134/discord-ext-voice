@@ -16,8 +16,8 @@ voice.play(dev.FFmpegPCMAudio('song.mp3'), after=lambda error: print('finished',
 for alternative voice backends — on top of the native transport, and is the only class in this
 package that inherits from `discord.py`. Only one other thing is Python: `dev.AudioPlayer`, a thin
 wrapper over the native playback thread. Everything else is Rust, including
-`dev.VoiceConnectionState` (the connection state and flow), `dev.DiscordVoiceWebSocket` (the
-websocket facade), the audio sources and the exception types. From `discord.py` we *use* the host
+`dev.VoiceConnectionState` (the connection state and flow), the audio sources and the exception
+types. From `discord.py` we *use* the host
 framework rather than inherit it: the client and its gateway, and the exception classes the public
 API raises.
 
@@ -217,8 +217,7 @@ types. It intentionally has no Python `read`/`is_opus`/`cleanup` methods: the pl
 is native-only, and the player calls the Rust data path directly. Native sources are
 subclassable from Python (the `yt-dlp` example adds metadata to `PCMVolumeTransformer`), but a
 source written *from scratch* in Python — an `AudioSource`/`discord.AudioSource` subclass that
-implements `read` itself — is not accepted by `play()`. `dev.is_audio_source(x)` answers whether a
-source is one of the native types (or a Python subclass of one).
+implements `read` itself — is not accepted by `play()`.
 
 `PCMVolumeTransformer` itself is a Rust `#[pyclass]`, and the whole data path — `read`,
 `is_opus`, `cleanup`, the sample scaling and the player's dispatch — stays in Rust. It accepts
@@ -245,7 +244,6 @@ voice = await channel.connect(cls=dev.VoiceClient)
 voice.native.is_connected()          # transport state
 voice.native.latency                 # voice websocket latency
 voice.native.voice_privacy_code      # DAVE displayable code
-voice.native.decrypt_rtp(header, payload)
 voice.native.dave_protocol_version   # 0 when DAVE is not negotiated
 voice.native.mode                    # negotiated RTP encryption mode
 ```
@@ -284,7 +282,6 @@ src/                             # the core
 ├── lib.rs                       # module registration and constants
 ├── connection.rs                # VoiceConnection: transport + flow + negotiated state
 ├── flow.rs                      # phases, close codes, retry spacing, reconnect backoff
-├── gateway.rs                   # DiscordVoiceWebSocket: latency + close
 ├── enums.rs                     # the IntEnums Python dispatches on
 ├── transport.rs                 # websocket + UDP actor, heartbeat, IP discovery
 ├── crypto.rs                    # the four RTP encryption modes
@@ -369,7 +366,7 @@ release wheel.
 
 ```bash
 cargo test --lib    # 42 Rust unit tests (1 ignored: it needs the network)
-pytest -q           # 169 passed, 1 skipped
+pytest -q           # 167 passed, 1 skipped
 
 The Python tests inspect decoded frames through `_native.read_frame`, which is compiled only
 into debug builds (including `maturin develop`). Release wheels expose no Python-side `read` at

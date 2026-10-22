@@ -17,7 +17,6 @@ class AudioPlayer: ...                                        # wrapper over the
 
 # Everything else is Rust, in discord_ext_voice._native:
 #   VoiceConnection          transport + negotiated session + connection state/flow
-#   DiscordVoiceWebSocket    latency + close, over the native socket
 #   AudioSource, PCMAudio, FFmpegPCMAudio, FFmpegOpusAudio, PCMVolumeTransformer
 #   ConnectionFlowState, VoiceStateAction, VoiceServerAction, CloseAction
 #   VoiceError and its subclasses, including FFmpegSourceError
@@ -86,37 +85,22 @@ close-code handling and the retry/backoff policy are the same on purpose.
 | `close_action(code, reconnect)` | the close-code verdict as a `CloseAction` |
 | `note_attempt()`, `retry_wait(attempt)`, `MAX_ATTEMPTS` | the connect-attempt policy (`_native.MAX_ATTEMPTS`, `_native.retry_wait`) |
 | `reconnect_delay()`, `reset_backoff()` | the jittered reconnect backoff |
-| `wait_for_state(states, timeout)`, `wait_connected(timeout)`, `wait(timeout)` | await/block on the phase; `wait_for_state` returns `False` on timeout so the caller raises `asyncio.TimeoutError` |
+| `wait_for_state(states, timeout)`, `wait_connected(timeout)` | await/block on the phase; `wait_for_state` returns `False` on timeout so the caller raises `asyncio.TimeoutError` |
 | `handshake(resume=False, timeout=...)`, `close(code=None)`, `wait_closed()` | the native handshake and socket lifecycle |
-| `ip`, `port`, `voice_port`, `ssrc`, `mode`, `secret_key`, `close_code`, `close_reason` | populated by the native handshake |
-| `dave_protocol_version`, `dave_session`, `can_encrypt` (property), `max_dave_protocol_version`, `voice_privacy_code`, `reinit_dave_session()` | live values from the native DAVE session |
-| `send_packet`, `send_audio_packet`, `decrypt_rtp` | native UDP/RTP (receive-side decryption is for tests and extensions) |
+| `ip`, `port`, `voice_port`, `ssrc`, `mode`, `close_code`, `close_reason` | populated by the native handshake (`secret_key` is debug-only) |
+| `dave_protocol_version`, `dave_session`, `can_encrypt` (property), `max_dave_protocol_version`, `voice_privacy_code` | live values from the native DAVE session |
+| `send_audio_packet`, `decrypt_rtp` | native RTP (`decrypt_rtp` is debug-only) |
 | `_create_socket`, `_execute_transition`, `_recover_from_invalid_commit`, `dave_pending_transitions`, `dave_downgraded` | **not present**: the native side owns the socket and answers the DAVE transitions itself |
 
 The error translation in `VoiceClient._open_websocket` matters: the native handshake raises
 `HandshakeError`/`ConnectionClosedError`, which are converted to `asyncio.TimeoutError` and
 `discord.ConnectionClosed` so the flow retries and resumes exactly like discord.py's.
 
-## `DiscordVoiceWebSocket`
-
-This is this package's own class (`src/gateway.rs`, exposed as
-`discord_ext_voice._native.DiscordVoiceWebSocket`), named after discord.py's because it plays the
-same role. It is small on purpose: Rust owns the socket, the heartbeat and every incoming frame,
-so there is no aiohttp connection, no keep-alive thread and no frame reader left to wrap.
-
-| Member | Behaviour |
-| --- | --- |
-| `latency` | the native heartbeat round trip, in seconds |
-| `close(code=1000)` | close the native socket (the reconnect loop and `disconnect` call it) |
-| `close_code` | the close code, once the socket ended |
-| `resume` | whether this connection's handshake sends RESUME rather than IDENTIFY |
-| the opcode constants, `speak`, `send_as_json`, `send_binary`, `send_heartbeat`, `poll_event`, `wait_closed`, `seq_ack`, `secret_key`, `average_latency` | **not present**: the native transport sends and reads every frame, and the negotiated values are read from the native connection (`VoiceClient`, `VoiceConnection`) |
-
 ## Audio sources
 
 | Class | Source |
 | --- | --- |
-| `AudioSource` | **ours** (`src/sources.rs`), the native base/marker class. No Python `read`/`is_opus`/`cleanup` methods exist on any source: the player calls the Rust data path (`read_native`, etc.) directly. `is_audio_source(x)` is true only for the concrete native sources (or Python subclasses of them), not for a source implemented from scratch in Python |
+| `AudioSource` | **ours** (`src/sources.rs`), the native base/marker class. No Python `read`/`is_opus`/`cleanup` methods exist on any source: the player calls the Rust data path (`read_native`, etc.) directly. `_native.is_audio_source(x)` (internal) is true only for the concrete native sources (or Python subclasses of them), not for a source implemented from scratch in Python |
 | `PCMAudio` | **ours**: raw PCM from a file object |
 | `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: built on the native readers (`_native.DecodeSource` / `_native.OpusSource`) with `symphonia`, which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
 | `PCMVolumeTransformer` | **ours** (`src/sources.rs`): a native `#[pyclass]`; the data path and the `_native.scale_pcm` scaling stay in Rust. It accepts only native sources; a Python `AudioSource` is a `TypeError` |
@@ -171,13 +155,13 @@ else is reachable through the native `VoiceError` hierarchy.
 6. **`add_socket_listener`/`remove_socket_listener` raise `NotImplementedError`** instead of
    silently registering a callback that would never fire.
 7. **There is no `socket` attribute to poke.** Rust owns the UDP socket; use
-   `voice.native` (for example `voice.native.send_packet(...)`) instead.
+   `voice.native` instead.
 8. **Only native sources are playable.** `play()` rejects an `AudioSource`/`discord.AudioSource`
    implementation written in Python; the playback path never calls Python `read` for a source it
    accepts. Use `PCMAudio`, `FFmpegPCMAudio`, `FFmpegOpusAudio` or `PCMVolumeTransformer` (or
    subclass one of those).
 9. **Nothing inherits from `discord.py` except `VoiceClient`.** `VoiceConnection`,
-   `DiscordVoiceWebSocket`, the audio sources and the player are this package's own classes, so
+   the audio sources and the player are this package's own classes, so
    an `isinstance` check against discord.py's equivalents is `False` (the *behaviour* is the
    same, and the enums keep discord.py's names and values). `dev.AudioPlayer` is not a
    `threading.Thread`: `start`/`stop`/`pause`/`resume`/`join` behave the same, but `is_alive()`
@@ -187,10 +171,10 @@ else is reachable through the native `VoiceError` hierarchy.
 
 * `discord_ext_voice.probe(source)` — codec/rate/channels/duration without decoding.
 * `voice.native` / `voice._connection` — the `_native.VoiceConnection`: `is_connected()`, `phase`,
-  `latency`, `average_latency`, `seq_ack`, `ssrc`, `ip`/`port`/`voice_port`, `mode`,
-  `secret_key`, `dave_protocol_version`, `can_encrypt`, `has_dave_session`,
-  `voice_privacy_code`, `decrypt_rtp`, `send_packet`, `close_code`, `close_reason`,
-  `dropped_packets`, `wait_closed`, ...
+  `latency`, `average_latency`, `ssrc`, `ip`/`port`/`voice_port`, `mode`,
+  `dave_protocol_version`, `can_encrypt`, `has_dave_session`, `voice_privacy_code`,
+  `close_code`, `close_reason`, `dropped_packets`, `wait_closed`, ... (`secret_key`, `seq_ack`
+  and `decrypt_rtp` exist only in debug builds for the tests)
 * `FFmpegPCMAudio(source, seek=...)` / `FFmpegOpusAudio(source, seek=...)` — the native `-ss`,
   implemented by seeking the demuxer and rebuilding the decoder.
 * A dropped `http(s)` stream is resumed from the byte it reached (a `Range` request, or a
@@ -222,8 +206,8 @@ else is reachable through the native `VoiceError` hierarchy.
   `VoiceServerAction`, `CloseAction`) are built in Rust, so the numbers cannot drift.
 * `FFmpegOpusAudio.probe_codec(source)` and the native `_native.scale_pcm` behind
   `PCMVolumeTransformer`.
-* `is_audio_source(candidate)` — whether an object is one of the native source types (or a
-  Python subclass of one). A source implemented from scratch in Python is rejected by `play()`.
+* `_native.is_audio_source(candidate)` — internal check used by `play()` and the player; a
+  source implemented from scratch in Python is rejected.
 * `DISCORD_EXT_VOICE_MAX_DAVE_VERSION=0` disables the DAVE advertisement in IDENTIFY (a
   diagnostic switch for calls that refuse to come up; end-to-end encryption is then off).
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

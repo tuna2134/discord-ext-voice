@@ -29,7 +29,6 @@ mod dave;
 mod enums;
 mod errors;
 mod flow;
-mod gateway;
 mod logging;
 mod opus;
 mod player;
@@ -62,16 +61,17 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         "VoiceConnectionState",
         py.get_type::<connection::VoiceConnection>(),
     )?;
-    module.add_class::<gateway::VoiceWebSocket>()?;
     module.add_class::<sources::AudioSource>()?;
     module.add_class::<sources::PcmAudio>()?;
     module.add_class::<sources::FfmpegPcmAudio>()?;
     module.add_class::<sources::FfmpegOpusAudio>()?;
     module.add_class::<sources::PcmVolumeTransformer>()?;
-    // The raw readers stay available for tests and for code that wants to drive a demuxer
-    // directly; the public source classes are built on the same internals.
-    module.add_class::<source::PyDecodeSource>()?;
-    module.add_class::<source::PyOpusSource>()?;
+    // The raw readers are test-only; release builds expose no Python-side frame reader.
+    #[cfg(debug_assertions)]
+    {
+        module.add_class::<source::PyDecodeSource>()?;
+        module.add_class::<source::PyOpusSource>()?;
+    }
     module.add_class::<player::PyAudioPlayer>()?;
 
     module.add_function(wrap_pyfunction!(sources::is_audio_source, module)?)?;

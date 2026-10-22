@@ -17,6 +17,7 @@ discord = pytest.importorskip('discord')
 import discord.voice_client as discord_voice_client  # noqa: E402
 
 import discord_ext_voice as dev  # noqa: E402
+from discord_ext_voice import _native  # noqa: E402
 
 
 def test_voice_client_implements_voice_protocol():
@@ -77,19 +78,6 @@ def test_connect_signature_is_accepted_by_discord():
     assert set(ours.parameters) == set(theirs.parameters)
 
 
-def test_voice_websocket_is_this_packages_own():
-    """The websocket facade is ours: Rust owns the socket, so only the surface is left."""
-    import discord.gateway
-
-    assert not issubclass(dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket)
-    assert dev.DiscordVoiceWebSocket.__module__ == 'discord_ext_voice._native'
-
-    # Only the two members the Python layer still needs are left.
-    ours = dev.DiscordVoiceWebSocket
-    assert callable(ours.close)
-    assert hasattr(ours, 'latency')
-
-
 def test_nothing_of_discord_pys_implementation_is_reused():
     """Only the host framework comes from discord.py; nothing of ours inherits from it."""
     import discord.gateway
@@ -98,6 +86,7 @@ def test_nothing_of_discord_pys_implementation_is_reused():
 
     # `VoiceClient` implements discord.py's documented extension point: the one inheritance this
     # package has, and the only one it wants.
+    assert not hasattr(dev, 'DiscordVoiceWebSocket')
     assert dev.VoiceProtocol is discord.voice_client.VoiceProtocol
     assert issubclass(dev.VoiceClient, discord.voice_client.VoiceProtocol)
 
@@ -105,7 +94,6 @@ def test_nothing_of_discord_pys_implementation_is_reused():
         (dev.AudioPlayer, discord.player.AudioPlayer),
         (dev.VoiceConnectionState, discord.voice_state.VoiceConnectionState),
         (dev.ConnectionFlowState, discord.voice_state.ConnectionFlowState),
-        (dev.DiscordVoiceWebSocket, discord.gateway.DiscordVoiceWebSocket),
         (dev.AudioSource, discord.player.AudioSource),
         (dev.PCMAudio, discord.player.PCMAudio),
         (dev.FFmpegPCMAudio, discord.player.FFmpegPCMAudio),
@@ -164,9 +152,9 @@ def test_audio_sources_are_this_packages_own():
         def read(self) -> bytes:
             return b''
 
-    assert dev.is_audio_source(External()) is False
-    assert dev.is_audio_source(b'not a source') is False
-    assert dev.is_audio_source(dev.PCMAudio(io.BytesIO(b''))) is True
+    assert _native.is_audio_source(External()) is False
+    assert _native.is_audio_source(b'not a source') is False
+    assert _native.is_audio_source(dev.PCMAudio(io.BytesIO(b''))) is True
 
 
 def test_discord_voice_protocol_contract_methods_exist():
@@ -184,4 +172,4 @@ def test_audio_source_still_works_alongside_discord():
 
     source = External()
     assert source.is_opus() is False
-    assert dev.is_audio_source(source) is False
+    assert _native.is_audio_source(source) is False

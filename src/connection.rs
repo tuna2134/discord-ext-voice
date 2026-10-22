@@ -13,15 +13,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyTuple};
 
 use crate::crypto::Mode;
-use crate::dave::Outgoing;
 use crate::enums;
 use crate::errors::{
-    AlreadyConnected, ConnectionClosedError, DaveError, EncryptionError, HandshakeError,
-    NotConnected, OpusError,
+    AlreadyConnected, ConnectionClosedError, EncryptionError, HandshakeError, NotConnected,
+    OpusError,
 };
 use crate::flow::{Backoff, Flow};
 use crate::opus::{EncoderConfig, OpusEncoder, SAMPLES_PER_FRAME};
-use crate::transport::{self, Hub, Phase, Session, UdpSend, WsCommand};
+use crate::transport::{self, Hub, Phase, Session, UdpSend};
 use crate::{log_debug, log_info};
 
 /// A Discord voice connection implemented natively.
@@ -342,12 +341,6 @@ impl VoiceConnection {
         })
     }
 
-    /// Alias of [`wait_connected`](Self::wait_connected).
-    #[pyo3(signature = (timeout=None))]
-    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> bool {
-        self.wait_connected(py, timeout)
-    }
-
     #[getter]
     fn latency(&self) -> f64 {
         self.hub.state.lock().latency
@@ -366,6 +359,7 @@ impl VoiceConnection {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(debug_assertions)]
     #[getter]
     fn seq_ack(&self) -> i32 {
         self.hub.state.lock().seq_ack
@@ -414,6 +408,7 @@ impl VoiceConnection {
         self.hub.state.lock().mode_name.clone()
     }
 
+    #[cfg(debug_assertions)]
     /// The RTP secret key as a list of ints, exactly like `discord.py`.
     #[getter]
     fn secret_key(&self) -> Vec<u8> {
@@ -441,54 +436,7 @@ impl VoiceConnection {
         self.hub.state.lock().dave.voice_privacy_code()
     }
 
-    /// (Re)create the DAVE session and send the resulting MLS key package.
-    fn reinit_dave_session(&self, py: Python<'_>) -> PyResult<()> {
-        let hub = self.hub.clone();
-        py.detach(move || {
-            let outgoing = transport::with_state(&hub, |state| state.dave.reinit());
-            match outgoing {
-                Ok(frames) => {
-                    for frame in frames {
-                        let command = match frame {
-                            Outgoing::Json(value) => WsCommand::Json(value),
-                            Outgoing::Binary(bytes) => WsCommand::Binary(bytes),
-                        };
-                        hub.send(command);
-                    }
-                    Ok(())
-                }
-                Err(err) => Err(DaveError::new_err(err.to_string())),
-            }
-        })
-    }
-
     // ----------------------------------------------------------------- websocket control
-
-    /// Serialize and send a JSON frame, returning whether the socket accepted it.
-    fn send_json_text(&self, text: &str) -> PyResult<bool> {
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid JSON payload: {err}"))
-        })?;
-        Ok(self.hub.send(WsCommand::Json(value)))
-    }
-
-    /// Send a binary frame as `[opcode][payload]`.
-    fn send_binary_op(&self, opcode: u8, data: &[u8]) -> bool {
-        let mut frame = Vec::with_capacity(data.len() + 1);
-        frame.push(opcode);
-        frame.extend_from_slice(data);
-        self.hub.send(WsCommand::Binary(frame))
-    }
-
-    /// Send a raw UDP packet. Mostly useful for tests and future receive-side work.
-    fn send_packet(&self, packet: &[u8]) -> PyResult<()> {
-        match self.hub.queue_udp(packet.to_vec()) {
-            UdpSend::Sent | UdpSend::Full => Ok(()),
-            UdpSend::Closed => Err(NotConnected::new_err(
-                "the voice UDP socket is not connected",
-            )),
-        }
-    }
 
     // ----------------------------------------------------------------- handshake
 
@@ -641,6 +589,7 @@ impl VoiceConnection {
         *self.hub.encoder.lock() = None;
     }
 
+    #[cfg(debug_assertions)]
     /// Decrypt a received RTP payload (for receive-side extensions and tests).
     fn decrypt_rtp(&self, header: &[u8], payload: &[u8]) -> PyResult<Vec<u8>> {
         let state = self.hub.state.lock();
@@ -690,16 +639,6 @@ impl VoiceConnection {
             hub.finish(code, String::new());
             Ok(())
         })
-    }
-
-    /// The heartbeat round trip, for the websocket facade.
-    pub(crate) fn current_latency(&self) -> f64 {
-        self.hub.state.lock().latency
-    }
-
-    /// The websocket close code, for the websocket facade.
-    pub(crate) fn close_code_raw(&self) -> Option<u16> {
-        self.hub.state.lock().close_code
     }
 }
 

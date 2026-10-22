@@ -54,7 +54,6 @@ def test_supported_modes_match_discord_py():
         'endpoint',
         'ssrc',
         'mode',
-        'ws',
         'timeout',
         'latency',
         'average_latency',

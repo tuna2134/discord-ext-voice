@@ -364,7 +364,7 @@ def test_volume_transformer_can_be_subclassed_with_extra_arguments():
 
     assert transformed.data == {'title': 'a song'}
     assert transformed.volume == 0.5
-    assert dev.is_audio_source(transformed) is True
+    assert _native.is_audio_source(transformed) is True
     assert len(read(transformed)) == dev.FRAME_SIZE
 
 

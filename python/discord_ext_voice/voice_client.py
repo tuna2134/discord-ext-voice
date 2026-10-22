@@ -99,8 +99,6 @@ class VoiceClient(VoiceProtocol):
         self._guild = getattr(channel, 'guild', None)
         self._state = state
         self._player: Optional[AudioPlayer] = None
-        #: The websocket facade; Rust owns the socket behind it.
-        self._ws: Optional[_native.DiscordVoiceWebSocket] = None
         self._timeout: float = 30.0
         self._reconnect: bool = True
         self._self_deaf: bool = False
@@ -157,11 +155,6 @@ class VoiceClient(VoiceProtocol):
     def mode(self) -> Optional[str]:
         """Optional[:class:`str`]: The negotiated RTP encryption mode."""
         return self._connection.mode
-
-    @property
-    def ws(self) -> Any:
-        """:class:`discord_ext_voice.DiscordVoiceWebSocket`: The voice websocket facade."""
-        return self._ws
 
     @property
     def timeout(self) -> float:
@@ -275,8 +268,7 @@ class VoiceClient(VoiceProtocol):
 
         if action is _native.VoiceServerAction.close_old_websocket:
             _log.debug('Voice server update, closing old voice websocket')
-            if self._ws is not None:
-                await self._ws.close(4014)
+            await self._connection.close(4014)
         elif action is _native.VoiceServerAction.reconnect_flow:
             _log.debug('Unexpected server update event, attempting to handle')
             await self._soft_disconnect(with_state=ConnectionFlowState.got_voice_server_update)
@@ -391,7 +383,6 @@ class VoiceClient(VoiceProtocol):
     async def _open_websocket(self, resume: bool) -> None:
         """Open the native websocket and complete the handshake."""
         self._connection.state = ConnectionFlowState.websocket_connected
-        self._ws = _native.DiscordVoiceWebSocket(self._connection, resume=resume)
         try:
             await self._connection.handshake(resume=resume, timeout=self._timeout)
         except _native.HandshakeError as exc:
@@ -406,7 +397,7 @@ class VoiceClient(VoiceProtocol):
                 code if code is not None else '<none>',
                 self._connection.close_reason or '<none>',
             )
-            raise ConnectionClosed(self._ws, shard_id=None, code=code or None) from exc
+            raise ConnectionClosed(self._connection, shard_id=None, code=code or None) from exc
 
     async def disconnect(self, *, force: bool = False) -> None:
         """|coro|
@@ -440,8 +431,7 @@ class VoiceClient(VoiceProtocol):
         requested = False
         try:
             requested = await self._leave_voice()
-            if self._ws is not None:
-                await self._ws.close()
+            await self._connection.close()
         except Exception:
             _log.warning('Ignoring exception disconnecting from voice', exc_info=True)
         finally:
@@ -505,8 +495,7 @@ class VoiceClient(VoiceProtocol):
             self._runner = None
 
         try:
-            if self._ws is not None:
-                await self._ws.close()
+            await self._connection.close()
         except Exception:
             _log.debug('Ignoring exception soft disconnecting from voice', exc_info=True)
         finally:
@@ -663,7 +652,7 @@ class VoiceClient(VoiceProtocol):
             # `CloseAction.raise_`: reconnecting is off, so this is fatal.
             _log.debug('Not handling close code %s (%s)', code, _reason or 'no reason')
             await self.disconnect()
-            raise ConnectionClosed(self._ws, shard_id=None, code=code)
+            raise ConnectionClosed(self._connection, shard_id=None, code=code)
 
     async def _potential_reconnect(self) -> bool:
         """Try to connect to the channel again after Discord moved us."""
@@ -680,17 +669,10 @@ class VoiceClient(VoiceProtocol):
         if self._connection.state is ConnectionFlowState.disconnected:
             return False
 
-        previous_ws = self._ws
         try:
             await self._open_websocket(False)
         except (ConnectionClosed, asyncio.TimeoutError):
             return False
-        finally:
-            if previous_ws is not None:
-                try:
-                    await previous_ws.close()
-                except Exception:
-                    pass
         return True
 
     # ------------------------------------------------------------------ audio

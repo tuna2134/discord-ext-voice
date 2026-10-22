@@ -547,9 +547,6 @@ fn play(inner: &Arc<PlayerInner>) -> Outcome {
         };
 
         if frame.data.is_empty() {
-            if let Some(error) = frame.current_error {
-                return Outcome::Failed(error);
-            }
             // `discord.py` calls `stop()` here, which announces the end of the voice state.
             inner.send_speaking(SPEAKING_NONE);
             return Outcome::Exhausted;
@@ -615,8 +612,6 @@ struct Frame {
     data: Vec<u8>,
     /// Whether `data` is an Opus packet rather than PCM.
     opus: bool,
-    /// A foreign source that failed reports it through `_current_error` instead of raising.
-    current_error: Option<PlayError>,
 }
 
 /// The reader thread: decode ahead of the clock into [`PlayerInner::queue`].
@@ -677,7 +672,7 @@ fn reader_loop(inner: Arc<PlayerInner>) {
         }
 
         let finished = match &result {
-            Ok(frame) => frame.data.is_empty() || frame.current_error.is_some(),
+            Ok(frame) => frame.data.is_empty(),
             Err(_) => true,
         };
         queue.frames.push_back(QueuedFrame {
@@ -763,35 +758,20 @@ fn read_frame(source: &Py<PyAny>, opus: bool) -> Option<Result<Frame, PlayError>
     Python::try_attach(|py| {
         let source = source.bind(py);
 
-        // Native sources are read without going through Python method dispatch: the player is
-        // the last place a Rust source would otherwise re-enter the interpreter.
-        let data = if let Some(result) = native_read(py, source) {
-            match result {
-                Ok(data) => data.into_any(),
-                Err(err) => return Err(PlayError::from_pyerr(py, err)),
-            }
-        } else {
-            match source.call_method0("read") {
+        // Sources are native-only, so this never needs Python method dispatch.
+        let data = match native_read(py, source) {
+            Some(result) => match result {
                 Ok(data) => data,
                 Err(err) => return Err(PlayError::from_pyerr(py, err)),
+            },
+            None => {
+                return Err(PlayError::from_pyerr(
+                    py,
+                    pyo3::exceptions::PyTypeError::new_err("source is not a native audio source"),
+                ));
             }
         };
-        let data = match data.extract::<Vec<u8>>() {
-            Ok(data) => data,
-            Err(err) => return Err(PlayError::from_pyerr(py, err)),
-        };
-
-        let current_error = if data.is_empty() {
-            read_current_error(source)
-        } else {
-            None
-        };
-
-        Ok(Frame {
-            data,
-            opus,
-            current_error,
-        })
+        Ok(Frame { data, opus })
     })
 }
 
@@ -799,31 +779,9 @@ fn read_frame(source: &Py<PyAny>, opus: bool) -> Option<Result<Frame, PlayError>
 fn read_is_opus(source: &Py<PyAny>) -> bool {
     Python::try_attach(|py| {
         let source = source.bind(py);
-        if let Some(opus) = native_is_opus(py, source) {
-            return opus;
-        }
-        source
-            .call_method0("is_opus")
-            .and_then(|value| value.is_truthy())
-            .unwrap_or(false)
+        native_is_opus(py, source).unwrap_or(false)
     })
     .unwrap_or(false)
-}
-
-/// `getattr(source, '_current_error', None)`, as an exception instance.
-fn read_current_error(source: &Bound<'_, PyAny>) -> Option<PlayError> {
-    let error = source.getattr("_current_error").ok()?;
-    if !error.is_truthy().unwrap_or(false) {
-        return None;
-    }
-    let message = error
-        .str()
-        .map(|text| text.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "the audio source failed".to_owned());
-    Some(PlayError {
-        message,
-        value: error.cast_into::<PyBaseException>().ok()?.unbind(),
-    })
 }
 
 /// Join the reader thread, but never block the player on a stuck network read.
@@ -855,15 +813,10 @@ fn cleanup_source(inner: &Arc<PlayerInner>, py: Python<'_>) {
         .source
         .as_ref()
         .map(|source| source.clone_ref(py));
-    if let Some(source) = source {
-        if native_cleanup(py, source.bind(py)).is_some() {
-            return;
-        }
-        if let Err(err) = source.bind(py).call_method0("cleanup")
-            && !err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
-        {
-            crate::log_debug!("calling cleanup on the audio source failed: {err}");
-        }
+    if let Some(source) = source
+        && native_cleanup(py, source.bind(py)).is_none()
+    {
+        crate::log_debug!("the audio source is not a native source; nothing to clean up");
     }
 }
 

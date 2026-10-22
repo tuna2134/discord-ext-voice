@@ -15,8 +15,22 @@ from pathlib import Path
 import pytest
 
 import discord_ext_voice as dev
+from discord_ext_voice import _native
 
 FFMPEG = shutil.which('ffmpeg')
+
+
+def read(source):
+    """Read one frame through the native helper (sources no longer expose `read`)."""
+    return _native.read_frame(source)
+
+
+def is_opus(source) -> bool:
+    return _native.is_audio_opus(source)
+
+
+def cleanup(source) -> None:
+    _native.cleanup_audio_source(source)
 
 
 # ---------------------------------------------------------------------------- PCMAudio
@@ -27,7 +41,7 @@ def test_pcm_audio_reads_exact_frames():
     source = dev.PCMAudio(stream)
     frames = []
     while True:
-        data = source.read()
+        data = read(source)
         if not data:
             break
         frames.append(data)
@@ -36,15 +50,15 @@ def test_pcm_audio_reads_exact_frames():
 
 
 def test_pcm_audio_is_not_opus():
-    assert dev.PCMAudio(io.BytesIO(b'')).is_opus() is False
+    assert is_opus(dev.PCMAudio(io.BytesIO(b''))) is False
 
 
 def test_pcm_audio_drops_a_partial_frame():
     """`discord.py`'s player reads an incomplete frame as the end of the source."""
     stream = io.BytesIO(b'\x00' * (dev.FRAME_SIZE + 100))
     source = dev.PCMAudio(stream)
-    assert len(source.read()) == dev.FRAME_SIZE
-    assert source.read() == b''
+    assert len(read(source)) == dev.FRAME_SIZE
+    assert read(source) == b''
 
 
 # ---------------------------------------------------------------------------- probe
@@ -78,7 +92,7 @@ def test_ffmpeg_pcm_audio_decodes_twenty_millisecond_frames(sine_wav: Path):
     try:
         frames = 0
         while True:
-            data = source.read()
+            data = read(source)
             if not data:
                 break
             assert len(data) in (dev.FRAME_SIZE,)
@@ -86,7 +100,7 @@ def test_ffmpeg_pcm_audio_decodes_twenty_millisecond_frames(sine_wav: Path):
         # 0.5s / 20ms == 25 frames
         assert frames == pytest.approx(25, abs=1)
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_ffmpeg_pcm_audio_resamples_and_upmixes(mono_wav: Path):
@@ -95,33 +109,33 @@ def test_ffmpeg_pcm_audio_resamples_and_upmixes(mono_wav: Path):
     try:
         total = 0
         while True:
-            data = source.read()
+            data = read(source)
             if not data:
                 break
             assert len(data) == dev.FRAME_SIZE
             total += len(data)
         assert total == pytest.approx(dev.FRAME_SIZE * 25, abs=dev.FRAME_SIZE)
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_ffmpeg_pcm_audio_seeks_natively(sine_wav: Path):
     full = dev.FFmpegPCMAudio(str(sine_wav))
     try:
         full_bytes = 0
-        while (chunk := full.read()) :
+        while (chunk := read(full)) :
             full_bytes += len(chunk)
     finally:
-        full.cleanup()
+        cleanup(full)
 
     # `seek` is the native form of `-ss`: the demuxer moves and the decoder is rebuilt.
     trimmed = dev.FFmpegPCMAudio(str(sine_wav), seek=0.25)
     try:
         trimmed_bytes = 0
-        while (chunk := trimmed.read()):
+        while (chunk := read(trimmed)):
             trimmed_bytes += len(chunk)
     finally:
-        trimmed.cleanup()
+        cleanup(trimmed)
 
     assert trimmed_bytes < full_bytes
     assert trimmed_bytes == pytest.approx(full_bytes / 2, abs=dev.FRAME_SIZE * 2)
@@ -131,18 +145,18 @@ async def test_ffmpeg_pcm_audio_opens_asynchronously(sine_wav: Path):
     """An `http(s)` constructor would block the event loop; `open()` is the awaitable form."""
     source = await dev.FFmpegPCMAudio.open(str(sine_wav))
     try:
-        assert len(source.read()) == dev.FRAME_SIZE
+        assert len(read(source)) == dev.FRAME_SIZE
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 async def test_ffmpeg_opus_audio_opens_asynchronously(opus_file: Path):
     source = await dev.FFmpegOpusAudio.open(str(opus_file))
     try:
-        assert source.is_opus() is True
-        assert len(source.read()) > 0
+        assert is_opus(source) is True
+        assert len(read(source)) > 0
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_ffmpeg_pcm_audio_can_be_subclassed_with_extra_arguments(sine_wav: Path):
@@ -156,18 +170,18 @@ def test_ffmpeg_pcm_audio_can_be_subclassed_with_extra_arguments(sine_wav: Path)
     source = Subclass(str(sine_wav), extra='metadata')
     try:
         assert source.extra == 'metadata'
-        assert len(source.read()) == dev.FRAME_SIZE
+        assert len(read(source)) == dev.FRAME_SIZE
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_ffmpeg_pcm_audio_reads_from_a_file_object(sine_wav: Path):
     with open(sine_wav, 'rb') as handle:
         source = dev.FFmpegPCMAudio(handle)
         try:
-            assert len(source.read()) == dev.FRAME_SIZE
+            assert len(read(source)) == dev.FRAME_SIZE
         finally:
-            source.cleanup()
+            cleanup(source)
 
 
 def test_ffmpeg_pcm_audio_rejects_a_bad_source(tmp_path: Path):
@@ -229,9 +243,9 @@ class _Unseekable(io.RawIOBase):
 def test_ffmpeg_pcm_audio_reads_an_unseekable_stream(sine_wav: Path):
     source = dev.FFmpegPCMAudio(_Unseekable(sine_wav.read_bytes()))
     try:
-        assert len(source.read()) == dev.FRAME_SIZE
+        assert len(read(source)) == dev.FRAME_SIZE
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_ffmpeg_pcm_audio_reports_a_failed_seek(sine_wav: Path):
@@ -252,10 +266,10 @@ def test_ffmpeg_pcm_audio_rejects_a_bad_seek_position(sine_wav: Path, seek: obje
 def test_ffmpeg_opus_audio_passes_opus_packets_through(opus_file: Path):
     source = dev.FFmpegOpusAudio(str(opus_file))
     try:
-        assert source.is_opus() is True
+        assert is_opus(source) is True
         packets = 0
         while True:
-            packet = source.read()
+            packet = read(source)
             if not packet:
                 break
             # Each packet is one Opus frame, not a 20ms block of PCM.
@@ -265,17 +279,17 @@ def test_ffmpeg_opus_audio_passes_opus_packets_through(opus_file: Path):
                 break
         assert packets > 5
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_ffmpeg_opus_audio_falls_back_to_pcm_for_non_opus(sine_wav: Path):
     """A WAV input cannot be passed through, so libopus encoding is used instead."""
     source = dev.FFmpegOpusAudio(str(sine_wav))
     try:
-        assert source.is_opus() is False
-        assert len(source.read()) == dev.FRAME_SIZE
+        assert is_opus(source) is False
+        assert len(read(source)) == dev.FRAME_SIZE
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 async def test_ffmpeg_opus_audio_probe(opus_file: Path):
@@ -291,10 +305,10 @@ async def test_ffmpeg_opus_audio_probe(opus_file: Path):
 def test_ffmpeg_opus_audio_seeks_natively(opus_file: Path):
     source = dev.FFmpegOpusAudio(str(opus_file), seek=0.1)
     try:
-        assert source.is_opus() is True
-        assert len(source.read()) > 0
+        assert is_opus(source) is True
+        assert len(read(source)) > 0
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 # ---------------------------------------------------------------------------- volume
@@ -304,7 +318,7 @@ def test_volume_transformer_scales_samples(sine_wav: Path):
     original = dev.FFmpegPCMAudio(str(sine_wav))
     transformer = dev.PCMVolumeTransformer(original, 0.5)
     try:
-        data = transformer.read()
+        data = read(transformer)
         assert len(data) == dev.FRAME_SIZE
         assert transformer.volume == 0.5
 
@@ -315,7 +329,7 @@ def test_volume_transformer_scales_samples(sine_wav: Path):
         transformer.volume = -1.0
         assert transformer.volume == 0.0
     finally:
-        transformer.cleanup()
+        cleanup(transformer)
 
 
 def test_volume_transformer_rejects_opus_sources(opus_file: Path):
@@ -325,7 +339,7 @@ def test_volume_transformer_rejects_opus_sources(opus_file: Path):
         with pytest.raises(dev.ClientException):
             dev.PCMVolumeTransformer(source)
     finally:
-        source.cleanup()
+        cleanup(source)
 
 
 def test_volume_transformer_rejects_a_non_source():
@@ -351,7 +365,7 @@ def test_volume_transformer_can_be_subclassed_with_extra_arguments():
     assert transformed.data == {'title': 'a song'}
     assert transformed.volume == 0.5
     assert dev.is_audio_source(transformed) is True
-    assert len(transformed.read()) == dev.FRAME_SIZE
+    assert len(read(transformed)) == dev.FRAME_SIZE
 
 
 def test_volume_transformer_rejects_a_python_source():
@@ -375,11 +389,11 @@ def test_volume_transformer_wraps_another_native_transformer():
     outer = dev.PCMVolumeTransformer(inner, 1.0)
     try:
         assert outer.original is inner
-        assert outer.read()[:2] == b'\x10\x00'
+        assert read(outer)[:2] == b'\x10\x00'
     finally:
-        outer.cleanup()
+        cleanup(outer)
 
 
 def test_volume_transformer_of_silence_stays_empty():
     transformer = dev.PCMVolumeTransformer(dev.PCMAudio(io.BytesIO(b'')), 0.5)
-    assert transformer.read() == b''
+    assert read(transformer) == b''

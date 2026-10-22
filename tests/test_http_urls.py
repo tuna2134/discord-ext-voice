@@ -12,12 +12,12 @@ def read_frames(source, limit: int = 500) -> list[bytes]:
     frames: list[bytes] = []
     try:
         while len(frames) < limit:
-            data = source.read()
+            data = _native.read_frame(source)
             if not data:
                 break
             frames.append(data)
     finally:
-        source.cleanup()
+        _native.cleanup_audio_source(source)
     return frames
 
 
@@ -31,7 +31,7 @@ def test_http_url_decodes_frames(sine_wav, http_server):
     frames = read_frames(source)
     assert len(frames) > 20, 'the whole 0.5s file has to come through'
     assert all(len(frame) == dev.FRAME_SIZE for frame in frames)
-    assert source.is_opus() is False
+    assert _native.is_audio_opus(source) is False
 
 
 def test_http_url_reports_a_missing_file(sine_wav, http_server):
@@ -73,9 +73,9 @@ async def test_http_url_opens_asynchronously(sine_wav, http_server):
     base = http_server(sine_wav.parent)
     source = await dev.FFmpegPCMAudio.open(f'{base}/{sine_wav.name}')
     try:
-        assert len(source.read()) == dev.FRAME_SIZE
+        assert len(_native.read_frame(source)) == dev.FRAME_SIZE
     finally:
-        source.cleanup()
+        _native.cleanup_audio_source(source)
 
 
 def test_http_url_seeks(sine_wav, http_server):
@@ -195,10 +195,10 @@ def test_opus_sources_take_headers_too(opus_file, http_server):
     base = http_server(opus_file.parent)
     source = dev.FFmpegOpusAudio(f'{base}/{opus_file.name}', headers={'X-Extra': 'opus'})
     try:
-        assert source.is_opus() is True
-        assert len(source.read()) > 0
+        assert _native.is_audio_opus(source) is True
+        assert len(_native.read_frame(source)) > 0
     finally:
-        source.cleanup()
+        _native.cleanup_audio_source(source)
 
     assert all(request.get('x-extra') == 'opus' for request in http_server.requests)
 
@@ -210,14 +210,14 @@ def test_http_url_passes_opus_packets_through(opus_file, http_server):
     base = http_server(opus_file.parent)
     source = dev.FFmpegOpusAudio(f'{base}/{opus_file.name}')
     try:
-        assert source.is_opus() is True
+        assert _native.is_audio_opus(source) is True
         packets = 0
         while packets < 10:
-            packet = source.read()
+            packet = _native.read_frame(source)
             if not packet:
                 break
             assert 0 < len(packet) < 1500
             packets += 1
         assert packets > 3
     finally:
-        source.cleanup()
+        _native.cleanup_audio_source(source)

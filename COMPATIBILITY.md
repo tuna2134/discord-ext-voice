@@ -116,10 +116,10 @@ so there is no aiohttp connection, no keep-alive thread and no frame reader left
 
 | Class | Source |
 | --- | --- |
-| `AudioSource` | **ours** (`src/sources.rs`), a native base class that Python may subclass; `is_audio_source(x)` is true only for the concrete native sources (or Python subclasses of them), not for a source implemented from scratch in Python |
+| `AudioSource` | **ours** (`src/sources.rs`), the native base/marker class. No Python `read`/`is_opus`/`cleanup` methods exist on any source: the player calls the Rust data path (`read_native`, etc.) directly. `is_audio_source(x)` is true only for the concrete native sources (or Python subclasses of them), not for a source implemented from scratch in Python |
 | `PCMAudio` | **ours**: raw PCM from a file object |
 | `FFmpegPCMAudio`, `FFmpegOpusAudio` | **ours**: built on the native readers (`_native.DecodeSource` / `_native.OpusSource`) with `symphonia`, which take a path, a file object or an `http(s)` URL (streamed with `reqwest`) |
-| `PCMVolumeTransformer` | **ours** (`src/sources.rs`): a native `#[pyclass]`; `read`/`is_opus`/`cleanup` and the `_native.scale_pcm` scaling stay in Rust. It accepts only native sources; a Python `AudioSource` is a `TypeError` |
+| `PCMVolumeTransformer` | **ours** (`src/sources.rs`): a native `#[pyclass]`; the data path and the `_native.scale_pcm` scaling stay in Rust. It accepts only native sources; a Python `AudioSource` is a `TypeError` |
 | `AudioPlayer` | **ours**, a thin wrapper over the native threads: a one-second read-ahead queue, 20ms pacing, pause/resume, the silence frames, the `SPEAKING` announcements and the reconnection wait are Rust |
 
 ## `discord.opus`
@@ -222,8 +222,8 @@ else is reachable through the native `VoiceError` hierarchy.
   `VoiceServerAction`, `CloseAction`) are built in Rust, so the numbers cannot drift.
 * `FFmpegOpusAudio.probe_codec(source)` and the native `_native.scale_pcm` behind
   `PCMVolumeTransformer`.
-* `is_audio_source(candidate)` — whether an object can be played (our sources, or anything with
-  the same three methods).
+* `is_audio_source(candidate)` — whether an object is one of the native source types (or a
+  Python subclass of one). A source implemented from scratch in Python is rejected by `play()`.
 * `DISCORD_EXT_VOICE_MAX_DAVE_VERSION=0` disables the DAVE advertisement in IDENTIFY (a
   diagnostic switch for calls that refuse to come up; end-to-end encryption is then off).
 * `ws://host:port` endpoints (plaintext websocket), used for local gateways and testing.

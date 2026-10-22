@@ -76,6 +76,13 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 
     module.add_function(wrap_pyfunction!(sources::is_audio_source, module)?)?;
     module.add_function(wrap_pyfunction!(sources::probe_async, module)?)?;
+    module.add_function(wrap_pyfunction!(sources::is_audio_opus, module)?)?;
+    // Test-only introspection; release wheels have no Python-side source read at all.
+    #[cfg(debug_assertions)]
+    {
+        module.add_function(wrap_pyfunction!(sources::read_frame, module)?)?;
+        module.add_function(wrap_pyfunction!(sources::cleanup_audio_source, module)?)?;
+    }
     module.add_function(wrap_pyfunction!(source::probe, module)?)?;
     module.add_function(wrap_pyfunction!(source::scale_pcm, module)?)?;
     module.add_function(wrap_pyfunction!(flow::retry_wait, module)?)?;

@@ -730,12 +730,13 @@ class VoiceClient(VoiceProtocol):
         if expected_packet_loss is None:
             expected_packet_loss = self.expected_packet_loss
 
-        # Any `discord.AudioSource` (or duck-typed equivalent) is accepted, not only the sources
-        # this package ships, so a user's own source keeps working.
+        # The playback pipeline is native-only: a source implemented from scratch in Python is
+        # rejected rather than read through the interpreter.
         if not _native.is_audio_source(source):
-            raise TypeError(f'source must be an AudioSource not {source.__class__.__name__}')
+            raise TypeError(f'source must be a native AudioSource not {source.__class__.__name__}')
 
-        if source.is_opus():
+        opus = _native.is_audio_opus(source)
+        if opus:
             # The packets already are Opus: no encoder is involved at all.
             self._connection.clear_encoder()
         else:
@@ -751,8 +752,8 @@ class VoiceClient(VoiceProtocol):
         _log.info(
             'Playing %r (opus passthrough=%s, encoder=%s)',
             source,
-            source.is_opus(),
-            'none' if source.is_opus() else 'native',
+            opus,
+            'none' if opus else 'native',
         )
         self._player = AudioPlayer(source, self, after=after)
         self._player.start()

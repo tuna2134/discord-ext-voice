@@ -65,7 +65,7 @@ async def on_message(message: discord.Message) -> None:
             await message.reply(f'could not open {FILE}: {exc}')
             return
 
-        print(f'!play: source={source!r} opus={source.is_opus()}')
+        print(f'!play: source={source!r}')
         voice.play(
             source,
             after=lambda error: print(f'finished, error={error!r}'),

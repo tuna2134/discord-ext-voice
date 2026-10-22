@@ -15,6 +15,7 @@ from typing import Any, Callable
 import pytest
 
 import discord_ext_voice as dev
+from discord_ext_voice import _native
 from test_voice_client import KEY, join, make_client
 
 pytestmark = pytest.mark.asyncio
@@ -23,29 +24,50 @@ pytestmark = pytest.mark.asyncio
 LOUD_FRAME = bytes(range(256)) * 15
 
 
-class CountingSource(dev.PCMAudio):
-    """A native source that hands out whole frames and records what the player did to it."""
+class ScriptedStream(io.RawIOBase):
+    """A PCM stream with deterministic reads, used by the native `PCMAudio` source."""
 
-    def __init__(self, frames: int = 3) -> None:
-        super().__init__(io.BytesIO(b''))
+    def __init__(
+        self, frames: int = 3, *, failure: Exception | None = None, delay: float = 0.0
+    ) -> None:
         self.frames = frames
+        self.failure = failure
+        self.delay = delay
         self.reads = 0
-        self.cleanups = 0
-        self.failure: Exception | None = None
+        self.cleaned = 0
 
-    def read(self) -> bytes:
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        if self.delay:
+            time.sleep(self.delay)
         if self.failure is not None:
             raise self.failure
         self.reads += 1
         if self.reads > self.frames:
             return b''
-        return LOUD_FRAME
+        return LOUD_FRAME if size is None or size < 0 else LOUD_FRAME[:size]
 
-    def is_opus(self) -> bool:
-        return False
+    def close(self) -> None:
+        self.cleaned += 1
+        super().close()
 
-    def cleanup(self) -> None:
-        self.cleanups += 1
+
+class CountingSource(dev.PCMAudio):
+    """A native source that hands out whole frames and records what the player did to it."""
+
+    def __init__(self, frames: int = 3) -> None:
+        self.stream = ScriptedStream(frames)
+        super().__init__(self.stream)
+
+    @property
+    def reads(self) -> int:
+        return self.stream.reads
+
+    @property
+    def cleanups(self) -> int:
+        return self.stream.cleaned
 
 
 def payload_overhead(mode: str) -> int:
@@ -114,7 +136,7 @@ async def test_a_failing_source_is_reported_to_after(gateway_factory):
     voice = await join(client, channel)
 
     source = CountingSource()
-    source.failure = dev.FFmpegSourceError('the decoder gave up')
+    source.stream.failure = dev.FFmpegSourceError('the decoder gave up')
     after, done, errors = completion_recorder()
 
     try:
@@ -136,16 +158,8 @@ class StallingSource(dev.PCMAudio):
     """A native source whose first read never returns in time, like a dead HTTP stream."""
 
     def __init__(self, delay: float = 1.0) -> None:
-        super().__init__(io.BytesIO(b''))
-        self.delay = delay
-        self.cleanups = 0
-
-    def read(self) -> bytes:
-        time.sleep(self.delay)
-        return b''
-
-    def cleanup(self) -> None:
-        self.cleanups += 1
+        self.stream = ScriptedStream(0, delay=delay)
+        super().__init__(self.stream)
 
 
 async def test_a_stalled_source_is_reported_to_after(gateway_factory):
@@ -289,9 +303,9 @@ async def test_an_opus_source_is_passed_through(gateway_factory, opus_file):
     # What the file's packets look like, read straight from the native source.
     expected: list[int] = []
     reader = dev.FFmpegOpusAudio(opus_file)
-    assert reader.is_opus() is True
+    assert _native.is_audio_opus(reader) is True
     while True:
-        packet = reader.read()
+        packet = _native.read_frame(reader)
         if not packet:
             break
         expected.append(len(packet))

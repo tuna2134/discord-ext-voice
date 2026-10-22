@@ -212,12 +212,13 @@ the probe in a native future, so a bot command can keep serving other events whi
 bound to the client that asked for it. A `User-Agent` there replaces this package's own; passing
 headers for a local file or a file object is a `TypeError`, since nothing would send them.
 
-`dev.AudioSource` is this package's own native base class, and nothing here inherits from
-discord.py. Native sources are subclassable from Python (the `yt-dlp` example does exactly that
-with `PCMVolumeTransformer`), but a source written *from scratch* in Python — an
-`AudioSource`/`discord.AudioSource` subclass that implements `read` itself — is not accepted by
-`play()`: the playback pipeline is native-only. `dev.is_audio_source(x)` answers whether a source
-is one of the native types (or a Python subclass of one).
+`dev.AudioSource` is this package's own native base class and a marker for the native source
+types. It intentionally has no Python `read`/`is_opus`/`cleanup` methods: the playback pipeline
+is native-only, and the player calls the Rust data path directly. Native sources are
+subclassable from Python (the `yt-dlp` example adds metadata to `PCMVolumeTransformer`), but a
+source written *from scratch* in Python — an `AudioSource`/`discord.AudioSource` subclass that
+implements `read` itself — is not accepted by `play()`. `dev.is_audio_source(x)` answers whether a
+source is one of the native types (or a Python subclass of one).
 
 `PCMVolumeTransformer` itself is a Rust `#[pyclass]`, and the whole data path — `read`,
 `is_opus`, `cleanup`, the sample scaling and the player's dispatch — stays in Rust. It accepts
@@ -368,7 +369,11 @@ release wheel.
 
 ```bash
 cargo test --lib    # 42 Rust unit tests (1 ignored: it needs the network)
-pytest -q           # 169 passed, 1 skipped (the crypto interop tests need PyNaCl; the live URL
+pytest -q           # 169 passed, 1 skipped
+
+The Python tests inspect decoded frames through `_native.read_frame`, which is compiled only
+into debug builds (including `maturin develop`). Release wheels expose no Python-side `read` at
+all. (the crypto interop tests need PyNaCl; the live URL
                     # test needs DISCORD_EXT_VOICE_LIVE_URL)
 ```
 
@@ -407,7 +412,7 @@ The Python suite includes:
   server that stops sending without closing anything blocks the reader thread until the OS gives
   up: there is a 10s connect timeout, and no read timeout while streaming. Redirects are
   followed.
-* **A missing local file fails at construction**, not on the first `read()`, so a typo is
+* **A missing local file fails at construction**, not during playback, so a typo is
   reported immediately.
 * **Wheels are dynamically linked** against the system FFmpeg and Opus.
 

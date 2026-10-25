@@ -49,7 +49,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             pkg-config patchelf \
-            ffmpeg build-essential
+            ffmpeg build-essential gcc
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
